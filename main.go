@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -848,6 +849,7 @@ var (
 	engineInfo    *widget.Label
 	progressBar   *widget.ProgressBar
 	micBtn        *tooltipButton
+	customerEntry *MinSizeEntry // Feld "erkannter Kunde"; per Rufnummern-Webhook befuellbar
 	lastSoundTime atomic.Value // *time.Time, atomar für Zugriff aus Goroutines
 	isSilent      atomic.Bool
 	isRecording   atomic.Bool
@@ -977,6 +979,15 @@ type AppConfig struct {
 	AutoScanEnabled  bool `json:"autoScanEnabled"`
 	AutoScanInterval int  `json:"autoScanInterval"`
 
+	// Rufnummern-Übergabe (Abschnitt "Rufnummern Übergabe" in Einstellungen):
+	// eingehender HTTP-Webhook, über den ein externer Trigger (z.B. Telefon-
+	// anlage) die Rufnummer eines Anrufers übergibt. Die App sucht damit in Jira
+	// und trägt den Issue-Key des Top-Treffers ins Feld "erkannter Kunde" ein.
+	// Server lauscht auf 0.0.0.0:<Port><Pfad>. Siehe webhook.go.
+	WebhookEnabled bool   `json:"webhookEnabled"`
+	WebhookPath    string `json:"webhookPath"` // URL-Pfad, Default "/rufnummer"
+	WebhookPort    int    `json:"webhookPort"` // Default 5555
+
 	// Einklapp-Zustand der Mic+Spk-Pegelanzeige im STT-Tab (Standard: zugeklappt).
 	SttMeterExpanded bool `json:"sttMeterExpanded"`
 
@@ -1050,6 +1061,9 @@ func LoadConfig(a fyne.App) {
 		JarvisTicketSearchPrompt: defaultTicketSearchPrompt,
 		AutoScanEnabled:          false,
 		AutoScanInterval:         10,
+		WebhookEnabled:           false,
+		WebhookPath:              "/rufnummer",
+		WebhookPort:              5555,
 	}
 	syncConfigToAtomics() // Atomics mit Defaults füllen (u.a. Logging aktiv)
 
@@ -1379,6 +1393,7 @@ func main() {
 		config.WinHeight = win.Canvas().Size().Height
 		saveWindowPosition(win)
 		SaveConfig()
+		stopWebhookServer()
 		stopAllServers()
 		closeAllRemoteSessions()
 		win.Close()
@@ -1438,8 +1453,8 @@ func main() {
 
 	// Pulse Animation - entfernt: nutzlos und erzeugt Data Race
 
-	micBtn = newTooltipButton(nil, toggleRecording, "Erkennung starten")
-	micBtn.SetText("Erkennung starten")
+	micBtn = newTooltipButton(nil, toggleRecording, "Mitschnitt starten")
+	micBtn.SetText("Mitschnitt starten")
 	micBtn.Importance = widget.HighImportance
 	micBtn.Disable()
 
@@ -1604,11 +1619,18 @@ func main() {
 		}
 	}
 
+	// Feld "erkannter Kunde" zwischen Statuszeile ("Bereit") und Start-Button.
+	// Wird per Rufnummern-Webhook (s. webhook.go) mit dem Jira-Issue-Key des zur
+	// eingehenden Rufnummer passenden Tickets befuellt. Default "CRM-10550".
+	customerEntry = NewMinSizeEntry(160)
+	customerEntry.SetText("CRM-10550")
+	customerRow := container.NewHBox(widget.NewLabel("erkannter Kunde"), customerEntry)
+
 	statusAndStart := container.NewBorder(
 		nil, nil,
 		statusLabel,
 		micBtn, // reiner Text-Button (kein Symbol), rot wie "Suchen"
-		nil,
+		customerRow,
 	)
 
 	// 3-Pixel-Abstand zum oberen Rand
@@ -1994,9 +2016,11 @@ func main() {
 	}
 
 	// DE/EN-Anzeige (Segment-Pill, siehe design.png "de_en.png") - Umschalten ist
-	// deaktiviert: die Jarvis-Suche laeuft fest auf Deutsch, das Umschalten auf
-	// EN wuerde die deutschsprachigen Support-Inhalte (Jira/Confluence) nicht
-	// sinnvoll verbessern. Pille bleibt sichtbar, reagiert aber nicht auf Klicks.
+	// BEWUSST deaktiviert: solange keine i18n-/Uebersetzungsschicht existiert,
+	// laeuft die App (und die Jarvis-Suche) fest auf Deutsch. Pille bleibt
+	// sichtbar, reagiert aber nicht auf Klicks. TODO: nach Einfuehrung von i18n
+	// wieder anklickbar machen (config.JarvisLang "de"/"en"), s. Memory
+	// [[i18n-todo-de-en-toggle]].
 	config.JarvisLang = "de"
 	deFg := canvas.NewText("DE", color.White)
 	deFg.TextStyle = fyne.TextStyle{Bold: true}
@@ -2175,6 +2199,8 @@ func main() {
 
 	saveBtn := widget.NewButtonWithIcon("Einstellungen jetzt speichern", theme.DocumentSaveIcon(), func() {
 		Log("Manuelle Konfigurationsspeicherung ausgelöst")
+		SaveConfig()
+		restartWebhookServer() // geänderte Webhook-Einstellungen (aktiv/Port/Pfad) übernehmen
 		showInfo("Erfolg", "Alle Einstellungen wurden dauerhaft gespeichert.", win)
 	})
 
@@ -2204,39 +2230,84 @@ func main() {
 		saveConfigDebounced()
 	}
 
-	// Automatischer zyklischer Ticket-Scan: Checkbox + Intervall-Slider (0..30 s).
-	// 0 = keine zyklische Anfrage (Anzeige "aus").
+	// Automatischer zyklischer Ticket-Scan: Checkbox "aktiviert" + Intervall-
+	// Slider (5..60 s, 5er-Schritte). Slider laesst sich nur ziehen, wenn die
+	// Checkbox aktiviert ist (Disable/Enable). Der Slider sitzt in der Wert-Spalte
+	// eines alignedFormLayout und ist dadurch links/rechts buendig zum Eingabefeld
+	// "Prompt für passende Tickets".
 	config.AutoScanInterval = clampAutoScanInterval(config.AutoScanInterval)
-	fmtScanInterval := func(sec int) string {
-		if sec <= 0 {
-			return "aus"
-		}
-		return fmt.Sprintf("%d s", sec)
-	}
-	autoScanIntervalLabel := widget.NewLabel(fmtScanInterval(config.AutoScanInterval))
-	autoScanSlider := widget.NewSlider(0, 30)
-	autoScanSlider.Step = 1
+	autoScanIntervalLabel := widget.NewLabel(fmt.Sprintf("Scan-Intervall: %d s", config.AutoScanInterval))
+	autoScanSlider := widget.NewSlider(5, 60)
+	autoScanSlider.Step = 5
 	autoScanSlider.SetValue(float64(config.AutoScanInterval))
 	autoScanSlider.OnChanged = func(v float64) {
 		config.AutoScanInterval = clampAutoScanInterval(int(v))
-		autoScanIntervalLabel.SetText(fmtScanInterval(config.AutoScanInterval))
+		autoScanIntervalLabel.SetText(fmt.Sprintf("Scan-Intervall: %d s", config.AutoScanInterval))
 		saveConfigDebounced()
-		// Neu starten/stoppen mit neuem Intervall (startAutoScan behandelt 0 =
-		// keine zyklische Anfrage selbst als Stopp).
+		// Laeuft gerade ein Scan-Zyklus, mit neuem Intervall neu starten.
 		if isRecording.Load() && config.AutoScanEnabled {
 			startAutoScan()
 		}
 	}
-	autoScanCheck := widget.NewCheck("Automatischer zyklischer Scan bei aktiver Erkennung", func(b bool) {
+	autoScanCheck := widget.NewCheck("aktiviert", func(b bool) {
 		config.AutoScanEnabled = b
 		saveConfigDebounced()
-		if b && isRecording.Load() {
-			startAutoScan()
-		} else if !b {
+		if b {
+			autoScanSlider.Enable()
+			if isRecording.Load() {
+				startAutoScan()
+			}
+		} else {
+			autoScanSlider.Disable()
 			stopAutoScan()
 		}
 	})
 	autoScanCheck.SetChecked(config.AutoScanEnabled)
+	if !config.AutoScanEnabled {
+		autoScanSlider.Disable() // Slider nur bei aktivierter Checkbox verschiebbar
+	}
+	// Fertige Zeilen fuer die Platzierung hinter "Analyse (manuell, mit Prompt)":
+	// Checkbox "aktiviert" in der Wert-Spalte, Beschreibung links davon; darunter
+	// der Slider in der Wert-Spalte (buendig zum Prompt-Eingabefeld).
+	autoScanCheckRow := container.New(&alignedFormLayout{}, widget.NewLabel("Automatische Ticketsuche"), autoScanCheck)
+	autoScanIntervalRow := container.New(&alignedFormLayout{}, autoScanIntervalLabel, autoScanSlider)
+
+	// --- Rufnummern Übergabe (eingehender Webhook, s. webhook.go) ---
+	// Aktiv-Checkbox startet/stoppt den Listener sofort; Port/Pfad werden beim
+	// manuellen Speichern (saveBtn) übernommen (restartWebhookServer).
+	webhookEnableCheck := widget.NewCheck("aktiviert", func(b bool) {
+		config.WebhookEnabled = b
+		saveConfigDebounced()
+		restartWebhookServer()
+	})
+	webhookEnableCheck.SetChecked(config.WebhookEnabled)
+
+	webhookPathEntry := NewMinSizeEntry(alignedFormValueW)
+	webhookPathEntry.Entry.SetText(effectiveWebhookPath())
+	webhookPathEntry.Entry.OnChanged = func(s string) {
+		config.WebhookPath = s
+		saveConfigDebounced()
+	}
+
+	webhookPortEntry := NewMinSizeEntry(alignedFormValueW)
+	webhookPortEntry.Entry.SetText(strconv.Itoa(effectiveWebhookPort()))
+	webhookPortEntry.Entry.OnChanged = func(s string) {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n <= 65535 {
+			config.WebhookPort = n
+			saveConfigDebounced()
+		}
+	}
+
+	webhookHelpBtn := widget.NewButtonWithIcon("", theme.QuestionIcon(), func() {
+		showInfo("Rufnummern-Übergabe (Webhook)",
+			"Ein externer Trigger (z.B. die Telefonanlage) übergibt beim eingehenden Anruf die Rufnummer an diese App. Damit wird in Jira gesucht und der Issue-Key des besten Treffers ins Feld \"erkannter Kunde\" eingetragen.\n\n"+
+				fmt.Sprintf("Der Server lauscht auf ALLEN Netzwerk-Adressen:\n    http://<Rechner-IP>:%d%s\n\n", effectiveWebhookPort(), effectiveWebhookPath())+
+				"Rufnummer übergeben – zwei Wege:\n"+
+				"• GET:   ...?number=+491701234567\n"+
+				"• POST:  JSON {\"number\":\"+491701234567\"} (Content-Type application/json) oder Formularfeld 'number'.\n\n"+
+				"Änderungen an Port/Pfad werden mit \"Einstellungen jetzt speichern\" übernommen.", win)
+	})
+	webhookHelpBtn.Importance = widget.LowImportance
 
 	settingsContent := container.New(&compactVBoxLayout{},
 		widget.NewLabelWithStyle("Betriebsmodus", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -2258,6 +2329,17 @@ func main() {
 		container.New(&alignedFormLayout{}, widget.NewLabel("Remote-Whisper-URL:"), remoteUrlEntry),
 		container.New(&alignedFormLayout{}, widget.NewLabel("Analyse (manuell, mit Prompt):"), framedSelect(analysisSelect)),
 
+		// Automatischer zyklischer Ticket-Scan - inhaltlich zur Erkennung/Analyse
+		// gehoerig, daher hier direkt hinter "Analyse (manuell, mit Prompt)".
+		// Reihenfolge: Ueberschrift, Prompt, Checkbox-Zeile, Intervall-Slider.
+		widget.NewLabel(""), // Leerzeile vor der Ueberschrift
+		widget.NewLabelWithStyle("Suche nach passenden Tickets", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.New(&alignedFormLayout{},
+			widget.NewLabel("Prompt für passende Tickets:"), jarvisTicketSearchPromptEntry,
+		),
+		autoScanCheckRow,
+		autoScanIntervalRow,
+
 		widget.NewLabel(""), // Leerzeile vor 'remote LLM konfigurieren'
 
 		// remote LLM - 3 Zeilen, 3 Spalten: Radio(180) | Label | Value
@@ -2277,18 +2359,21 @@ func main() {
 			widget.NewLabel("Server-URL:"), jarvisServerEntry,
 			widget.NewLabel("API-Key:"), jarvisApiKeyEntry,
 			widget.NewLabel("Prompt für Suchen:"), jarvisSearchPromptEntry,
-			widget.NewLabel("Prompt für passende Tickets:"), jarvisTicketSearchPromptEntry,
 		),
-		container.New(&compactFormLayout{},
-			widget.NewLabel("Sprache:"), jarvisLangToggle,
-		),
-		autoScanCheck,
-		container.New(&compactFormLayout{},
-			widget.NewLabel("Scan-Intervall:"), container.NewBorder(nil, nil, nil, autoScanIntervalLabel, autoScanSlider),
+
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Rufnummern Übergabe", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.New(&alignedFormLayout{},
+			widget.NewLabel("Webhook aktiv:"), container.NewHBox(webhookEnableCheck, webhookHelpBtn),
+			widget.NewLabel("Webhook-URL (Pfad):"), webhookPathEntry,
+			widget.NewLabel("Port:"), webhookPortEntry,
 		),
 
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("System-Einstellungen", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.New(&compactFormLayout{},
+			widget.NewLabel("Sprache:"), jarvisLangToggle,
+		),
 		logCheck,
 		debugCheck,
 
@@ -2361,17 +2446,26 @@ func main() {
 	win.SetContent(container.NewBorder(nil, statusBar, nil, nil, container.NewStack(tabs, logoOverlay)))
 	restoreWindowPosition(win)
 	setWindowSquare(win, isClassic(config.Theme)) // eckiger Fensterrahmen im klassischen Design
+
+	// Auto-Update: still im Hintergrund gegen die neueste GitHub-Release-Version
+	// pruefen und bei Bedarf (nach Rueckfrage) herunterladen + neu starten.
+	go runUpdateCheck(win)
+
+	// Rufnummern-Webhook starten, falls in den Einstellungen aktiviert.
+	startWebhookServer()
+
 	win.ShowAndRun()
 }
 
 // clampAutoScanInterval begrenzt das Scan-Intervall auf den erlaubten Bereich
-// 0..30 Sekunden. 0 bedeutet "keine zyklische Anfrage" (s. startAutoScan).
+// 5..60 Sekunden. Ob überhaupt zyklisch gescannt wird, steuert die Checkbox
+// config.AutoScanEnabled.
 func clampAutoScanInterval(sec int) int {
-	if sec < 0 {
-		return 0
+	if sec < 5 {
+		return 5
 	}
-	if sec > 30 {
-		return 30
+	if sec > 60 {
+		return 60
 	}
 	return sec
 }
@@ -2386,11 +2480,7 @@ func startAutoScan() {
 	if !config.AutoScanEnabled || searchMatchingTickets == nil {
 		return
 	}
-	sec := clampAutoScanInterval(config.AutoScanInterval)
-	if sec == 0 {
-		return // 0 = keine zyklische Anfrage
-	}
-	interval := time.Duration(sec) * time.Second
+	interval := time.Duration(clampAutoScanInterval(config.AutoScanInterval)) * time.Second
 	ctx, cancel := context.WithCancel(context.Background())
 	autoScanCancel = cancel
 	go func() {
@@ -2433,8 +2523,8 @@ func toggleRecording() {
 		pendingSpeaker = ""
 		inProgress = nil
 		isRecording.Store(true)
-		micBtn.SetText("Erkennung stoppen")
-		micBtn.tip = "Erkennung stoppen"
+		micBtn.SetText("Mitschnitt stoppen")
+		micBtn.tip = "Mitschnitt stoppen"
 		micBtn.Importance = widget.DangerImportance
 		statusLabel.SetText("Höre zu...")
 		startAutoScan() // zyklischen Ticket-Scan starten (No-op, wenn deaktiviert)
@@ -2446,8 +2536,8 @@ func toggleRecording() {
 		}
 		statusLabel.SetText("Bereit")
 		isRecording.Store(false)
-		micBtn.SetText("Erkennung starten")
-		micBtn.tip = "Erkennung starten"
+		micBtn.SetText("Mitschnitt starten")
+		micBtn.tip = "Mitschnitt starten"
 		micBtn.Importance = widget.HighImportance
 	}
 	micBtn.Refresh()
@@ -3111,7 +3201,7 @@ func runLocalAnalysisAt(inst *llamaInstance, text, userPrompt string) string {
 }
 
 func updateWindowTitle(w fyne.Window) {
-	title := "SpeechToText und Support Assistent"
+	title := fmt.Sprintf("SpeechToText und Support Assistent (v%s)", AppVersion)
 	if u, err := user.Current(); err == nil && u.Username != "" {
 		title = fmt.Sprintf("%s — %s", title, u.Username) // u.Username liefert unter Windows bereits "DOMAIN\Nutzer"
 	}

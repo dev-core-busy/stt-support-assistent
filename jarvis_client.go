@@ -646,20 +646,23 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	}
 
 	top := container.NewVBox(
-		widget.NewLabel("KI-Support"),
+		widget.NewLabel("Portal Suche"),
 		searchCard,
 	)
 
 	panel := container.NewBorder(top, nil, nil, nil, resultsArea)
 
-	// searchMatchingTickets: vom Button "Suche passende Tickets" (STT-Tab)
-	// aufgerufen. Sucht zum erkannten Text passende Jira-Tickets. Der dafuer
-	// noetige Prompt kommt aus "Einstellungen" (config.JarvisTicketSearchPrompt);
-	// darin wird "[Textfenster]" vor dem API-Call durch den erkannten Text
-	// ersetzt und im Feld prompt der Anfrage mitgeschickt (im Debug-Fenster
-	// sichtbar). Der erkannte Text selbst geht als Suchtext (text) an die API,
-	// damit inhaltlich aehnliche Tickets gefunden werden. Bewusst auf Jira
-	// fokussiert (Wissen/Confluence aus), da gezielt Tickets gesucht werden.
+	// searchMatchingTickets: sucht zum erkannten Text passende Jira-Tickets.
+	// Manueller Trigger (Button "Suche passende Tickets") und automatischer Zyklus
+	// verwenden EXAKT denselben Anfrage-Body; einziger Unterschied ist der
+	// Ausloeser (auto=false: mit Debug-Popup + Button-Sperre; auto=true: ohne
+	// Popup, mit Ueberlappschutz).
+	//
+	// Body: als einzige aktive Quelle "jira_all" (rag/confluence/jira_open/ai aus),
+	// dazu jira_limit + summary_lines. Der Prompt aus "Einstellungen"
+	// (config.JarvisTicketSearchPrompt, "[Textfenster]" durch den erkannten Text
+	// ersetzt) wird im Feld prompt mitgeschickt (und ist im Debug-Fenster sichtbar).
+	// Der erkannte Text geht zusaetzlich als Suchtext (text) an die API.
 	searchMatchingTickets := func(recognizedText string, trigger *widget.Button, auto bool) {
 		text := strings.TrimSpace(recognizedText)
 		if text == "" {
@@ -668,12 +671,6 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			}
 			return // Automatik-Zyklus bei leerem Text still ueberspringen
 		}
-		promptTemplate := strings.TrimSpace(config.JarvisTicketSearchPrompt)
-		if promptTemplate == "" {
-			promptTemplate = defaultTicketSearchPrompt
-		}
-		prompt := strings.ReplaceAll(promptTemplate, ticketSearchPlaceholder, text)
-
 		jiraLimit := config.JarvisJiraLimit
 		if jiraLimit <= 0 {
 			jiraLimit = 10
@@ -686,12 +683,18 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		if lang == "" {
 			lang = "de"
 		}
+		promptTemplate := strings.TrimSpace(config.JarvisTicketSearchPrompt)
+		if promptTemplate == "" {
+			promptTemplate = defaultTicketSearchPrompt
+		}
+		prompt := strings.ReplaceAll(promptTemplate, ticketSearchPlaceholder, text)
+
 		req := jarvisQueryRequest{
 			Text:         text,
 			RAG:          false,
-			Jira:         true,
+			Jira:         true, // jira_all - einziger aktiver Quell-Key
 			Confluence:   false,
-			AI:           true,
+			AI:           false,
 			OpenOnly:     false,
 			JiraLimit:    jiraLimit,
 			SummaryLines: summaryLines,

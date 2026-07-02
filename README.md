@@ -1,6 +1,6 @@
 # stt-support-assistent
 
-**Version 0.7.0**
+**Version 0.8.1**
 
 Portable Speech-to-Text-Anwendung (Windows) mit lokaler KI-gestützter
 Textkorrektur/-analyse und angebundenem KI-Support (Jarvis). Geschrieben in Go
@@ -22,6 +22,15 @@ Start automatisch heruntergeladen; danach läuft sie voll offline.
   Jira-Tickets (Prompt-Vorlage in den Einstellungen hinterlegbar).
 - **Automatischer zyklischer Scan**: sucht bei aktiver Erkennung optional
   zyklisch (Intervall 0–30 s, 0 = aus) passende Tickets zum laufenden Text.
+- **Auto-Update über GitHub**: prüft beim Start still das neueste Release; ist
+  eine neuere Version verfügbar, wird sie nach Rückfrage heruntergeladen,
+  installiert und die App automatisch neu gestartet. Die aktuelle Version steht
+  im Fenstertitel in Klammern. Release-Erstellung über `release.sh`.
+- **Rufnummern-Übergabe (Webhook)**: eingehender HTTP-Webhook (Einstellungen →
+  „Rufnummern Übergabe“, Standard-Port 5555, lauscht auf 0.0.0.0). Ein externer
+  Trigger übergibt per GET (`?number=…`) oder POST (JSON `{"number":"…"}`) die
+  Rufnummer eines Anrufers; die App sucht damit in Jira und trägt den Issue-Key
+  des besten Treffers ins Feld „erkannter Kunde“ ein.
 
 ## Build
 

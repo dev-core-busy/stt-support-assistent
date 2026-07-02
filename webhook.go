@@ -34,7 +34,7 @@ var (
 
 // numberParamKeys sind die akzeptierten Parameter-/JSON-Feldnamen für die
 // Rufnummer (verschiedene Telefonanlagen benennen das Feld unterschiedlich).
-var numberParamKeys = []string{"number", "num", "phone", "caller", "callerid", "rufnummer"}
+var numberParamKeys = []string{"number", "num", "nummer", "phone", "tel", "telefon", "caller", "callerid", "rufnummer"}
 
 // effectiveWebhookPort liefert den konfigurierten Port, sonst die Vorgabe 5555.
 func effectiveWebhookPort() int {

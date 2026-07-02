@@ -372,6 +372,16 @@ func jarvisSourceRow(b jarvisBlock, win fyne.Window) fyne.CanvasObject {
 	return container.NewBorder(nil, nil, prefix, nil, link)
 }
 
+// defaultTicketSearchPrompt ist der Standard-Prompt fuer den Button "Suche
+// passende Tickets" (STT-Tab). "[Textfenster]" wird vor dem API-Call durch den
+// erkannten Text ersetzt. Ueberschreibbar in "Einstellungen"
+// (config.JarvisTicketSearchPrompt).
+const defaultTicketSearchPrompt = "Suche Tickets mit ähnlichem Inhalt zu [Textfenster]"
+
+// ticketSearchPlaceholder ist der Platzhalter im Ticket-Such-Prompt, der vor
+// dem API-Call durch den erkannten Text ersetzt wird.
+const ticketSearchPlaceholder = "[Textfenster]"
+
 // buildKISupportPanel liefert den Inhalt der rechten Fensterhaelfte: eine
 // Such-Karte oben (Eingabe, roter Suchen-Button, Filter, aufklappbare
 // erweiterte Einstellungen, Ticket-Zusammenfassung) und darunter eine
@@ -381,7 +391,15 @@ func jarvisSourceRow(b jarvisBlock, win fyne.Window) fyne.CanvasObject {
 // Suchtext und Ticketbezug sind reine Sitzungseingaben ohne jede Verbindung
 // zu einem Prompt aus "Einstellungen" - Suche/Sucheingabe und LLM-Prompt sind
 // unabhaengige Konzepte und duerfen nicht miteinander synchronisiert werden.
-func buildKISupportPanel(win fyne.Window) fyne.CanvasObject {
+//
+// Rueckgabe zusaetzlich zum Panel: searchMatchingTickets - wird vom Button
+// "Suche passende Tickets" im STT-Tab (linke Haelfte) sowie vom automatischen
+// zyklischen Scan aufgerufen und sucht zum uebergebenen (erkannten) Text
+// passende Jira-Tickets; das Ergebnis erscheint in derselben Ergebnisliste wie
+// eine normale Suche. Parameter auto=true unterdrueckt das Debug-Popup (sonst
+// erschiene es bei jedem Zyklus) und ueberspringt einen Zyklus, wenn noch eine
+// vorherige Automatik-Suche laeuft (Ueberlappschutz).
+func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedText string, trigger *widget.Button, auto bool)) {
 	// --- Ergebnisbereich (wird nach jeder Suche neu befuellt) ---
 	resultsBox := container.NewVBox(
 		widget.NewLabel("Noch keine Suche durchgeführt."),
@@ -634,5 +652,91 @@ func buildKISupportPanel(win fyne.Window) fyne.CanvasObject {
 
 	panel := container.NewBorder(top, nil, nil, nil, resultsArea)
 
-	return panel
+	// searchMatchingTickets: vom Button "Suche passende Tickets" (STT-Tab)
+	// aufgerufen. Sucht zum erkannten Text passende Jira-Tickets. Der dafuer
+	// noetige Prompt kommt aus "Einstellungen" (config.JarvisTicketSearchPrompt);
+	// darin wird "[Textfenster]" vor dem API-Call durch den erkannten Text
+	// ersetzt und im Feld prompt der Anfrage mitgeschickt (im Debug-Fenster
+	// sichtbar). Der erkannte Text selbst geht als Suchtext (text) an die API,
+	// damit inhaltlich aehnliche Tickets gefunden werden. Bewusst auf Jira
+	// fokussiert (Wissen/Confluence aus), da gezielt Tickets gesucht werden.
+	searchMatchingTickets := func(recognizedText string, trigger *widget.Button, auto bool) {
+		text := strings.TrimSpace(recognizedText)
+		if text == "" {
+			if !auto {
+				showErr(fmt.Errorf("Kein erkannter Text vorhanden, zu dem passende Tickets gesucht werden könnten."), win)
+			}
+			return // Automatik-Zyklus bei leerem Text still ueberspringen
+		}
+		promptTemplate := strings.TrimSpace(config.JarvisTicketSearchPrompt)
+		if promptTemplate == "" {
+			promptTemplate = defaultTicketSearchPrompt
+		}
+		prompt := strings.ReplaceAll(promptTemplate, ticketSearchPlaceholder, text)
+
+		jiraLimit := config.JarvisJiraLimit
+		if jiraLimit <= 0 {
+			jiraLimit = 10
+		}
+		summaryLines := config.JarvisSummaryLines
+		if summaryLines <= 0 {
+			summaryLines = 5
+		}
+		lang := config.JarvisLang
+		if lang == "" {
+			lang = "de"
+		}
+		req := jarvisQueryRequest{
+			Text:         text,
+			RAG:          false,
+			Jira:         true,
+			Confluence:   false,
+			AI:           true,
+			OpenOnly:     false,
+			JiraLimit:    jiraLimit,
+			SummaryLines: summaryLines,
+			Lang:         lang,
+			Prompt:       prompt,
+		}
+
+		run := func() {
+			if trigger != nil {
+				trigger.Disable()
+			}
+			progress.Show()
+			start := time.Now()
+
+			go func() {
+				res, err := jarvisQuery(req)
+				duration := time.Since(start)
+				fyne.Do(func() {
+					progress.Hide()
+					if trigger != nil {
+						trigger.Enable()
+					}
+					if auto {
+						autoScanBusy.Store(false)
+					}
+					if err != nil {
+						renderError(err)
+						return
+					}
+					renderResults(text, res, duration)
+				})
+			}()
+		}
+
+		if auto {
+			// Ueberlappschutz: laeuft noch eine Automatik-Suche, diesen Zyklus
+			// auslassen. Kein Debug-Popup im Automatikbetrieb.
+			if !autoScanBusy.CompareAndSwap(false, true) {
+				return
+			}
+			run()
+			return
+		}
+		debugPreviewAndConfirm(win, "Anfrage: Passende Tickets (/api/support/query)", jarvisRequestPreview(req), run)
+	}
+
+	return panel, searchMatchingTickets
 }

@@ -851,8 +851,16 @@ var (
 	lastSoundTime atomic.Value // *time.Time, atomar für Zugriff aus Goroutines
 	isSilent      atomic.Bool
 	isRecording   atomic.Bool
-	currentText   strings.Builder
-	lastSpeaker   string // zuletzt ins Transkript geschriebener Sprecher; nur in fyne.Do-Callbacks
+
+	// Ticket-Suche ("Suche passende Tickets" + Auto-Scan). searchMatchingTickets
+	// wird in main() nach buildKISupportPanel zugewiesen (paketweit, damit auch
+	// toggleRecording/startAutoScan darauf zugreifen). autoScanCancel stoppt den
+	// laufenden Zyklus, autoScanBusy schuetzt vor ueberlappenden Auto-Suchen.
+	searchMatchingTickets func(recognizedText string, trigger *widget.Button, auto bool)
+	autoScanCancel        context.CancelFunc
+	autoScanBusy          atomic.Bool
+	currentText           strings.Builder
+	lastSpeaker           string // zuletzt ins Transkript geschriebener Sprecher; nur in fyne.Do-Callbacks
 	// Whisper+LLM: aktueller, noch nicht korrigierter Rohblock (live angezeigt,
 	// bei Sprechpause/Sprecherwechsel an die LLM-Korrektur übergeben). Nur fyne.Do.
 	pendingRaw     strings.Builder
@@ -957,6 +965,18 @@ type AppConfig struct {
 	// die beiden werden NICHT miteinander vermischt/synchronisiert.
 	JarvisSearchQuery string `json:"jarvisSearchQuery"`
 
+	// "Prompt für passende Tickets" in "Einstellungen": Prompt-Vorlage für den
+	// Button "Suche passende Tickets" (STT-Tab). Der Platzhalter "[Textfenster]"
+	// wird vor dem API-Call durch den erkannten Text ersetzt. Default s.
+	// defaultTicketSearchPrompt (jarvis_client.go).
+	JarvisTicketSearchPrompt string `json:"jarvisTicketSearchPrompt"`
+
+	// Automatischer, zyklischer Ticket-Scan bei aktiver Texterkennung.
+	// AutoScanInterval in Sekunden, erlaubt 0..30 (s. clampAutoScanInterval);
+	// 0 = keine zyklische Anfrage.
+	AutoScanEnabled  bool `json:"autoScanEnabled"`
+	AutoScanInterval int  `json:"autoScanInterval"`
+
 	// Einklapp-Zustand der Mic+Spk-Pegelanzeige im STT-Tab (Standard: zugeklappt).
 	SttMeterExpanded bool `json:"sttMeterExpanded"`
 
@@ -994,39 +1014,42 @@ func LoadConfig(a fyne.App) {
 
 	// Standardwerte
 	config = AppConfig{
-		AppMode:                "Standard-Betrieb",
-		Theme:                  "Hell (modern)",
-		AnalysisPrompt:         "Fasse das wesentliche zusammen",
-		AnalysisPrompts:        []string{"Fasse das wesentliche zusammen"},
-		WhisperLocal:           true,
-		RemoteWhisperUrl:       "ws://191.100.130.61:8090/ws/stt",
-		PostProcModel:          "none",
-		AnalysisModel:          "e2b",
-		RemoteBackend:          "vLLM",
-		Ollama:                 BackendCfg{Url: "http://localhost:11434", Model: "gemma2"},
-		Vllm:                   BackendCfg{Url: "http://localhost:8000"},
-		PauseThreshold:         1.5,
-		LoggingEnabled:         true,
-		MicName:                "System-Standard",
-		SpeakerName:            "System-Standard",
-		WinWidth:               1000,
-		WinHeight:              800,
-		WinX:                   100,
-		WinY:                   100,
-		WinShowCmd:             1, // SW_SHOWNORMAL
-		PhysX:                  100,
-		PhysY:                  100,
-		PhysWidth:              1000,
-		PhysHeight:             800,
-		MicGain:                1.0,
-		SpkGain:                1.0,
-		JarvisLang:             "de",
-		JarvisRAG:              true,
-		JarvisJira:             true,
-		JarvisAISummary:        true,
-		JarvisJiraLimit:        10,
-		JarvisSummaryLines:     5,
-		JarvisAdvancedExpanded: true,
+		AppMode:                  "Standard-Betrieb",
+		Theme:                    "Hell (modern)",
+		AnalysisPrompt:           "Fasse das wesentliche zusammen",
+		AnalysisPrompts:          []string{"Fasse das wesentliche zusammen"},
+		WhisperLocal:             true,
+		RemoteWhisperUrl:         "ws://191.100.130.61:8090/ws/stt",
+		PostProcModel:            "none",
+		AnalysisModel:            "e2b",
+		RemoteBackend:            "vLLM",
+		Ollama:                   BackendCfg{Url: "http://localhost:11434", Model: "gemma2"},
+		Vllm:                     BackendCfg{Url: "http://localhost:8000"},
+		PauseThreshold:           1.5,
+		LoggingEnabled:           true,
+		MicName:                  "System-Standard",
+		SpeakerName:              "System-Standard",
+		WinWidth:                 1000,
+		WinHeight:                800,
+		WinX:                     100,
+		WinY:                     100,
+		WinShowCmd:               1, // SW_SHOWNORMAL
+		PhysX:                    100,
+		PhysY:                    100,
+		PhysWidth:                1000,
+		PhysHeight:               800,
+		MicGain:                  1.0,
+		SpkGain:                  1.0,
+		JarvisLang:               "de",
+		JarvisRAG:                true,
+		JarvisJira:               true,
+		JarvisAISummary:          true,
+		JarvisJiraLimit:          10,
+		JarvisSummaryLines:       5,
+		JarvisAdvancedExpanded:   true,
+		JarvisTicketSearchPrompt: defaultTicketSearchPrompt,
+		AutoScanEnabled:          false,
+		AutoScanInterval:         10,
 	}
 	syncConfigToAtomics() // Atomics mit Defaults füllen (u.a. Logging aktiv)
 
@@ -1744,6 +1767,18 @@ func main() {
 	})
 	clearBtn.Importance = widget.HighImportance
 
+	// "Suche passende Tickets": sucht zum erkannten Text (outputArea) passende
+	// Jira-Tickets. Die eigentliche Suchlogik liegt im KI-Support-Panel
+	// (buildKISupportPanel), das weiter unten gebaut wird - searchMatchingTickets
+	// (paketweit) wird nach dem Panel-Bau zugewiesen. auto=false: manueller Klick
+	// mit Debug-Popup (falls aktiv).
+	var ticketSearchBtn *widget.Button
+	ticketSearchBtn = widget.NewButtonWithIcon("Suche passende Tickets", theme.SearchIcon(), func() {
+		if searchMatchingTickets != nil {
+			searchMatchingTickets(outputArea.Text, ticketSearchBtn, false)
+		}
+	})
+
 	diktatTab := container.NewBorder(
 		topControls,
 		container.NewVBox(
@@ -1757,7 +1792,7 @@ func main() {
 		),
 		nil, nil,
 		// Erkennungs-Textfenster, darunter direkt "Inhalt leeren" und "Speichern".
-		container.NewBorder(nil, container.NewHBox(clearBtn, saveTranscriptBtn), nil, nil, outputArea),
+		container.NewBorder(nil, container.NewHBox(clearBtn, ticketSearchBtn, saveTranscriptBtn), nil, nil, outputArea),
 	)
 	refreshDiktatTab = func() {
 		topControls.Refresh()
@@ -2144,7 +2179,10 @@ func main() {
 	})
 
 	// KI-Support: zweite Haelfte NUR des STT-Tabs, Anbindung an die Jarvis-Support-API.
-	kiSupportTab := buildKISupportPanel(win)
+	// searchMatchingTickets (oben vorwaerts deklariert) wird hier zugewiesen und
+	// vom Button "Suche passende Tickets" im Diktat-Panel genutzt.
+	kiSupportTab, searchMatchingTicketsFn := buildKISupportPanel(win)
+	searchMatchingTickets = searchMatchingTicketsFn
 
 	// "Prompt für Suchen" (config.JarvisSearchQuery): LLM-Anweisung, die bei
 	// jeder Suche im "prompt"-Feld mitgeschickt wird - bewusst OHNE Verbindung
@@ -2155,6 +2193,50 @@ func main() {
 		config.JarvisSearchQuery = s
 		saveConfigDebounced()
 	}
+
+	// "Prompt für passende Tickets" (config.JarvisTicketSearchPrompt): Vorlage
+	// für den Button "Suche passende Tickets" (STT-Tab). "[Textfenster]" wird
+	// vor dem API-Call durch den erkannten Text ersetzt.
+	jarvisTicketSearchPromptEntry := NewMinSizeEntry(alignedFormValueW)
+	jarvisTicketSearchPromptEntry.Entry.SetText(config.JarvisTicketSearchPrompt)
+	jarvisTicketSearchPromptEntry.Entry.OnChanged = func(s string) {
+		config.JarvisTicketSearchPrompt = s
+		saveConfigDebounced()
+	}
+
+	// Automatischer zyklischer Ticket-Scan: Checkbox + Intervall-Slider (0..30 s).
+	// 0 = keine zyklische Anfrage (Anzeige "aus").
+	config.AutoScanInterval = clampAutoScanInterval(config.AutoScanInterval)
+	fmtScanInterval := func(sec int) string {
+		if sec <= 0 {
+			return "aus"
+		}
+		return fmt.Sprintf("%d s", sec)
+	}
+	autoScanIntervalLabel := widget.NewLabel(fmtScanInterval(config.AutoScanInterval))
+	autoScanSlider := widget.NewSlider(0, 30)
+	autoScanSlider.Step = 1
+	autoScanSlider.SetValue(float64(config.AutoScanInterval))
+	autoScanSlider.OnChanged = func(v float64) {
+		config.AutoScanInterval = clampAutoScanInterval(int(v))
+		autoScanIntervalLabel.SetText(fmtScanInterval(config.AutoScanInterval))
+		saveConfigDebounced()
+		// Neu starten/stoppen mit neuem Intervall (startAutoScan behandelt 0 =
+		// keine zyklische Anfrage selbst als Stopp).
+		if isRecording.Load() && config.AutoScanEnabled {
+			startAutoScan()
+		}
+	}
+	autoScanCheck := widget.NewCheck("Automatischer zyklischer Scan bei aktiver Erkennung", func(b bool) {
+		config.AutoScanEnabled = b
+		saveConfigDebounced()
+		if b && isRecording.Load() {
+			startAutoScan()
+		} else if !b {
+			stopAutoScan()
+		}
+	})
+	autoScanCheck.SetChecked(config.AutoScanEnabled)
 
 	settingsContent := container.New(&compactVBoxLayout{},
 		widget.NewLabelWithStyle("Betriebsmodus", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -2195,9 +2277,14 @@ func main() {
 			widget.NewLabel("Server-URL:"), jarvisServerEntry,
 			widget.NewLabel("API-Key:"), jarvisApiKeyEntry,
 			widget.NewLabel("Prompt für Suchen:"), jarvisSearchPromptEntry,
+			widget.NewLabel("Prompt für passende Tickets:"), jarvisTicketSearchPromptEntry,
 		),
 		container.New(&compactFormLayout{},
 			widget.NewLabel("Sprache:"), jarvisLangToggle,
+		),
+		autoScanCheck,
+		container.New(&compactFormLayout{},
+			widget.NewLabel("Scan-Intervall:"), container.NewBorder(nil, nil, nil, autoScanIntervalLabel, autoScanSlider),
 		),
 
 		widget.NewSeparator(),
@@ -2277,6 +2364,64 @@ func main() {
 	win.ShowAndRun()
 }
 
+// clampAutoScanInterval begrenzt das Scan-Intervall auf den erlaubten Bereich
+// 0..30 Sekunden. 0 bedeutet "keine zyklische Anfrage" (s. startAutoScan).
+func clampAutoScanInterval(sec int) int {
+	if sec < 0 {
+		return 0
+	}
+	if sec > 30 {
+		return 30
+	}
+	return sec
+}
+
+// startAutoScan startet den zyklischen Ticket-Scan (falls aktiviert). Ein evtl.
+// laufender Zyklus wird zuvor beendet, sodass die Funktion auch zum Neustart
+// nach Intervalländerung dient. Der Ticker feuert nur, solange die Erkennung
+// aktiv ist; jeder Tick loest eine (stille) Ticketsuche zum aktuellen Textinhalt
+// aus. Ueberlappende Laeufe werden im Suchcode via autoScanBusy verhindert.
+func startAutoScan() {
+	stopAutoScan()
+	if !config.AutoScanEnabled || searchMatchingTickets == nil {
+		return
+	}
+	sec := clampAutoScanInterval(config.AutoScanInterval)
+	if sec == 0 {
+		return // 0 = keine zyklische Anfrage
+	}
+	interval := time.Duration(sec) * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	autoScanCancel = cancel
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !isRecording.Load() {
+					return
+				}
+				fyne.Do(func() {
+					if searchMatchingTickets != nil {
+						searchMatchingTickets(outputArea.Text, nil, true)
+					}
+				})
+			}
+		}
+	}()
+}
+
+// stopAutoScan beendet einen laufenden zyklischen Scan (idempotent).
+func stopAutoScan() {
+	if autoScanCancel != nil {
+		autoScanCancel()
+		autoScanCancel = nil
+	}
+}
+
 func toggleRecording() {
 	if !isRecording.Load() {
 		// Device ist bereits gestartet durch prepareAudio() beim Init/Wechsel
@@ -2292,7 +2437,9 @@ func toggleRecording() {
 		micBtn.tip = "Erkennung stoppen"
 		micBtn.Importance = widget.DangerImportance
 		statusLabel.SetText("Höre zu...")
+		startAutoScan() // zyklischen Ticket-Scan starten (No-op, wenn deaktiviert)
 	} else {
+		stopAutoScan()
 		// Offenen Whisper+LLM-Block beim Stoppen noch korrigieren (läuft im Main-Thread).
 		if atHasPostProc.Load() {
 			flushPendingToCorrection()
@@ -2964,7 +3111,7 @@ func runLocalAnalysisAt(inst *llamaInstance, text, userPrompt string) string {
 }
 
 func updateWindowTitle(w fyne.Window) {
-	title := "Portable Realtime STT (Whisper + Gemma 4)"
+	title := "SpeechToText und Support Assistent"
 	if u, err := user.Current(); err == nil && u.Username != "" {
 		title = fmt.Sprintf("%s — %s", title, u.Username) // u.Username liefert unter Windows bereits "DOMAIN\Nutzer"
 	}

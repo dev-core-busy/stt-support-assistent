@@ -1,6 +1,6 @@
 # stt-support-assistent
 
-**Version 0.6.0**
+**Version 0.7.0**
 
 Portable Speech-to-Text-Anwendung (Windows) mit lokaler KI-gestützter
 Textkorrektur/-analyse und angebundenem KI-Support (Jarvis). Geschrieben in Go
@@ -18,6 +18,10 @@ Start automatisch heruntergeladen; danach läuft sie voll offline.
 - **KI-Support (Jarvis)**: Suche über RAG (Wissensdatenbank) / Jira / Confluence
   mit optionaler KI-Gesamtzusammenfassung; Quellen inkl. klickbarem Link,
   Wissens-Dateien werden mit API-Key geladen (siehe `jarvis_api.md`).
+- **Suche passende Tickets**: findet per Knopfdruck zum erkannten Text passende
+  Jira-Tickets (Prompt-Vorlage in den Einstellungen hinterlegbar).
+- **Automatischer zyklischer Scan**: sucht bei aktiver Erkennung optional
+  zyklisch (Intervall 0–30 s, 0 = aus) passende Tickets zum laufenden Text.
 
 ## Build
 

@@ -1,0 +1,3284 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+	"github.com/gen2brain/malgo"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
+)
+
+// ========= UI Elements with Tooltips =========
+type tooltipButton struct {
+	widget.Button
+	tip string
+}
+
+func (b *tooltipButton) Tooltip() string {
+	return b.tip
+}
+
+func newTooltipButton(icon fyne.Resource, tapped func(), tip string) *tooltipButton {
+	b := &tooltipButton{tip: tip}
+	b.Icon = icon
+	b.OnTapped = tapped
+	b.ExtendBaseWidget(b)
+	return b
+}
+
+func newTooltipButtonNoTap(icon fyne.Resource, tip string) *tooltipButton {
+	b := &tooltipButton{tip: tip}
+	b.Icon = icon
+	b.ExtendBaseWidget(b)
+	return b
+}
+
+// ========= MinSizeEntry =========
+// Entry mit fester MinBreite von mindestens 200px
+type MinSizeEntry struct {
+	widget.Entry
+	minWidth float32
+}
+
+func NewMinSizeEntry(minW float32) *MinSizeEntry {
+	e := &MinSizeEntry{minWidth: minW}
+	// Pflicht bei eingebettetem widget.Entry: ohne ExtendBaseWidget verdrahtet
+	// Fyne Fokus/Tastatur nicht korrekt -> das Feld nimmt keine Eingaben an.
+	e.ExtendBaseWidget(e)
+	return e
+}
+
+func (m *MinSizeEntry) MinSize() fyne.Size {
+	s := m.Entry.MinSize()
+	if s.Width < m.minWidth {
+		s.Width = m.minWidth
+	}
+	return s
+}
+
+func (m *MinSizeEntry) Disable()       { m.Entry.Disable() }
+func (m *MinSizeEntry) Enable()        { m.Entry.Enable() }
+func (m *MinSizeEntry) Disabled() bool { return m.Entry.Disabled() }
+
+// ========= MinSizeSelect =========
+// Dropdown (widget.Select) mit fester Mindestbreite, damit lange Einträge
+// (z.B. "Gemma 4 E2B") nicht abgeschnitten werden.
+type MinSizeSelect struct {
+	widget.Select
+	minWidth float32
+}
+
+func NewMinSizeSelect(options []string, changed func(string), minW float32) *MinSizeSelect {
+	s := &MinSizeSelect{minWidth: minW}
+	s.Options = options
+	s.OnChanged = changed
+	// Pflicht bei eingebettetem widget.Select: ohne ExtendBaseWidget funktioniert
+	// das Aufklapp-Menü nicht korrekt.
+	s.ExtendBaseWidget(s)
+	return s
+}
+
+func (m *MinSizeSelect) MinSize() fyne.Size {
+	s := m.Select.MinSize()
+	if s.Width < m.minWidth {
+		s.Width = m.minWidth
+	}
+	return s
+}
+
+// ========= StretchHForm =========
+// Layout für Controls: Label-Entry-Paare horizontal nebeneinander (1 Zeile pro Modell)
+type stretchHForm struct{}
+
+func (s *stretchHForm) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var w, maxH float32
+	for i := 0; i < len(objects); i += 2 {
+		if i+1 >= len(objects) {
+			break
+		}
+		l, e := objects[i], objects[i+1]
+		if !l.Visible() && !e.Visible() {
+			continue
+		}
+		lMin := l.MinSize()
+		eMin := e.MinSize()
+		w += lMin.Width + eMin.Width + 8
+		rowH := lMin.Height
+		if eMin.Height > rowH {
+			rowH = eMin.Height
+		}
+		if rowH > maxH {
+			maxH = rowH
+		}
+	}
+	return fyne.NewSize(w, maxH)
+}
+
+func (s *stretchHForm) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	x := float32(0)
+	for i := 0; i < len(objects); i += 2 {
+		if i+1 >= len(objects) {
+			break
+		}
+		l, e := objects[i], objects[i+1]
+		if !l.Visible() && !e.Visible() {
+			continue
+		}
+		lMin := l.MinSize()
+		eMin := e.MinSize()
+		rowH := lMin.Height
+		if eMin.Height > rowH {
+			rowH = eMin.Height
+		}
+
+		l.Resize(fyne.NewSize(lMin.Width, rowH))
+		l.Move(fyne.NewPos(x, 0))
+		x += lMin.Width + 4
+
+		e.Resize(fyne.NewSize(eMin.Width, rowH))
+		e.Move(fyne.NewPos(x, 0))
+		x += eMin.Width + 4
+	}
+}
+
+// ========= StretchForm (VERTIKAL) =========
+// Packt Label-Entry-Paare vertikal untereinander, Entry stretcht auf volle Breite
+type stretchForm struct{}
+
+func (s *stretchForm) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var labelW, maxW float32
+	var h float32
+	for i := 0; i < len(objects); i += 2 {
+		if i+1 >= len(objects) {
+			break
+		}
+		l, e := objects[i], objects[i+1]
+		if !l.Visible() && !e.Visible() {
+			continue
+		}
+		lMin := l.MinSize()
+		eMin := e.MinSize()
+		if lMin.Width > labelW {
+			labelW = lMin.Width
+		}
+		rowW := lMin.Width + eMin.Width + 4
+		if rowW > maxW {
+			maxW = rowW
+		}
+		rowH := lMin.Height
+		if eMin.Height > rowH {
+			rowH = eMin.Height
+		}
+		h += rowH + 4
+	}
+	return fyne.NewSize(maxW, h)
+}
+
+func (s *stretchForm) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	y := float32(0)
+	for i := 0; i < len(objects); i += 2 {
+		if i+1 >= len(objects) {
+			break
+		}
+		l, e := objects[i], objects[i+1]
+		if !l.Visible() && !e.Visible() {
+			continue
+		}
+		lMin := l.MinSize()
+		eMin := e.MinSize()
+		rowH := lMin.Height
+		if eMin.Height > rowH {
+			rowH = eMin.Height
+		}
+
+		l.Resize(fyne.NewSize(lMin.Width, rowH))
+		l.Move(fyne.NewPos(0, y))
+
+		e.Resize(fyne.NewSize(size.Width-lMin.Width-4, rowH))
+		e.Move(fyne.NewPos(lMin.Width+4, y))
+
+		y += rowH + 4
+	}
+}
+
+// ========= LLMTableLayout =========
+// Festes Koordinatenraster: 4 Zeilen, 3 Spalten à 25% Breite
+// objects[0] = Header, dann je 3 Widgets pro Zeile (Label, Radio, Control)
+type llmTableLayout struct{}
+
+func (l *llmTableLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	// Höhe konsistent zu Layout() berechnen: Header + eine Höhe pro Zeile
+	// (je 3 Objekte: Radio, Label, Control). Vorher wurde jedes Objekt einzeln
+	// summiert, was massiven Leerraum unter der Tabelle erzeugte.
+	var h float32
+	for i, o := range objects {
+		if !o.Visible() {
+			continue
+		}
+		if i == 0 {
+			h += o.MinSize().Height + 8
+			continue
+		}
+		if (i-1)%3 == 2 { // 3. Spalte = Control -> Zeilenhöhe einmal zählen
+			h += o.MinSize().Height + 6
+		}
+	}
+	return fyne.NewSize(760, h) // 180(Radio) + 10(gutter) + 100(Label) + 450(Entry) + Puffer
+}
+
+func (l *llmTableLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	radioW := float32(180) // Spalte 0: Radio
+	labelW := float32(100) // Spalte 1: Label (breit genug für "Modelname:")
+	entryW := float32(450) // Spalte 2: Entry (300 * 1.5)
+	gutter := float32(10)  // Abstand zwischen Spalten
+
+	y := float32(0)
+	for i, o := range objects {
+		if !o.Visible() {
+			continue
+		}
+		s := o.MinSize()
+		if i == 0 {
+			o.Resize(fyne.NewSize(size.Width, s.Height))
+			o.Move(fyne.NewPos(0, y))
+			y += s.Height + 8
+			continue
+		}
+		switch (i - 1) % 3 {
+		case 0: // Radio
+			o.Resize(fyne.NewSize(radioW, s.Height))
+			o.Move(fyne.NewPos(0, y))
+		case 1: // Label
+			o.Resize(fyne.NewSize(labelW, s.Height))
+			o.Move(fyne.NewPos(radioW+gutter, y))
+		case 2: // Entry/Label (localModelLabel)
+			o.Resize(fyne.NewSize(entryW, s.Height))
+			o.Move(fyne.NewPos(radioW+gutter+labelW, y))
+		}
+		if (i-1)%3 == 2 {
+			y += s.Height + 6
+		}
+	}
+}
+
+// ========= Compact Layouts =========
+// segmentLayout ordnet Elemente ohne Zwischenabstand gleich breit nebeneinander
+// an - fuer den DE/EN-Segment-Umschalter (wirkt wie ein zusammenhaengendes
+// Pill-Widget statt zweier getrennter Buttons).
+type segmentLayout struct{}
+
+func (s *segmentLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var maxW, maxH float32
+	for _, o := range objects {
+		m := o.MinSize()
+		if m.Width > maxW {
+			maxW = m.Width
+		}
+		if m.Height > maxH {
+			maxH = m.Height
+		}
+	}
+	return fyne.NewSize(maxW*float32(len(objects)), maxH)
+}
+
+func (s *segmentLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	n := float32(len(objects))
+	w := size.Width / n
+	for i, o := range objects {
+		o.Resize(fyne.NewSize(w, size.Height))
+		o.Move(fyne.NewPos(w*float32(i), 0))
+	}
+}
+
+// alignedFormLayout ordnet Label/Value-Paare mit FESTER Spaltenaufteilung an:
+// Value beginnt immer bei alignedFormValueX mit Breite alignedFormValueW -
+// exakt die X-Position/Breite der "API key"-Zeile in llmTableLayout
+// (radioW 180 + gutter 10 + labelW 100 = 290, entryW 450). So stehen
+// Mikrofon/Lautsprecher/Remote-Whisper-URL/Analyse/Jarvis-Felder auf
+// derselben Flucht wie das API-Key-Feld ("aufgeraeumtes, symmetrisches Design").
+type alignedFormLayout struct{}
+
+const (
+	alignedFormValueX = 290
+	alignedFormValueW = 450
+)
+
+func (a *alignedFormLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var h float32
+	for i := 0; i+1 < len(objects); i += 2 {
+		if !objects[i].Visible() {
+			continue
+		}
+		rowH := objects[i].MinSize().Height
+		if vh := objects[i+1].MinSize().Height; vh > rowH {
+			rowH = vh
+		}
+		h += rowH + 4
+	}
+	return fyne.NewSize(alignedFormValueX+alignedFormValueW, h)
+}
+
+func (a *alignedFormLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	y := float32(0)
+	for i := 0; i+1 < len(objects); i += 2 {
+		label, value := objects[i], objects[i+1]
+		if !label.Visible() {
+			continue
+		}
+		rowH := label.MinSize().Height
+		if vh := value.MinSize().Height; vh > rowH {
+			rowH = vh
+		}
+		label.Resize(fyne.NewSize(alignedFormValueX-10, rowH))
+		label.Move(fyne.NewPos(0, y))
+		value.Resize(fyne.NewSize(alignedFormValueW, rowH))
+		value.Move(fyne.NewPos(alignedFormValueX, y))
+		y += rowH + 4
+	}
+}
+
+// framedSelect hinterlegt ein Dropdown mit einem leicht grauen Hintergrund,
+// damit es sich optisch vom weissen Einstellungen-Hintergrund absetzt (Fynes
+// Select-Rahmen allein war zu unauffaellig).
+func framedSelect(sel fyne.CanvasObject) fyne.CanvasObject {
+	// WICHTIG: sel deckt mit seinem eigenen (undurchsichtigen) Hintergrund die
+	// gesamte ihm zugewiesene Flaeche ab. Ein Rahmen/Hintergrund in der GLEICHEN
+	// Groesse (z.B. per Stack ohne Inset) wird dadurch komplett uebermalt und
+	// bleibt unsichtbar. Deshalb hier: sel per Padded etwas KLEINER als der
+	// aussen liegende Rahmen machen, damit der Rahmen im Rand-Bereich sichtbar
+	// bleibt (dünne schwarze Linie rundherum).
+	border := canvas.NewRectangle(color.Transparent)
+	border.StrokeColor = color.Black
+	border.StrokeWidth = 1
+	return container.NewStack(border, container.NewPadded(sel))
+}
+
+// newCollapsibleSection baut einen Klapp-Header im Stil von "Erweiterte
+// Einstellungen": Klick auf den Titel zeigt/versteckt content. Fyne loest bei
+// Hide()/Show() eines Kindes KEIN Neu-Layout des Elterncontainers aus, daher
+// muss refreshParent (Refresh+Resize auf den umschliessenden Container) nach
+// jedem Umschalten aufgerufen werden. persist speichert den neuen Zustand
+// (z.B. in config.json), initialExpanded ist der beim Start wiederhergestellte
+// Zustand.
+func newCollapsibleSection(title string, content fyne.CanvasObject, initialExpanded bool, persist func(bool), refreshParent func()) *widget.Button {
+	var toggle *widget.Button
+	apply := func(exp bool) {
+		if exp {
+			content.Show()
+			toggle.SetIcon(theme.MenuDropUpIcon())
+		} else {
+			content.Hide()
+			toggle.SetIcon(theme.MenuDropDownIcon())
+		}
+		if refreshParent != nil {
+			refreshParent()
+		}
+	}
+	expanded := initialExpanded
+	toggle = widget.NewButtonWithIcon(title, theme.MenuDropDownIcon(), func() {
+		expanded = !expanded
+		apply(expanded)
+		persist(expanded)
+	})
+	toggle.Importance = widget.LowImportance
+	toggle.Alignment = widget.ButtonAlignLeading
+	apply(expanded)
+	return toggle
+}
+
+// topRightOverlayLayout positioniert genau ein Objekt rechtsbuendig mit festem
+// Randabstand, vertikal um yOffset gegenueber der Oberkante verschoben
+// (negativ = nach oben). Fuer das Firmenlogo, das ueber der AppTabs-Leiste liegt.
+type topRightOverlayLayout struct {
+	rightMargin float32
+	yOffset     float32
+}
+
+func (l *topRightOverlayLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	if len(objects) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	return objects[0].MinSize()
+}
+
+func (l *topRightOverlayLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	if len(objects) == 0 {
+		return
+	}
+	o := objects[0]
+	s := o.MinSize()
+	o.Resize(s)
+	o.Move(fyne.NewPos(size.Width-s.Width-l.rightMargin, l.yOffset))
+}
+
+type compactVBoxLayout struct{}
+
+func (c *compactVBoxLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var w, h float32
+	for _, o := range objects {
+		if !o.Visible() {
+			continue
+		}
+		size := o.MinSize()
+		if _, ok := o.(*widget.Separator); ok {
+			// 1px dünne Linie + je 4px Luft oben/unten (Separator wird sonst auf
+			// die zugewiesene Höhe gestreckt und wirkt als dicker Balken).
+			h += 9
+			if size.Width > w {
+				w = size.Width
+			}
+			continue
+		}
+		if size.Width > w {
+			w = size.Width
+		}
+		h += size.Height + 1
+	}
+	return fyne.NewSize(w, h)
+}
+
+func (c *compactVBoxLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	y := float32(0)
+	for _, o := range objects {
+		if !o.Visible() {
+			continue
+		}
+		if _, ok := o.(*widget.Separator); ok {
+			o.Resize(fyne.NewSize(size.Width, 1)) // 1px dünne Trennlinie
+			o.Move(fyne.NewPos(0, y+4))           // 4px Luft oben
+			y += 9                                // 1px Linie + 8px Luft (4 oben/4 unten)
+			continue
+		}
+		min := o.MinSize()
+		o.Resize(fyne.NewSize(size.Width, min.Height))
+		o.Move(fyne.NewPos(0, y))
+		y += min.Height + 1
+	}
+}
+
+type compactFormLayout struct{}
+
+func (c *compactFormLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var lw, rw, h float32
+	for i := 0; i < len(objects); i += 2 {
+		if !objects[i].Visible() {
+			continue
+		}
+		lMin := objects[i].MinSize()
+		rMin := objects[i+1].MinSize()
+		if lMin.Width > lw {
+			lw = lMin.Width
+		}
+		if rMin.Width > rw {
+			rw = rMin.Width
+		}
+
+		maxH := lMin.Height
+		if rMin.Height > maxH {
+			maxH = rMin.Height
+		}
+		h += maxH + 1
+	}
+	return fyne.NewSize(lw+rw+4, h)
+}
+
+func (c *compactFormLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	var lw float32
+	for i := 0; i < len(objects); i += 2 {
+		if objects[i].MinSize().Width > lw {
+			lw = objects[i].MinSize().Width
+		}
+	}
+
+	y := float32(0)
+	for i := 0; i < len(objects); i += 2 {
+		l, r := objects[i], objects[i+1]
+		if !l.Visible() {
+			continue
+		}
+
+		lMin := l.MinSize()
+		rMin := r.MinSize()
+		maxH := lMin.Height
+		if rMin.Height > maxH {
+			maxH = rMin.Height
+		}
+
+		// Labels rechtsbündig ausrichten für bessere Form-Optik
+		l.Resize(fyne.NewSize(lw, maxH))
+		l.Move(fyne.NewPos(0, y))
+
+		r.Resize(fyne.NewSize(size.Width-lw-4, maxH))
+		r.Move(fyne.NewPos(lw+4, y))
+
+		y += maxH + 1
+	}
+}
+
+type compactTableLayout struct {
+	Cols int
+}
+
+func (c *compactTableLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var w, h float32
+	colWidths := make([]float32, c.Cols)
+
+	// Finde maximale Breite jeder Spalte
+	for i, o := range objects {
+		if !o.Visible() {
+			continue
+		}
+		col := i % c.Cols
+		s := o.MinSize()
+		if s.Width > colWidths[col] {
+			colWidths[col] = s.Width
+		}
+	}
+
+	for _, cw := range colWidths {
+		w += cw
+	}
+	if c.Cols > 1 {
+		w += float32(c.Cols-1) * 4 // 4px Lücke zwischen Spalten
+	}
+
+	// Finde Höhe (Summe der maximalen Höhen jeder Zeile)
+	for i := 0; i < len(objects); i += c.Cols {
+		var rowH float32
+		for j := 0; j < c.Cols; j++ {
+			if i+j >= len(objects) {
+				break
+			}
+			o := objects[i+j]
+			if !o.Visible() {
+				continue
+			}
+			s := o.MinSize()
+			if s.Height > rowH {
+				rowH = s.Height
+			}
+		}
+		h += rowH + 1 // 1px Zeilenabstand
+	}
+
+	return fyne.NewSize(w, h)
+}
+
+func (c *compactTableLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	colWidths := make([]float32, c.Cols)
+	for i, o := range objects {
+		if !o.Visible() {
+			continue
+		}
+		col := i % c.Cols
+		s := o.MinSize()
+		if s.Width > colWidths[col] {
+			colWidths[col] = s.Width
+		}
+	}
+
+	// Wenn Spalte 2 (Index 2) und 4 (Index 4) flexibel sein sollen, verteilen wir den Restplatz
+	usedW := float32(0)
+	for _, cw := range colWidths {
+		usedW += cw
+	}
+	usedW += float32(c.Cols-1) * 4
+
+	if size.Width > usedW && c.Cols == 5 {
+		extra := (size.Width - usedW) / 2
+		colWidths[2] += extra
+		colWidths[4] += extra
+	}
+
+	y := float32(0)
+	for i := 0; i < len(objects); i += c.Cols {
+		var rowH float32
+		for j := 0; j < c.Cols; j++ {
+			if i+j >= len(objects) {
+				break
+			}
+			o := objects[i+j]
+			if !o.Visible() {
+				continue
+			}
+			if o.MinSize().Height > rowH {
+				rowH = o.MinSize().Height
+			}
+		}
+
+		x := float32(0)
+		for j := 0; j < c.Cols; j++ {
+			if i+j >= len(objects) {
+				break
+			}
+			o := objects[i+j]
+			if o.Visible() {
+				// Vertikal zentrieren innerhalb der Zeile
+				oH := o.MinSize().Height
+				oY := y + (rowH-oH)/2
+				o.Resize(fyne.NewSize(colWidths[j], oH))
+				o.Move(fyne.NewPos(x, oY))
+			}
+			x += colWidths[j] + 4
+		}
+		y += rowH + 1
+	}
+}
+
+// ========= Pegelanzeige mit Richtwert-Marker =========
+// targetLevel ist der empfohlene Aussteuerungspegel (grüner Ziel-Strich).
+const targetLevel = 0.8
+
+// meterMarkerLayout legt zwei dünne vertikale Striche über die Pegelanzeige
+// (objs[0]): objs[1] = beobachteter Spitzenpegel (orange, *markerVal), objs[2] =
+// fester Ziel-Pegel (grün, targetVal). Richtwert für die Aussteuerung / Autoadjust.
+type meterMarkerLayout struct {
+	markerVal *float64
+	targetVal float64
+}
+
+func (l *meterMarkerLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	if len(objs) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	return objs[0].MinSize()
+}
+
+func (l *meterMarkerLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	if len(objs) < 3 {
+		return
+	}
+	objs[0].Resize(size) // Pegelanzeige füllt die Fläche
+	objs[0].Move(fyne.NewPos(0, 0))
+	place := func(o fyne.CanvasObject, val float64) {
+		v := float32(val)
+		if v < 0 {
+			v = 0
+		}
+		if v > 1 {
+			v = 1
+		}
+		o.Resize(fyne.NewSize(2, size.Height))
+		o.Move(fyne.NewPos(v*size.Width-1, 0))
+	}
+	place(objs[1], *l.markerVal) // Peak-Hold (orange)
+	place(objs[2], l.targetVal)  // Ziel (grün)
+}
+
+// newLevelMeter kombiniert eine Pegelanzeige mit Peak-Hold- und Ziel-Strich.
+func newLevelMeter(bar *widget.ProgressBar, markerVal *float64) *fyne.Container {
+	peak := canvas.NewRectangle(color.NRGBA{R: 235, G: 120, B: 0, A: 255})   // orange: Ist-Spitze
+	target := canvas.NewRectangle(color.NRGBA{R: 30, G: 170, B: 60, A: 255}) // grün: Ziel
+	return container.New(&meterMarkerLayout{markerVal: markerVal, targetVal: targetLevel}, bar, peak, target)
+}
+
+// ========= Windows Desktop Theme =========
+// winTheme erzwingt einen festen Hell-/Dunkel-Variant (unabhängig vom System) und
+// gibt Windows-typische Farben. Im 'classic'-Modus zusätzlich eckige Ecken
+// (Radius 0) und klassisches Fenster-Grau – wie eine traditionelle Win32-App.
+type winTheme struct {
+	dark    bool
+	classic bool
+}
+
+func (w *winTheme) variantOf() fyne.ThemeVariant {
+	if w.dark {
+		return theme.VariantDark
+	}
+	return theme.VariantLight
+}
+
+func (w *winTheme) Color(name fyne.ThemeColorName, _ fyne.ThemeVariant) color.Color {
+	v := w.variantOf()
+	// App-weite Akzentfarbe: Rot statt des Fyne-Standardblaus (betrifft u.a.
+	// Tab-Indikator, fokussierte Rahmen, ProgressBar, markierte Checkboxen,
+	// "HighImportance"-Buttons und Hyperlinks - siehe KI-Support-Panel).
+	switch name {
+	case theme.ColorNamePrimary, theme.ColorNameHyperlink:
+		return color.NRGBA{R: 0xB0, G: 0x1E, B: 0x2C, A: 255}
+	}
+	if v == theme.VariantLight {
+		switch name {
+		case theme.ColorNameBackground:
+			if w.classic {
+				return color.NRGBA{R: 240, G: 240, B: 240, A: 255} // klassisches Windows-Grau
+			}
+			return color.NRGBA{R: 255, G: 255, B: 255, A: 255} // weiß wie moderne Windows-App
+		case theme.ColorNameForeground:
+			return color.NRGBA{R: 0, G: 0, B: 0, A: 255}
+		case theme.ColorNameInputBackground:
+			return color.NRGBA{R: 255, G: 255, B: 255, A: 255}
+		case theme.ColorNameInputBorder:
+			// Sichtbarer Rahmen fuer Eingabefelder/Pulldowns auf weissem Grund
+			// (Fynes Standard-Rahmenfarbe war hier kaum erkennbar).
+			return color.NRGBA{R: 0x9B, G: 0x9B, B: 0x9B, A: 255}
+		}
+	} else {
+		switch name {
+		case theme.ColorNameBackground:
+			return color.NRGBA{R: 32, G: 32, B: 32, A: 255}
+		case theme.ColorNameForeground:
+			return color.NRGBA{R: 255, G: 255, B: 255, A: 255}
+		}
+	}
+	return theme.DefaultTheme().Color(name, v)
+}
+
+// loadSystemFont laedt eine TTF-Datei aus dem Windows-Fontverzeichnis zur
+// Laufzeit (kein Embedding/Redistribution - Segoe UI/Consolas sind
+// Microsoft-Lizenzware, nur auf Windows-Systemen selbst vorhanden). Liefert
+// nil, wenn die Datei fehlt (z.B. beim Cross-Compile-Test auf Linux) - in dem
+// Fall greift die Fyne-Standardschrift als Fallback.
+func loadSystemFont(filename string) fyne.Resource {
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = `C:\Windows`
+	}
+	data, err := os.ReadFile(filepath.Join(root, "Fonts", filename))
+	if err != nil {
+		return nil
+	}
+	return fyne.NewStaticResource(filename, data)
+}
+
+// Segoe UI ist die Windows-Systemschrift (Explorer, Einstellungen, etc.) -
+// wird geladen, um die App optisch wie eine native Windows-Anwendung wirken
+// zu lassen, statt mit Fynes gebuendelter Standardschrift.
+var (
+	segoeRegular    = loadSystemFont("segoeui.ttf")
+	segoeBold       = loadSystemFont("segoeuib.ttf")
+	segoeItalic     = loadSystemFont("segoeuii.ttf")
+	segoeBoldItalic = loadSystemFont("segoeuiz.ttf")
+	consolasRegular = loadSystemFont("consola.ttf")
+)
+
+func (w *winTheme) Font(style fyne.TextStyle) fyne.Resource {
+	if style.Monospace {
+		if consolasRegular != nil {
+			return consolasRegular
+		}
+		return theme.DefaultTheme().Font(style)
+	}
+	switch {
+	case style.Bold && style.Italic:
+		if segoeBoldItalic != nil {
+			return segoeBoldItalic
+		}
+	case style.Bold:
+		if segoeBold != nil {
+			return segoeBold
+		}
+	case style.Italic:
+		if segoeItalic != nil {
+			return segoeItalic
+		}
+	default:
+		if segoeRegular != nil {
+			return segoeRegular
+		}
+	}
+	return theme.DefaultTheme().Font(style)
+}
+func (w *winTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
+	return theme.DefaultTheme().Icon(name)
+}
+func (w *winTheme) Size(name fyne.ThemeSizeName) float32 {
+	switch name {
+	case theme.SizeNamePadding, theme.SizeNameInnerPadding:
+		return 3 // kompakter Abstand (Standard ist 4)
+	case theme.SizeNameText:
+		return 12 // Windows-übliche Textgröße (~9pt; Fyne-Standard ist 14)
+	case theme.SizeNameCaptionText:
+		return 11
+	case theme.SizeNameInputRadius, theme.SizeNameSelectionRadius:
+		if w.classic {
+			return 0 // eckige Ecken im klassischen Design
+		}
+	}
+	return theme.DefaultTheme().Size(name)
+}
+
+// isClassic erkennt den klassischen (eckigen) Modus – alte und neue Bezeichnung.
+func isClassic(mode string) bool { return mode == "Klassisch" || mode == "Hell (klassisch)" }
+
+// applyTheme setzt das App-Theme anhand des Modus. Akzeptiert auch die alten
+// Bezeichnungen ("Hell"/"Dunkel"/"Klassisch") zur Migration.
+func applyTheme(a fyne.App, mode string) {
+	switch mode {
+	case "Dunkel", "Dunkel (modern)":
+		a.Settings().SetTheme(&winTheme{dark: true})
+	case "Klassisch", "Hell (klassisch)":
+		a.Settings().SetTheme(&winTheme{classic: true})
+	default: // "Hell (modern)"
+		a.Settings().SetTheme(&winTheme{})
+	}
+}
+
+// =========================================
+
+var (
+	outputArea    *widget.Entry
+	statusLabel   *widget.Label
+	engineInfo    *widget.Label
+	progressBar   *widget.ProgressBar
+	micBtn        *tooltipButton
+	lastSoundTime atomic.Value // *time.Time, atomar für Zugriff aus Goroutines
+	isSilent      atomic.Bool
+	isRecording   atomic.Bool
+	currentText   strings.Builder
+	lastSpeaker   string // zuletzt ins Transkript geschriebener Sprecher; nur in fyne.Do-Callbacks
+	// Whisper+LLM: aktueller, noch nicht korrigierter Rohblock (live angezeigt,
+	// bei Sprechpause/Sprecherwechsel an die LLM-Korrektur übergeben). Nur fyne.Do.
+	pendingRaw     strings.Builder
+	pendingSpeaker string
+	pendingTs      string          // Zeitstempel des aktuellen pending-Blocks (Whisper+LLM)
+	inProgress     []*pendingBlock // Whisper+LLM: Blöcke in LLM-Korrektur (Rohtext bleibt sichtbar)
+
+	audioDevice         *malgo.Device
+	callerDevice        *malgo.Device
+	modeIcon            *widget.Icon
+	mctx                *malgo.AllocatedContext
+	selectedMicID       *malgo.DeviceID
+	selectedSpeakerID   *malgo.DeviceID
+	analysisProgress    *widget.ProgressBarInfinite
+	agentLevel          *widget.ProgressBar
+	callerLevel         *widget.ProgressBar
+	agentMeter          *fyne.Container // Pegelanzeige + Richtwert-Marker (Mic)
+	callerMeter         *fyne.Container // Pegelanzeige + Richtwert-Marker (Speaker)
+	agentMarkerVal      float64         // beobachteter Spitzenpegel Mic (0..1), nur Main-Thread
+	callerMarkerVal     float64         // beobachteter Spitzenpegel Speaker (0..1), nur Main-Thread
+	erkennungInfoLabel  *widget.Label
+	exeDir              string
+	spkGainSlider       *widget.Slider
+	spkGainLabel        *widget.Label
+	speakerControlGroup *fyne.Container
+
+	// Zentrale Konfiguration
+	config AppConfig
+
+	// Audio-Lifecycle: schützt prepareAudio gegen parallele Aufrufe und hält die
+	// Cancel-Funktionen der aktuell laufenden Buffer-Goroutinen, um sie bei einem
+	// Geräte-Wechsel sauber (und ohne UI-Blockade) zu beenden.
+	audioMu         sync.Mutex
+	agentBufCancel  context.CancelFunc
+	callerBufCancel context.CancelFunc
+
+	// Race-freie Spiegelung der im Audio-/Worker-Hot-Path gelesenen Config-Werte.
+	// Geschrieben im UI-Thread (via syncConfigToAtomics), gelesen aus Goroutinen.
+	atMicGain         atomic.Uint64 // float64-Bits
+	atSpkGain         atomic.Uint64 // float64-Bits
+	atPauseThresh     atomic.Uint64 // float64-Bits
+	atHeadsetMode     atomic.Bool
+	atWhisperLocal    atomic.Bool // Erkennung lokal (Whisper) vs. remote
+	atHasPostProc     atomic.Bool // Nachbearbeitung aktiv (PostProcModel != "none")
+	atRemoteWhisperOK atomic.Bool // Remote-Whisper-Server erreichbar (vom Pill-Ticker gesetzt)
+	atLogging         atomic.Bool
+
+	// Serielle Warteschlange für die Satz-Korrektur (Whisper+LLM). Ein einziger
+	// Worker hält die Reihenfolge der korrigierten Sätze stabil.
+	correctionJobs = make(chan correctionJob, 32)
+
+	// Debounce für das Schreiben der config.json (Slider/Eingaben feuern pro Tick).
+	saveTimer   *time.Timer
+	saveTimerMu sync.Mutex
+)
+
+// BackendCfg bündelt die Verbindungsdaten eines Analyse-Backends. Jedes
+// Remote-/Cloud-Backend (Flash, Ollama, vLLM) behält so seine eigenen Werte.
+type BackendCfg struct {
+	ApiKey string `json:"apiKey"`
+	Url    string `json:"url"`
+	Model  string `json:"model"`
+}
+
+type AppConfig struct {
+	AppMode         string   `json:"appMode"`
+	Theme           string   `json:"theme"`
+	AnalysisPrompt  string   `json:"analysisPrompt"`
+	AnalysisPrompts []string `json:"analysisPrompts"` // gespeicherte Analyse-Vorgaben (Dropdown)
+
+	// Neue Pipeline-Struktur: Erkennung / Nachbearbeitung / Analyse.
+	WhisperLocal     bool   `json:"whisperLocal"`     // Erkennung: lokaler Whisper (true) vs. Remote Whisper (false)
+	RemoteWhisperUrl string `json:"remoteWhisperUrl"` // WebSocket-URL des Remote-Whisper-Servers
+	PostProcModel    string `json:"postProcModel"`    // Nachbearbeitung: "none"/"e2b"/"12b"/"remote"
+	AnalysisModel    string `json:"analysisModel"`    // Analyse: "e2b"/"12b"/"remote"
+	RemoteBackend    string `json:"remoteBackend"`    // Remote-LLM: "Google Flash"/"Ollama"/"vLLM"
+
+	// Pro-Backend-Konfiguration der Remote-LLMs (API-Key, URL, Modell je Backend).
+	Flash  BackendCfg `json:"flash"`
+	Ollama BackendCfg `json:"ollama"`
+	Vllm   BackendCfg `json:"vllm"`
+
+	// Jarvis-Support-API (Kundenverwaltung, siehe jarvis_api.md). ApiKey/Url
+	// bewusst nur in config.json, nicht im Quellcode hinterlegt.
+	Jarvis     BackendCfg `json:"jarvis"`
+	JarvisLang string     `json:"jarvisLang"` // "de" oder "en"
+
+	// Zuletzt genutzte Filter/Optionen im KI-Support-Panel (STT-Tab).
+	JarvisRAG              bool `json:"jarvisRAG"`
+	JarvisJira             bool `json:"jarvisJira"`
+	JarvisOpenOnly         bool `json:"jarvisOpenOnly"`
+	JarvisConfluence       bool `json:"jarvisConfluence"`
+	JarvisAISummary        bool `json:"jarvisAISummary"`
+	JarvisJiraLimit        int  `json:"jarvisJiraLimit"`
+	JarvisSummaryLines     int  `json:"jarvisSummaryLines"`
+	JarvisAdvancedExpanded bool `json:"jarvisAdvancedExpanded"`
+
+	// "Prompt für Suchen" in "Einstellungen" (KI-Support (Jarvis)): Anweisung an
+	// die LLM, die bei jeder Suche im Feld "prompt" der Anfrage mitgeschickt wird
+	// (s. jarvisQueryRequest.Prompt). Bewusst UNABHÄNGIG vom Suchtext im STT-Tab
+	// (queryEntry): der Suchtext ist die Frage, dieser Prompt die Instruktion -
+	// die beiden werden NICHT miteinander vermischt/synchronisiert.
+	JarvisSearchQuery string `json:"jarvisSearchQuery"`
+
+	// Einklapp-Zustand der Mic+Spk-Pegelanzeige im STT-Tab (Standard: zugeklappt).
+	SttMeterExpanded bool `json:"sttMeterExpanded"`
+
+	PauseThreshold float64 `json:"pauseThreshold"`
+	LoggingEnabled bool    `json:"loggingEnabled"`
+	DebugMode      bool    `json:"debugMode"` // zeigt vor Suchen/Analysieren ein Popup mit der Anfrage
+	MicName        string  `json:"micName"`
+	SpeakerName    string  `json:"speakerName"`
+	WinWidth       float32 `json:"winWidth"`
+	WinHeight      float32 `json:"winHeight"`
+	WinX           int32   `json:"winX"`
+	WinY           int32   `json:"winY"`
+	WinShowCmd     int32   `json:"winShowCmd"`
+	PhysX          int32   `json:"physX"`
+	PhysY          int32   `json:"physY"`
+	PhysWidth      int32   `json:"physWidth"`
+	PhysHeight     int32   `json:"physHeight"`
+	MicGain        float64 `json:"micGain"`
+	SpkGain        float64 `json:"spkGain"`
+
+	// Veraltete Felder – nur noch zum Migrieren alter config.json gelesen.
+	AnalysisMode    string `json:"analysisMode,omitempty"`
+	SttPipeline     string `json:"sttPipeline,omitempty"`
+	LocalGemmaModel string `json:"localGemmaModel,omitempty"`
+	UseMTPDrafter   bool   `json:"useMTPDrafter,omitempty"`
+	GeminiApiKey    string `json:"geminiApiKey,omitempty"`
+	OllamaUrl       string `json:"ollamaUrl,omitempty"`
+	OllamaModel     string `json:"ollamaModel,omitempty"`
+	VllmUrl         string `json:"vllmUrl,omitempty"`
+	VllmModel       string `json:"vllmModel,omitempty"`
+}
+
+func LoadConfig(a fyne.App) {
+	configPath := filepath.Join(exeDir, "config.json")
+
+	// Standardwerte
+	config = AppConfig{
+		AppMode:                "Standard-Betrieb",
+		Theme:                  "Hell (modern)",
+		AnalysisPrompt:         "Fasse das wesentliche zusammen",
+		AnalysisPrompts:        []string{"Fasse das wesentliche zusammen"},
+		WhisperLocal:           true,
+		RemoteWhisperUrl:       "ws://191.100.130.61:8090/ws/stt",
+		PostProcModel:          "none",
+		AnalysisModel:          "e2b",
+		RemoteBackend:          "vLLM",
+		Ollama:                 BackendCfg{Url: "http://localhost:11434", Model: "gemma2"},
+		Vllm:                   BackendCfg{Url: "http://localhost:8000"},
+		PauseThreshold:         1.5,
+		LoggingEnabled:         true,
+		MicName:                "System-Standard",
+		SpeakerName:            "System-Standard",
+		WinWidth:               1000,
+		WinHeight:              800,
+		WinX:                   100,
+		WinY:                   100,
+		WinShowCmd:             1, // SW_SHOWNORMAL
+		PhysX:                  100,
+		PhysY:                  100,
+		PhysWidth:              1000,
+		PhysHeight:             800,
+		MicGain:                1.0,
+		SpkGain:                1.0,
+		JarvisLang:             "de",
+		JarvisRAG:              true,
+		JarvisJira:             true,
+		JarvisAISummary:        true,
+		JarvisJiraLimit:        10,
+		JarvisSummaryLines:     5,
+		JarvisAdvancedExpanded: true,
+	}
+	syncConfigToAtomics() // Atomics mit Defaults füllen (u.a. Logging aktiv)
+
+	data, err := os.ReadFile(configPath)
+	if err == nil {
+		json.Unmarshal(data, &config)
+		migrateLegacyBackendFields()
+		migrateLegacyPipelineFields()
+		if len(config.AnalysisPrompts) == 0 && config.AnalysisPrompt != "" {
+			config.AnalysisPrompts = []string{config.AnalysisPrompt}
+		}
+		syncConfigToAtomics()
+		return
+	}
+
+	// Migration: Falls config.json fehlt, versuchen wir aus Preferences zu laden
+	if a != nil {
+		p := a.Preferences()
+		// Wir prüfen ein Schlüsselfeld, um zu sehen, ob Daten da sind
+		if p.String("analysisMode") != "" {
+			Log("Migration: Alte Einstellungen gefunden, konvertiere nach config.json...")
+			config.AppMode = p.StringWithFallback("appMode", config.AppMode)
+			config.Theme = p.StringWithFallback("theme", config.Theme)
+			config.AnalysisPrompt = p.StringWithFallback("analysisPrompt", config.AnalysisPrompt)
+			oldMode := p.StringWithFallback("analysisMode", "")
+			switch oldMode {
+			case "Lokal (Gemma 4)", "Gemma 4":
+				config.AnalysisMode = "Gemma4 (lokal)"
+			case "Google Gemini (Flash)":
+				config.AnalysisMode = "Google Flash"
+			case "Remote Ollama":
+				config.AnalysisMode = "Ollama"
+			default:
+				config.AnalysisMode = "Gemma4 (lokal)"
+			}
+			config.GeminiApiKey = p.String("geminiApiKey")
+			config.OllamaUrl = p.StringWithFallback("ollamaUrl", config.OllamaUrl)
+			config.OllamaModel = p.StringWithFallback("ollamaModel", config.OllamaModel)
+			config.VllmUrl = p.StringWithFallback("vllmUrl", config.VllmUrl)
+			config.VllmModel = p.StringWithFallback("vllmModel", config.VllmModel)
+			config.PauseThreshold = p.FloatWithFallback("pauseThreshold", config.PauseThreshold)
+			config.LoggingEnabled = p.BoolWithFallback("loggingEnabled", config.LoggingEnabled)
+			config.MicName = p.StringWithFallback("micName", config.MicName)
+			config.SpeakerName = p.StringWithFallback("speakerName", config.SpeakerName)
+			config.SttPipeline = p.StringWithFallback("sttPipeline", config.SttPipeline)
+			config.WinWidth = float32(p.FloatWithFallback("winWidth", 1000))
+			config.WinHeight = float32(p.FloatWithFallback("winHeight", 800))
+			config.WinX = int32(p.IntWithFallback("winX", 100))
+			config.WinY = int32(p.IntWithFallback("winY", 100))
+			config.WinShowCmd = int32(p.IntWithFallback("winShowCmd", 1))
+			config.PhysX = int32(p.IntWithFallback("physX", 100))
+			config.PhysY = int32(p.IntWithFallback("physY", 100))
+			config.PhysWidth = int32(p.IntWithFallback("physWidth", 1000))
+			config.PhysHeight = int32(p.IntWithFallback("physHeight", 800))
+			config.MicGain = p.FloatWithFallback("micGain", 1.0)
+			config.SpkGain = p.FloatWithFallback("spkGain", 1.0)
+
+			migrateLegacyBackendFields()
+			migrateLegacyPipelineFields()
+			SaveConfig()
+			Log("Migration abgeschlossen.")
+
+			// Alte Einstellungen löschen (Bereinigung)
+			// Da Fyne kein 'ClearAll' hat, setzen wir die wichtigsten Felder zurück
+			p.SetString("analysisMode", "")
+			p.SetString("geminiApiKey", "")
+			p.SetString("appMode", "")
+		}
+	}
+}
+
+// currentBackend liefert die Konfiguration des in der 'remote LLM'-Sektion
+// gewählten Remote-Backends (Flash/Ollama/vLLM).
+func currentBackend() *BackendCfg {
+	switch config.RemoteBackend {
+	case "Google Flash":
+		return &config.Flash
+	case "Ollama":
+		return &config.Ollama
+	case "vLLM":
+		return &config.Vllm
+	}
+	return nil
+}
+
+// remoteConfigured prüft, ob das aktuell gewählte Remote-Backend nutzbar konfiguriert ist.
+func remoteConfigured() bool {
+	switch config.RemoteBackend {
+	case "Google Flash":
+		return config.Flash.ApiKey != ""
+	case "Ollama":
+		return config.Ollama.Url != "" && config.Ollama.Model != ""
+	case "vLLM":
+		return config.Vllm.Url != "" && config.Vllm.Model != ""
+	}
+	return false
+}
+
+// migrateLegacyPipelineFields überführt die alten Felder (SttPipeline/AnalysisMode/
+// LocalGemmaModel) einmalig in die neue Pipeline-Struktur und leert sie danach.
+func migrateLegacyPipelineFields() {
+	if config.AnalysisMode == "" && config.SttPipeline == "" {
+		return // bereits neue Struktur
+	}
+	switch config.AnalysisMode {
+	case "Google Flash", "Ollama", "vLLM":
+		config.AnalysisModel = "remote"
+		config.RemoteBackend = config.AnalysisMode
+	case "Gemma4 (lokal)", "Gemma 4":
+		if config.LocalGemmaModel == "gemma-4-12b-it-q8.gguf" {
+			config.AnalysisModel = "12b"
+		} else {
+			config.AnalysisModel = "e2b"
+		}
+	}
+	if config.SttPipeline == "Whisper + LLM" {
+		config.PostProcModel = "remote"
+	}
+	config.WhisperLocal = config.SttPipeline != "Gemma Native"
+	if config.RemoteBackend == "" {
+		config.RemoteBackend = "vLLM"
+	}
+	config.AnalysisMode, config.SttPipeline, config.LocalGemmaModel = "", "", ""
+}
+
+// migrateLegacyBackendFields überträgt die alten Flach-Felder einmalig in die
+// neuen Backend-Tripel und leert sie danach, damit sie nicht erneut persistiert
+// werden. Idempotent: überschreibt keine bereits gesetzten neuen Werte.
+func migrateLegacyBackendFields() {
+	if config.GeminiApiKey != "" && config.Flash.ApiKey == "" {
+		config.Flash.ApiKey = config.GeminiApiKey
+	}
+	if config.OllamaUrl != "" && config.Ollama.Url == "" {
+		config.Ollama.Url = config.OllamaUrl
+	}
+	if config.OllamaModel != "" && config.Ollama.Model == "" {
+		config.Ollama.Model = config.OllamaModel
+	}
+	if config.VllmUrl != "" && config.Vllm.Url == "" {
+		config.Vllm.Url = config.VllmUrl
+	}
+	if config.VllmModel != "" && config.Vllm.Model == "" {
+		config.Vllm.Model = config.VllmModel
+	}
+	config.GeminiApiKey, config.OllamaUrl, config.OllamaModel = "", "", ""
+	config.VllmUrl, config.VllmModel = "", ""
+}
+
+// pill ist ein kleiner Status-Indikator (farbiger Punkt + Text).
+type pill struct {
+	dot *canvas.Text
+	lbl *widget.Label
+	box *fyne.Container
+}
+
+func newPill() *pill {
+	dot := canvas.NewText("●", color.NRGBA{R: 190, G: 40, B: 40, A: 255})
+	dot.TextSize = 16
+	lbl := widget.NewLabel("…")
+	return &pill{dot: dot, lbl: lbl, box: container.NewHBox(dot, lbl)}
+}
+
+// set färbt den Punkt grün (ok) bzw. rot und setzt den Text. Main-Thread.
+func (p *pill) set(ok bool, text string) {
+	if ok {
+		p.dot.Color = color.NRGBA{R: 40, G: 160, B: 60, A: 255}
+	} else {
+		p.dot.Color = color.NRGBA{R: 190, G: 40, B: 40, A: 255}
+	}
+	p.dot.Refresh()
+	p.lbl.SetText(text)
+}
+
+// showInfo zeigt einen Info-Dialog mit LINKSBÜNDIGEM Text (der Standard-Dialog
+// dialog.ShowInformation zentriert den Text).
+func showInfo(title, msg string, parent fyne.Window) {
+	lbl := widget.NewLabel(msg)
+	lbl.Alignment = fyne.TextAlignLeading
+	dialog.ShowCustom(title, "OK", lbl, parent)
+}
+
+// showErr zeigt eine Fehlermeldung mit LINKSBÜNDIGEM Text (Ersatz für das
+// zentrierende dialog.ShowError).
+func showErr(err error, parent fyne.Window) {
+	lbl := widget.NewLabel(err.Error())
+	lbl.Alignment = fyne.TextAlignLeading
+	dialog.ShowCustom("Fehler", "OK", lbl, parent)
+}
+
+// showConfirm zeigt eine Ja/Nein-Sicherheitsabfrage mit LINKSBÜNDIGEM Text
+// (Ersatz für das zentrierende dialog.ShowConfirm).
+func showConfirm(title, msg string, cb func(bool), parent fyne.Window) {
+	lbl := widget.NewLabel(msg)
+	lbl.Alignment = fyne.TextAlignLeading
+	dialog.ShowCustomConfirm(title, "Ja", "Nein", lbl, cb, parent)
+}
+
+// debugPreviewAndConfirm zeigt im Debug-Modus (config.DebugMode) vor dem
+// eigentlichen Versand ein Popup mit dem Inhalt der Anfrage ("Senden" führt
+// proceed aus, "Abbrechen" bricht ab, ohne zu senden). Außerhalb des
+// Debug-Modus wird proceed sofort ausgeführt.
+func debugPreviewAndConfirm(win fyne.Window, title, payload string, proceed func()) {
+	if !config.DebugMode {
+		proceed()
+		return
+	}
+	// MultiLineEntry statt Label: Label unterstuetzt kein Markieren/Kopieren.
+	// OnChanged setzt Bearbeitungen sofort zurueck (nur lesbar, aber der Text
+	// bleibt markier- und kopierbar) - Aendern hier haette ohnehin keinen
+	// Einfluss auf die bereits gebaute Anfrage.
+	body := widget.NewMultiLineEntry()
+	body.SetText(payload)
+	body.Wrapping = fyne.TextWrapWord
+	body.OnChanged = func(s string) {
+		if s != payload {
+			body.SetText(payload)
+		}
+	}
+	scroll := container.NewScroll(body)
+	scroll.SetMinSize(fyne.NewSize(560, 320))
+	dialog.ShowCustomConfirm(title, "Senden", "Abbrechen", scroll, func(send bool) {
+		if send {
+			proceed()
+		}
+	}, win)
+}
+
+// contains prüft, ob s in slice enthalten ist.
+func contains(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// loadF64 liest einen als atomic.Uint64 gespiegelten float64-Wert.
+func loadF64(a *atomic.Uint64) float64 { return math.Float64frombits(a.Load()) }
+
+// syncConfigToAtomics spiegelt die im Hintergrund-Hot-Path gelesenen Config-Felder
+// in atomare Variablen. Muss nach jeder Config-Änderung aufgerufen werden.
+func syncConfigToAtomics() {
+	atMicGain.Store(math.Float64bits(config.MicGain))
+	atSpkGain.Store(math.Float64bits(config.SpkGain))
+	atPauseThresh.Store(math.Float64bits(config.PauseThreshold))
+	atHeadsetMode.Store(config.AppMode == "Headset-Betrieb")
+	atWhisperLocal.Store(config.WhisperLocal)
+	atHasPostProc.Store(config.PostProcModel != "" && config.PostProcModel != "none")
+	atLogging.Store(config.LoggingEnabled)
+}
+
+func writeConfigFile() {
+	configPath := filepath.Join(exeDir, "config.json")
+	data, _ := json.MarshalIndent(config, "", "  ")
+	os.WriteFile(configPath, data, 0644)
+}
+
+// SaveConfig aktualisiert die Atomics und schreibt die config.json sofort.
+func SaveConfig() {
+	syncConfigToAtomics()
+	writeConfigFile()
+}
+
+// saveConfigDebounced aktualisiert die Atomics sofort, verzögert aber das teure
+// Schreiben der Datei. Für Slider/Eingaben, die pro Tick/Tastendruck feuern.
+func saveConfigDebounced() {
+	syncConfigToAtomics()
+	saveTimerMu.Lock()
+	defer saveTimerMu.Unlock()
+	if saveTimer != nil {
+		saveTimer.Stop()
+	}
+	saveTimer = time.AfterFunc(600*time.Millisecond, writeConfigFile)
+}
+
+// opaqueWindowIcon rendert das (transparente) App-Icon auf einen deckend
+// weißen Hintergrund. Windows stellt das Titelleisten-Icon (oben links im
+// Fenster) bei einem Icon mit Alphakanal teils fehlerhaft dar; das Taskleisten-
+// symbol (myApp.SetIcon) ist davon nicht betroffen und bleibt transparent.
+func opaqueWindowIcon(src fyne.Resource) fyne.Resource {
+	img, _, err := image.Decode(bytes.NewReader(src.Content()))
+	if err != nil {
+		return src
+	}
+	bounds := img.Bounds()
+	flat := image.NewRGBA(bounds)
+	draw.Draw(flat, bounds, &image.Uniform{color.White}, image.Point{}, draw.Src)
+	draw.Draw(flat, bounds, img, bounds.Min, draw.Over)
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, flat); err != nil {
+		return src
+	}
+	return fyne.NewStaticResource("app_icon_window.png", buf.Bytes())
+}
+
+func main() {
+	// EXE-Pfad global bestimmen
+	p, _ := os.Executable()
+	exeDir = filepath.Dir(p)
+
+	// 1. App & Theme (zuerst init für Migration)
+	myApp := app.NewWithID("com.sst.gemma.hybrid")
+	appIcon := fyne.NewStaticResource("app_icon.png", appIconPNG)
+	myApp.SetIcon(appIcon) // Taskleisten-/Programmsymbol zur Laufzeit
+
+	// Konfiguration laden (mit Migration)
+	LoadConfig(myApp)
+
+	// Theme laden & anwenden (Hell = Windows-Look, sonst Dunkel)
+	applyTheme(myApp, config.Theme)
+
+	win := myApp.NewWindow("")
+	win.SetMaster()
+	win.SetIcon(opaqueWindowIcon(appIcon)) // Fenster-Icon (oben links) deckend statt transparent
+	updateWindowTitle(win)
+
+	// Fenstergröße & Position wiederherstellen
+	if config.WinWidth > 0 && config.WinHeight > 0 {
+		win.Resize(fyne.NewSize(config.WinWidth, config.WinHeight))
+	}
+
+	// Close-Intercept zum Speichern der GUI-Metriken (Größe & Position)
+	win.SetCloseIntercept(func() {
+		config.WinWidth = win.Canvas().Size().Width
+		config.WinHeight = win.Canvas().Size().Height
+		saveWindowPosition(win)
+		SaveConfig()
+		stopAllServers()
+		closeAllRemoteSessions()
+		win.Close()
+	})
+
+	// 2. UI Widgets
+	outputArea = widget.NewMultiLineEntry()
+	outputArea.SetPlaceHolder("Gesprochener Text erscheint hier...")
+	outputArea.Wrapping = fyne.TextWrapWord
+
+	statusLabel = widget.NewLabel("Initialisiere...")
+	statusLabel.Alignment = fyne.TextAlignCenter
+	statusLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	engineInfo = widget.NewLabel("Engine: Wartet...")
+	engineInfo.Alignment = fyne.TextAlignCenter
+
+	progressBar = widget.NewProgressBar()
+	progressBar.Hide()
+
+	analysisProgress = widget.NewProgressBarInfinite()
+	analysisProgress.Hide()
+
+	agentLevel = widget.NewProgressBar()
+	agentLevel.Min = 0
+	agentLevel.Max = 1
+
+	callerLevel = widget.NewProgressBar()
+	callerLevel.Min = 0
+	callerLevel.Max = 1
+
+	agentMeter = newLevelMeter(agentLevel, &agentMarkerVal)
+	callerMeter = newLevelMeter(callerLevel, &callerMarkerVal)
+
+	// Peak-Hold langsam abklingen lassen, damit ein einzelner lauter Ausschlag den
+	// Richtwert nicht dauerhaft hochhält. Neue, höhere Pegel heben ihn im Callback.
+	go func() {
+		t := time.NewTicker(250 * time.Millisecond)
+		defer t.Stop()
+		for range t.C {
+			fyne.Do(func() {
+				if agentMarkerVal > 0.005 {
+					agentMarkerVal *= 0.96
+					if agentMeter != nil {
+						agentMeter.Refresh()
+					}
+				}
+				if callerMarkerVal > 0.005 {
+					callerMarkerVal *= 0.96
+					if callerMeter != nil {
+						callerMeter.Refresh()
+					}
+				}
+			})
+		}
+	}()
+
+	// Pulse Animation - entfernt: nutzlos und erzeugt Data Race
+
+	micBtn = newTooltipButton(nil, toggleRecording, "Erkennung starten")
+	micBtn.SetText("Erkennung starten")
+	micBtn.Importance = widget.HighImportance
+	micBtn.Disable()
+
+	InitLogger()
+	Log("GUI gestartet")
+
+	// Serieller Worker für die Whisper+LLM-Satzkorrektur (siehe correctionWorker).
+	go correctionWorker()
+
+	// 3. Audio & Engine Run
+	go func() {
+		fyne.Do(func() { progressBar.Show() })
+		err := EnsureDependencies(func(task string, p float64) {
+			fyne.Do(func() {
+				statusLabel.SetText(task)
+				progressBar.SetValue(p)
+			})
+		})
+		fyne.Do(func() { progressBar.Hide() })
+
+		if err != nil {
+			fyne.Do(func() { statusLabel.SetText("Fehler bei Dependencies!") })
+			return
+		}
+		fyne.Do(func() {
+			statusLabel.SetText("Bereit")
+			micBtn.Enable()
+		})
+
+		// Lokale llama-server bedarfsgesteuert starten (Nachbearbeitung/Analyse).
+		go ensureLocalServers()
+
+		prepareAudio()
+	}()
+
+	modeIcon = widget.NewIcon(theme.SettingsIcon()) // Platzhalter
+	modeIcon.Hide()
+
+	// Analysis UI: editierbares Dropdown mit gespeicherten Analyse-Vorgaben.
+	analysisPrompt := widget.NewSelectEntry(config.AnalysisPrompts)
+	analysisPrompt.SetPlaceHolder("KI-Analyse Prompt (z.B. Fasse zusammen)")
+	analysisPrompt.SetText(config.AnalysisPrompt)
+	analysisPrompt.OnChanged = func(s string) {
+		config.AnalysisPrompt = s
+		saveConfigDebounced()
+	}
+	// rememberPrompt nimmt den aktuellen Prompt dauerhaft in die Auswahlliste auf
+	// (sofern neu/nicht leer). Wird bei Enter und beim Start einer Analyse aufgerufen.
+	rememberPrompt := func() {
+		p := strings.TrimSpace(analysisPrompt.Text)
+		if p == "" || contains(config.AnalysisPrompts, p) {
+			return
+		}
+		config.AnalysisPrompts = append(config.AnalysisPrompts, p)
+		analysisPrompt.SetOptions(config.AnalysisPrompts)
+		SaveConfig()
+		Log("Analyse-Vorgabe gespeichert: " + p)
+	}
+	analysisPrompt.OnSubmitted = func(string) { rememberPrompt() }
+
+	// Löschen-Button: entfernt die aktuell im Feld stehende Vorgabe aus der Liste.
+	delPromptBtn := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
+		p := strings.TrimSpace(analysisPrompt.Text)
+		if p == "" || !contains(config.AnalysisPrompts, p) {
+			showInfo("Vorgabe löschen", "Diese Vorgabe ist nicht in der Liste gespeichert.", win)
+			return
+		}
+		showConfirm("Vorgabe löschen", "Analyse-Vorgabe wirklich löschen?\n\n\""+p+"\"", func(ok bool) {
+			if !ok {
+				return
+			}
+			rest := config.AnalysisPrompts[:0:0]
+			for _, x := range config.AnalysisPrompts {
+				if x != p {
+					rest = append(rest, x)
+				}
+			}
+			config.AnalysisPrompts = rest
+			analysisPrompt.SetOptions(config.AnalysisPrompts)
+			analysisPrompt.SetText("")
+			SaveConfig()
+			Log("Analyse-Vorgabe gelöscht: " + p)
+		}, win)
+	})
+
+	analysisBtn := widget.NewButton("Analysieren", func() {
+		if isRecording.Load() {
+			toggleRecording()
+		}
+		text := outputArea.Text
+		prompt := analysisPrompt.Text
+		if len(strings.TrimSpace(text)) < 10 {
+			Log("Analyse übersprungen: Zu wenig Text")
+			showErr(fmt.Errorf("Zu wenig Text für eine Analyse vorhanden."), win)
+			return
+		}
+		rememberPrompt() // genutzten Prompt in die Auswahlliste übernehmen
+
+		backendDesc := modelLabelFromSymbol(config.AnalysisModel)
+		if config.AnalysisModel == "remote" {
+			backendDesc = "remote (" + config.RemoteBackend + ")"
+		}
+		preview := fmt.Sprintf("Backend: %s\n\nPrompt:\n%s\n\nText (%d Zeichen):\n%s", backendDesc, prompt, len(text), text)
+
+		debugPreviewAndConfirm(win, "Analyse-Anfrage", preview, func() {
+			Log(fmt.Sprintf("KI-Analyse gestartet (Prompt: '%s' | Text-Länge: %d)", prompt, len(text)))
+			statusLabel.SetText("Analysiere...")
+			analysisProgress.Show()
+
+			start := time.Now()
+			go func() {
+				res := runAnalysisLogic(text, prompt)
+				duration := time.Since(start).Seconds()
+				Log(fmt.Sprintf("KI-Analyse abgeschlossen in %.1fs", duration))
+
+				// Gesamter UI-Aufbau muss auf dem Main-Thread laufen.
+				fyne.Do(func() {
+					analysisProgress.Hide()
+					win.Canvas().Refresh(statusLabel)
+
+					resRichText := widget.NewRichTextFromMarkdown(res)
+					resRichText.Wrapping = fyne.TextWrapWord
+
+					copyBtn := widget.NewButtonWithIcon("In Zwischenablage kopieren", theme.ContentCopyIcon(), func() {
+						cleanText := strings.ReplaceAll(res, "**", "")
+						cleanText = strings.ReplaceAll(cleanText, "## ", "")
+						cleanText = strings.ReplaceAll(cleanText, "### ", "")
+						copyToClipboardRich(cleanText, res)
+						Log("Analyse-Ergebnis (Rich Text) in Zwischenablage kopiert")
+					})
+
+					scrollContainer := container.NewScroll(resRichText)
+					scrollContainer.SetMinSize(fyne.NewSize(600, 300))
+
+					dContent := container.NewBorder(nil, copyBtn, nil, nil, scrollContainer)
+					win2 := fyne.CurrentApp().NewWindow(fmt.Sprintf("KI-Analyse Ergebnis (%.1f s)", duration))
+					win2.SetContent(dContent)
+					win2.Resize(fyne.NewSize(700, 500))
+					moveWindowNear(win2, win)
+					win2.Show()
+
+					statusLabel.SetText("Bereit")
+				})
+			}()
+		})
+	})
+	analysisBtn.Importance = widget.HighImportance
+
+	// 5. Layout TTS (ehemals Diktat)
+	// Gain Slider für die Hauptansicht vorbereiten
+	gainLabel := widget.NewLabel(fmt.Sprintf("%.1fx", config.MicGain))
+	gainSlider := widget.NewSlider(1.0, 20.0)
+	gainSlider.Step = 0.5
+	gainSlider.SetValue(config.MicGain)
+	gainSlider.OnChanged = func(f float64) {
+		config.MicGain = f
+		gainLabel.SetText(fmt.Sprintf("%.1fx", f))
+		saveConfigDebounced()
+		agentMarkerVal = 0 // Richtwert neu ermitteln nach Gain-Änderung
+		if agentMeter != nil {
+			agentMeter.Refresh()
+		}
+	}
+
+	statusAndStart := container.NewBorder(
+		nil, nil,
+		statusLabel,
+		micBtn, // reiner Text-Button (kein Symbol), rot wie "Suchen"
+		nil,
+	)
+
+	// 3-Pixel-Abstand zum oberen Rand
+	topGap := canvas.NewRectangle(color.Transparent)
+	topGap.SetMinSize(fyne.NewSize(0, 3))
+
+	spkGainLabel = widget.NewLabel(fmt.Sprintf("%.1fx", config.SpkGain))
+	spkGainSlider = widget.NewSlider(1.0, 20.0)
+	spkGainSlider.Step = 0.5
+	spkGainSlider.SetValue(config.SpkGain)
+	spkGainSlider.OnChanged = func(f float64) {
+		config.SpkGain = f
+		spkGainLabel.SetText(fmt.Sprintf("%.1fx", f))
+		saveConfigDebounced()
+		callerMarkerVal = 0 // Richtwert neu ermitteln nach Gain-Änderung
+		if callerMeter != nil {
+			callerMeter.Refresh()
+		}
+	}
+
+	speakerSection := container.NewVBox(
+		callerMeter,
+		container.NewBorder(nil, nil, spkGainLabel, nil, spkGainSlider),
+	)
+
+	// Hilfe-Button zur Pegelanzeige – rechts in der Mic-Zeile. Hier definiert, damit
+	// die Spk-Zeile mit einem gleich breiten Platzhalter rechtsbündig abschließt.
+	pegelHelpBtn := widget.NewButtonWithIcon("", theme.QuestionIcon(), func() {
+		showInfo("Pegelanzeige & Aussteuerung",
+			"Der Balken zeigt die aktuelle Lautstärke (Pegel) des Kanals.\n\n"+
+				"🟢 Grüner Strich (80 %): Ziel-Aussteuerung – hierhin sollte laute Sprache reichen.\n\n"+
+				"🟠 Oranger Strich: höchster zuletzt erreichter Pegel (Spitzenwert). Er klingt nach Sprechpausen langsam ab und steigt bei neuen, lauteren Stellen sofort wieder.\n\n"+
+				"So stellst du den Gain (Schieberegler) ein:\n"+
+				"• Oranger Strich bleibt deutlich LINKS vom grünen → Gain erhöhen (zu leise).\n"+
+				"• Oranger Strich klebt ganz RECHTS am Anschlag → Gain senken (Übersteuerung/Verzerrung).\n"+
+				"• Optimal: bei lauter Sprache landet Orange etwa auf dem grünen Strich.", win)
+	})
+	pegelHelpBtn.Importance = widget.LowImportance // kein grauer Button-Hintergrund fuer das Hilfe-Symbol
+	spkSpacer := canvas.NewRectangle(color.Transparent)
+	spkSpacer.SetMinSize(fyne.NewSize(pegelHelpBtn.MinSize().Width, 0))
+
+	speakerControlGroup = container.NewBorder(nil, nil, widget.NewLabel("Spk:"), spkSpacer, speakerSection)
+
+	if config.AppMode != "Headset-Betrieb" {
+		speakerControlGroup.Hide()
+	}
+
+	// Drei Status-Indikatoren: Erkennung, Nachbearbeitung, Analyse - EINE globale
+	// Instanz je Status, angezeigt in der Statuszeile ganz unten am Fenster
+	// (tabuebergreifend sichtbar, wie bei anderen Windows-Anwendungen).
+	recPill, postPill, anaPill := newPill(), newPill(), newPill()
+
+	whisperReady := func() bool {
+		bin := "whisper-cli"
+		if runtime.GOOS == "windows" {
+			bin = "whisper-cli.exe"
+		}
+		_, err := os.Stat(filepath.Join(exeDir, "libs", bin))
+		return err == nil
+	}
+	// modelState liefert (verfügbar?, Anzeigetext) für ein Modell-Symbol.
+	modelState := func(sym string) (bool, string) {
+		switch sym {
+		case "none":
+			return true, "ohne"
+		case "e2b", "12b":
+			inst := instanceFor(sym)
+			return inst != nil && inst.ready.Load(), modelLabelFromSymbol(sym)
+		case "remote":
+			return remoteConfigured(), "remote (" + config.RemoteBackend + ")"
+		}
+		return false, "—"
+	}
+	updatePills := func() {
+		recOK, recTxt := true, "Erkennung: Whisper lokal"
+		if !config.WhisperLocal {
+			recOK, recTxt = atRemoteWhisperOK.Load(), "Erkennung: Remote Whisper (GPU)"
+		} else if !whisperReady() {
+			recOK = false
+		}
+		postOK, postTxt := modelState(config.PostProcModel)
+		anaOK, anaTxt := modelState(config.AnalysisModel)
+
+		recPill.set(recOK, recTxt)
+		postPill.set(postOK, "Nachbearb.: "+postTxt)
+		anaPill.set(anaOK, "Analyse: "+anaTxt)
+	}
+	// Periodischer Live-Check der lokalen Server (aktualisiert die ready-Flags).
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			refreshServerHealth()
+			if !atWhisperLocal.Load() {
+				atRemoteWhisperOK.Store(remoteWhisperHealth())
+			}
+			fyne.Do(updatePills)
+		}
+	}()
+
+	// Mic+Spk-Pegelanzeige einklappbar (Pills/Status/Fortschrittsbalken bleiben
+	// immer sichtbar). refreshDiktatTab wird unten gesetzt, sobald diktatTab
+	// existiert (Fyne layoutet den Elterncontainer bei Hide()/Show() nicht
+	// automatisch neu).
+	var refreshDiktatTab func()
+	meterContent := container.NewVBox(
+		container.NewBorder(nil, nil, widget.NewLabel("Mic:"), pegelHelpBtn,
+			container.NewVBox(
+				agentMeter,
+				container.NewBorder(nil, nil, gainLabel, nil, gainSlider),
+			),
+		),
+		speakerControlGroup,
+	)
+	meterToggle := newCollapsibleSection("Mic + Spk", meterContent, config.SttMeterExpanded, func(exp bool) {
+		config.SttMeterExpanded = exp
+		saveConfigDebounced()
+	}, func() {
+		if refreshDiktatTab != nil {
+			refreshDiktatTab()
+		}
+	})
+
+	topControls := container.NewVBox(
+		topGap,
+		statusAndStart,
+		progressBar,
+		meterToggle,
+		meterContent,
+	)
+
+	saveTranscriptBtn := widget.NewButtonWithIcon("", theme.DocumentSaveIcon(), func() {
+		text := outputArea.Text
+		if len(strings.TrimSpace(text)) == 0 {
+			showErr(fmt.Errorf("Kein Text zum Speichern vorhanden."), win)
+			return
+		}
+		filename := fmt.Sprintf("transkript_%s.txt", time.Now().Format("20060102_150405"))
+		err := os.WriteFile(filename, []byte(text), 0644)
+		if err != nil {
+			showErr(err, win)
+		} else {
+			showInfo("Export erfolgreich", "Text gespeichert unter:\n"+filename, win)
+		}
+	})
+
+	clearBtn := widget.NewButton("Inhalt leeren", func() {
+		// Sowohl Anzeige als auch internen Puffer zurücksetzen, damit neuer Text
+		// nicht an den alten Inhalt angehängt wird (currentText speist appendToOutput).
+		currentText.Reset()
+		lastSpeaker = ""
+		pendingRaw.Reset()
+		pendingSpeaker = ""
+		inProgress = nil
+		outputArea.SetText("")
+	})
+	clearBtn.Importance = widget.HighImportance
+
+	diktatTab := container.NewBorder(
+		topControls,
+		container.NewVBox(
+			engineInfo,
+			analysisProgress,
+			container.NewBorder(
+				widget.NewLabelWithStyle("LLM Prompt zur Analyse:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+				nil, nil, nil,
+				container.NewBorder(nil, nil, nil, container.NewHBox(delPromptBtn, analysisBtn), analysisPrompt),
+			),
+		),
+		nil, nil,
+		// Erkennungs-Textfenster, darunter direkt "Inhalt leeren" und "Speichern".
+		container.NewBorder(nil, container.NewHBox(clearBtn, saveTranscriptBtn), nil, nil, outputArea),
+	)
+	refreshDiktatTab = func() {
+		topControls.Refresh()
+		topControls.Resize(topControls.MinSize())
+		diktatTab.Refresh()
+	}
+
+	// Audio Device Selection Placeholder
+	var speakerSelect *widget.Select
+
+	// Mode Switcher (RadioGroup)
+	modeRadio := widget.NewRadioGroup([]string{"Standard-Betrieb", "Headset-Betrieb"}, func(s string) {
+		config.AppMode = s
+		SaveConfig()
+		if s == "Standard-Betrieb" {
+			if speakerSelect != nil {
+				speakerSelect.Disable()
+			}
+			speakerControlGroup.Hide()
+		} else {
+			if speakerSelect != nil {
+				speakerSelect.Enable()
+			}
+			speakerControlGroup.Show()
+		}
+		Log("Betriebsmodus gewechselt: " + s)
+	})
+	modeRadio.Horizontal = true
+	modeRadio.SetSelected(config.AppMode)
+	if config.AppMode == "Standard-Betrieb" {
+		// Platzhalter-Logik entfernt
+	}
+
+	modeInfoBtn := newTooltipButton(theme.InfoIcon(), func() {
+		infoText := "Wenn deine Kommunikations-Software (z.B. Teams/Zoom) beim Start der App verstummt,\n" +
+			"musst du die Exklusiv-Rechte von Windows deaktivieren, damit \n" +
+			"diese App und Teams gleichzeitig auf das Headset zugreifen können.\n\n" +
+			"Öffne die Soundeinstellungen durch Klick auf den Button unten, " +
+			"scrolle nach unten zu „Erweitert“,\nklicke auf „Weitere Soundeinstellungen“.\n\n" +
+			"🔊 Für dein Headset (Wiedergabe)\n" +
+			"1. Tab „Wiedergabe“\n" +
+			"2. Doppelklick auf dein Headset\n" +
+			"3. Tab „Erweitert“\n" +
+			"4. Entferne die Haken bei:\n" +
+			"   o „Anwendungen haben alleinige Kontrolle über das Gerät“\n" +
+			"   o „Anwendungen im exklusiven Modus haben Priorität“\n" +
+			"5. Übernehmen\n" +
+			"________________________________________\n" +
+			"🎤 Für dein Mikrofon (Aufnahme)\n" +
+			"6. Tab „Aufnahme“\n" +
+			"7. Doppelklick auf dein Mikrofon\n" +
+			"8. Tab „Erweitert“\n" +
+			"9. Die gleichen beiden Haken entfernen\n" +
+			"10. Übernehmen"
+
+		content := container.NewVBox(
+			widget.NewLabel(infoText),
+			widget.NewButtonWithIcon("Soundeinstellungen ändern", theme.SettingsIcon(), func() {
+				cmd := exec.Command("cmd", "/c", "start", "ms-settings:sound")
+				cmd.Start()
+			}),
+		)
+		winHelp := fyne.CurrentApp().NewWindow("Hilfe: Headset-Betrieb (Stumme Leitung fixen)")
+		winHelp.SetContent(content)
+		winHelp.Resize(fyne.NewSize(550, 500))
+		moveWindowNear(winHelp, win)
+		winHelp.Show()
+	}, "Hilfe zum Exklusivmodus anzeigen")
+	modeInfoBtn.Importance = widget.LowImportance // kein grauer Button-Hintergrund fuer das Info-Symbol
+
+	// Audio Device Selection
+	micNames, micMap := getDeviceList(malgo.Capture)
+	micSelect := widget.NewSelect(micNames, func(s string) {
+		id := micMap[s]
+		selectedMicID = &id
+		config.MicName = s
+		SaveConfig()
+		Log("Mikrofon gewechselt: " + s)
+		prepareAudio()
+	})
+	micSelect.PlaceHolder = "Standard-Mikrofon"
+	if config.MicName != "System-Standard" {
+		micSelect.SetSelected(config.MicName)
+	}
+
+	speakerNames, speakerMap := getDeviceList(malgo.Playback)
+	speakerSelect = widget.NewSelect(speakerNames, func(s string) {
+		id := speakerMap[s]
+		selectedSpeakerID = &id
+		config.SpeakerName = s
+		SaveConfig()
+		Log("Lautsprecher gewechselt: " + s)
+		prepareAudio()
+	})
+	speakerSelect.PlaceHolder = "Standard-Lautsprecher"
+	if config.AppMode != "Headset-Betrieb" {
+		speakerSelect.Disable()
+	}
+	if config.SpeakerName != "System-Standard" {
+		speakerSelect.SetSelected(config.SpeakerName)
+	}
+
+	// Pause Slider
+	pauseLabel := widget.NewLabel(fmt.Sprintf("Satzpause: %.1fs", config.PauseThreshold))
+	pauseSlider := widget.NewSlider(0.5, 5.0)
+	pauseSlider.Step = 0.5
+	pauseSlider.SetValue(config.PauseThreshold)
+	pauseSlider.OnChanged = func(v float64) {
+		config.PauseThreshold = v
+		saveConfigDebounced()
+		pauseLabel.SetText(fmt.Sprintf("Satzpause: %.1fs", v))
+	}
+
+	// Logging Toggle
+	logCheck := widget.NewCheck("System-Logging aktivieren", func(b bool) {
+		config.LoggingEnabled = b
+		SaveConfig()
+		if b {
+			Log("Logging aktiviert")
+		}
+	})
+	logCheck.SetChecked(config.LoggingEnabled)
+
+	debugCheck := widget.NewCheck("Debug-Modus (Anfrage vor Versand anzeigen: Suchen/Analysieren)", func(b bool) {
+		config.DebugMode = b
+		SaveConfig()
+	})
+	debugCheck.SetChecked(config.DebugMode)
+
+	updateAnalysisUI := func() {} // Forward declaration
+
+	// --- 'remote LLM': Auswahl des Remote-Backends (Flash/Ollama/vLLM) ---
+	flashRadio := widget.NewButtonWithIcon("Google Flash", theme.RadioButtonIcon(), func() {
+		config.RemoteBackend = "Google Flash"
+		SaveConfig()
+		updateAnalysisUI()
+	})
+	flashRadio.Importance = widget.LowImportance
+	flashRadio.Alignment = widget.ButtonAlignLeading
+
+	ollamaRadio := widget.NewButtonWithIcon("Ollama", theme.RadioButtonIcon(), func() {
+		config.RemoteBackend = "Ollama"
+		SaveConfig()
+		updateAnalysisUI()
+	})
+	ollamaRadio.Importance = widget.LowImportance
+	ollamaRadio.Alignment = widget.ButtonAlignLeading
+
+	vllmRadio := widget.NewButtonWithIcon("vLLM", theme.RadioButtonIcon(), func() {
+		config.RemoteBackend = "vLLM"
+		SaveConfig()
+		updateAnalysisUI()
+	})
+	vllmRadio.Importance = widget.LowImportance
+	vllmRadio.Alignment = widget.ButtonAlignLeading
+
+	// Verbindungsfelder des gewählten Remote-Backends (currentBackend).
+	apiKeyEntry := NewMinSizeEntry(200)
+	apiKeyEntry.Entry.SetPlaceHolder("API Key")
+	apiKeyEntry.Entry.OnChanged = func(s string) {
+		if b := currentBackend(); b != nil {
+			b.ApiKey = s
+			saveConfigDebounced()
+		}
+	}
+
+	urlEntry := NewMinSizeEntry(200)
+	urlEntry.Entry.SetPlaceHolder("http://localhost:...")
+	urlEntry.Entry.OnChanged = func(s string) {
+		if b := currentBackend(); b != nil {
+			b.Url = s
+			saveConfigDebounced()
+		}
+	}
+
+	modelEntry := NewMinSizeEntry(200)
+	modelEntry.Entry.SetPlaceHolder("Modell-Name")
+	modelEntry.Entry.OnChanged = func(s string) {
+		if b := currentBackend(); b != nil {
+			b.Model = s
+			saveConfigDebounced()
+		}
+	}
+
+	// Verbindungsfelder fuer die Jarvis-KI-Support-API (siehe jarvis_client.go).
+	jarvisServerEntry := NewMinSizeEntry(200)
+	jarvisServerEntry.Entry.SetPlaceHolder("https://jarvis-host")
+	jarvisServerEntry.Entry.SetText(config.Jarvis.Url)
+	jarvisServerEntry.Entry.OnChanged = func(s string) {
+		config.Jarvis.Url = s
+		saveConfigDebounced()
+	}
+	jarvisApiKeyEntry := widget.NewPasswordEntry()
+	jarvisApiKeyEntry.SetPlaceHolder("API-Key")
+	jarvisApiKeyEntry.SetText(config.Jarvis.ApiKey)
+	jarvisApiKeyEntry.OnChanged = func(s string) {
+		config.Jarvis.ApiKey = s
+		saveConfigDebounced()
+	}
+
+	// DE/EN-Anzeige (Segment-Pill, siehe design.png "de_en.png") - Umschalten ist
+	// deaktiviert: die Jarvis-Suche laeuft fest auf Deutsch, das Umschalten auf
+	// EN wuerde die deutschsprachigen Support-Inhalte (Jira/Confluence) nicht
+	// sinnvoll verbessern. Pille bleibt sichtbar, reagiert aber nicht auf Klicks.
+	config.JarvisLang = "de"
+	deFg := canvas.NewText("DE", color.White)
+	deFg.TextStyle = fyne.TextStyle{Bold: true}
+	deFg.TextSize = 11
+	enFg := canvas.NewText("EN", theme.Color(theme.ColorNameDisabled))
+	enFg.TextStyle = fyne.TextStyle{Bold: true}
+	enFg.TextSize = 11
+	deBg := canvas.NewRectangle(kiAccent)
+	deBg.CornerRadius = 9
+	enBg := canvas.NewRectangle(color.Transparent)
+	enBg.CornerRadius = 9
+	jarvisLangTrack := canvas.NewRectangle(color.NRGBA{R: 0xEA, G: 0xEA, B: 0xEA, A: 255})
+	jarvisLangTrack.CornerRadius = 9
+	jarvisLangToggle := container.NewHBox(container.NewStack(
+		jarvisLangTrack,
+		container.New(&segmentLayout{},
+			container.NewStack(deBg, container.NewPadded(deFg)),
+			container.NewStack(enBg, container.NewPadded(enFg)),
+		),
+	))
+
+	// Auto-Discovery der Modelle des gewählten Remote-Backends.
+	discoverBtn := newTooltipButton(theme.SearchIcon(), func() {
+		b := currentBackend()
+		if b == nil {
+			return
+		}
+		mode := config.RemoteBackend
+		srvUrl := b.Url
+		apiKey := b.ApiKey
+		statusLabel.SetText("Suche Modelle...")
+		go func() {
+			var models []string
+			var derr error
+			switch mode {
+			case "vLLM":
+				models, derr = fetchVllmModels(srvUrl, apiKey)
+			case "Ollama":
+				models, derr = fetchOllamaModels(srvUrl, apiKey)
+			}
+			fyne.Do(func() {
+				statusLabel.SetText("Bereit")
+				if derr != nil {
+					showErr(derr, win)
+					return
+				}
+				if len(models) == 0 {
+					showErr(fmt.Errorf("Server unter %s erreichbar, meldet aber keine Modelle.", srvUrl), win)
+					return
+				}
+				sel := widget.NewSelect(models, nil)
+				sel.SetSelectedIndex(0)
+				content := container.NewVBox(
+					widget.NewLabel(fmt.Sprintf("%d Modelle erkannt:", len(models))),
+					sel,
+				)
+				dialog.ShowCustomConfirm("Modell auswählen", "Auswählen", "Abbrechen", content, func(ok bool) {
+					if ok && sel.Selected != "" {
+						modelEntry.Entry.SetText(sel.Selected)
+					}
+				}, win)
+			})
+		}()
+	}, "Verfügbare Modelle vom Server abrufen (Auto-Discovery)")
+
+	modelRow := container.NewBorder(nil, nil, discoverBtn, nil, modelEntry)
+
+	updateAnalysisUI = func() {
+		flashRadio.SetIcon(theme.RadioButtonIcon())
+		ollamaRadio.SetIcon(theme.RadioButtonIcon())
+		vllmRadio.SetIcon(theme.RadioButtonIcon())
+		switch config.RemoteBackend {
+		case "Google Flash":
+			flashRadio.SetIcon(theme.RadioButtonCheckedIcon())
+		case "Ollama":
+			ollamaRadio.SetIcon(theme.RadioButtonCheckedIcon())
+		default:
+			vllmRadio.SetIcon(theme.RadioButtonCheckedIcon())
+		}
+		if b := currentBackend(); b != nil {
+			apiKeyEntry.Entry.SetText(b.ApiKey)
+			urlEntry.Entry.SetText(b.Url)
+			modelEntry.Entry.SetText(b.Model)
+		}
+		// Modell-Discovery nur für Ollama/vLLM sinnvoll.
+		if config.RemoteBackend == "Ollama" || config.RemoteBackend == "vLLM" {
+			discoverBtn.Enable()
+		} else {
+			discoverBtn.Disable()
+		}
+		updatePills()
+	}
+	updateAnalysisUI() // Initialer Aufruf
+
+	// prepareSelection lädt bei Bedarf das lokale Modell eines Pulldown-Symbols
+	// herunter und startet/stoppt die lokalen Server passend zur aktuellen Auswahl.
+	prepareSelection := func(sym string) {
+		f := modelFileForSymbol(sym)
+		if f == "" { // "none"/"remote": kein lokales Modell nötig
+			go ensureLocalServers()
+			updatePills()
+			return
+		}
+		prog := widget.NewProgressBarInfinite()
+		info := widget.NewLabel("Bereite Modell vor …")
+		dlg := dialog.NewCustom("Modell wird vorbereitet", "Im Hintergrund weiter", container.NewVBox(info, prog), win)
+		dlg.Show()
+		go func() {
+			if err := ensureLocalModel(f, func(task string, p float64) {
+				fyne.Do(func() { info.SetText(task) })
+			}); err != nil {
+				Log("Modell-Download-Fehler: " + err.Error())
+				fyne.Do(func() { info.SetText("Download fehlgeschlagen:\n" + err.Error()) })
+				return
+			}
+			ensureLocalServers()
+			fyne.Do(func() { dlg.Hide(); updatePills() })
+		}()
+	}
+
+	// --- Erkennung: Whisper lokal vs. Remote Whisper (GPU) ---
+	remoteUrlEntry := NewMinSizeEntry(260)
+	remoteUrlEntry.Entry.SetPlaceHolder("ws://host:8090/ws/stt")
+	remoteUrlEntry.Entry.SetText(config.RemoteWhisperUrl)
+	remoteUrlEntry.Entry.OnChanged = func(s string) {
+		config.RemoteWhisperUrl = s
+		saveConfigDebounced()
+	}
+	whisperRadio := widget.NewRadioGroup([]string{"Whisper lokal", "Remote GPU"}, func(s string) {
+		b := s == "Whisper lokal"
+		config.WhisperLocal = b
+		SaveConfig()
+		if b {
+			closeAllRemoteSessions() // zurück zu lokal -> Remote-Sessions beenden
+			remoteUrlEntry.Disable()
+		} else {
+			remoteUrlEntry.Enable()
+		}
+		updatePills()
+	})
+	whisperRadio.Horizontal = true
+	if config.WhisperLocal {
+		whisperRadio.SetSelected("Whisper lokal")
+		remoteUrlEntry.Disable()
+	} else {
+		whisperRadio.SetSelected("Remote GPU")
+		remoteUrlEntry.Enable()
+	}
+
+	// --- Nachbearbeitung der Erkennung ---
+	postProcSelect := NewMinSizeSelect([]string{"ohne", "Gemma 4 E2B", "Gemma 4 12B", "remote LLM"}, func(s string) {
+		config.PostProcModel = modelSymbolFromLabel(s)
+		SaveConfig()
+		prepareSelection(config.PostProcModel)
+	}, 170)
+	postProcSelect.SetSelected(modelLabelFromSymbol(config.PostProcModel))
+	postProcHelpBtn := widget.NewButtonWithIcon("", theme.QuestionIcon(), func() {
+		showInfo("Spracherkennung & Nachbearbeitung",
+			"Erkennung:\n"+
+				"• Whisper lokal: lokaler whisper-cli (CPU).\n"+
+				"• Remote GPU: GPU-Whisper-Server über die WebSocket-URL.\n\n"+
+				"Nachbearbeitung: Verbessert den erkannten Text.\n"+
+				"• ohne: roher Text\n"+
+				"• Gemma 4 E2B / 12B: lokale Korrektur (12B genauer, aber langsam auf CPU)\n"+
+				"• remote LLM: Korrektur über das unten gewählte Remote-Backend", win)
+	})
+	postProcHelpBtn.Importance = widget.LowImportance // kein grauer Button-Hintergrund fuer das Hilfe-Symbol
+
+	// --- Analyse (manuell, mit Prompt) ---
+	analysisSelect := NewMinSizeSelect([]string{"Gemma 4 E2B", "Gemma 4 12B", "remote LLM"}, func(s string) {
+		config.AnalysisModel = modelSymbolFromLabel(s)
+		SaveConfig()
+		prepareSelection(config.AnalysisModel)
+	}, 170)
+	analysisSelect.SetSelected(modelLabelFromSymbol(config.AnalysisModel))
+
+	saveBtn := widget.NewButtonWithIcon("Einstellungen jetzt speichern", theme.DocumentSaveIcon(), func() {
+		Log("Manuelle Konfigurationsspeicherung ausgelöst")
+		showInfo("Erfolg", "Alle Einstellungen wurden dauerhaft gespeichert.", win)
+	})
+
+	// KI-Support: zweite Haelfte NUR des STT-Tabs, Anbindung an die Jarvis-Support-API.
+	kiSupportTab := buildKISupportPanel(win)
+
+	// "Prompt für Suchen" (config.JarvisSearchQuery): LLM-Anweisung, die bei
+	// jeder Suche im "prompt"-Feld mitgeschickt wird - bewusst OHNE Verbindung
+	// zur Sucheingabe (queryEntry) im KI-Support-Panel.
+	jarvisSearchPromptEntry := NewMinSizeEntry(alignedFormValueW)
+	jarvisSearchPromptEntry.Entry.SetText(config.JarvisSearchQuery)
+	jarvisSearchPromptEntry.Entry.OnChanged = func(s string) {
+		config.JarvisSearchQuery = s
+		saveConfigDebounced()
+	}
+
+	settingsContent := container.New(&compactVBoxLayout{},
+		widget.NewLabelWithStyle("Betriebsmodus", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewHBox(modeRadio, modeInfoBtn),
+
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Audio-Geräte", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.New(&alignedFormLayout{},
+			widget.NewLabel("Mikrofon:"), framedSelect(micSelect),
+			widget.NewLabel("Lautsprecher:"), framedSelect(speakerSelect),
+		),
+
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Spracherkennung und Analyse", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.New(&alignedFormLayout{},
+			widget.NewLabel("Transkribierung über:"), whisperRadio,
+			widget.NewLabel("Nachbearbeitung:"), container.NewBorder(nil, nil, nil, postProcHelpBtn, framedSelect(postProcSelect)),
+		),
+		container.New(&alignedFormLayout{}, widget.NewLabel("Remote-Whisper-URL:"), remoteUrlEntry),
+		container.New(&alignedFormLayout{}, widget.NewLabel("Analyse (manuell, mit Prompt):"), framedSelect(analysisSelect)),
+
+		widget.NewLabel(""), // Leerzeile vor 'remote LLM konfigurieren'
+
+		// remote LLM - 3 Zeilen, 3 Spalten: Radio(180) | Label | Value
+		func() fyne.CanvasObject {
+			header := widget.NewLabelWithStyle("remote LLM konfigurieren", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+			return container.New(&llmTableLayout{},
+				header,
+				flashRadio, widget.NewLabel("API key:"), apiKeyEntry,
+				ollamaRadio, widget.NewLabel("URL:"), urlEntry,
+				vllmRadio, widget.NewLabel("Modelname:"), modelRow,
+			)
+		}(),
+
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("KI-Support (Jarvis)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.New(&alignedFormLayout{},
+			widget.NewLabel("Server-URL:"), jarvisServerEntry,
+			widget.NewLabel("API-Key:"), jarvisApiKeyEntry,
+			widget.NewLabel("Prompt für Suchen:"), jarvisSearchPromptEntry,
+		),
+		container.New(&compactFormLayout{},
+			widget.NewLabel("Sprache:"), jarvisLangToggle,
+		),
+
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("System-Einstellungen", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		logCheck,
+		debugCheck,
+
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Design", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		func() *widget.RadioGroup {
+			r := widget.NewRadioGroup([]string{"Hell (klassisch)", "Hell (modern)", "Dunkel (modern)"}, func(s string) {
+				config.Theme = s
+				SaveConfig()
+				applyTheme(myApp, s)
+				setWindowSquare(win, isClassic(s)) // klassisch -> eckiger Fensterrahmen
+			})
+			switch config.Theme {
+			case "Dunkel", "Dunkel (modern)":
+				r.SetSelected("Dunkel (modern)")
+			case "Klassisch", "Hell (klassisch)":
+				r.SetSelected("Hell (klassisch)")
+			default:
+				r.SetSelected("Hell (modern)")
+			}
+			r.Horizontal = true
+			return r
+		}(),
+
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Speicherpfade", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("Binaries: ./libs/"),
+		widget.NewLabel("Modelle: ./models/"),
+	)
+
+	// Weisser Hintergrund statt des Theme-Graus (klassischer Modus) - wie beim
+	// Windows Explorer, dessen Inhaltsbereich ebenfalls weiss bleibt.
+	settingsBg := canvas.NewRectangle(color.White)
+	configTab := container.NewBorder(saveBtn, nil, nil, nil,
+		container.NewStack(settingsBg, container.NewVScroll(settingsContent)),
+	)
+
+	// STT-Tab in zwei per Maus verschiebbare Haelften teilen (Splitter mittig).
+	// Die Einstellungen bleiben unangetastet ein eigener, ungeteilter Tab.
+	sttSplit := container.NewHSplit(diktatTab, kiSupportTab)
+	sttSplit.SetOffset(0.5)
+
+	tabs := container.NewAppTabs(
+		container.NewTabItemWithIcon("STT", theme.MediaRecordIcon(), sttSplit),
+		container.NewTabItemWithIcon("Einstellungen", theme.SettingsIcon(), configTab),
+	)
+
+	// Firmenlogo oben rechts, auf gleicher Hoehe wie die Tab-Reiter. AppTabs hat
+	// keinen eigenen Slot dafuer - das Logo wird per Stack ueber die Tabs gelegt
+	// und rechtsbuendig in eine eigene Kopfzeile einsortiert. Der Rest dieser
+	// Overlay-Zeile bleibt leer/transparent, Klicks auf die Tabs darunter
+	// funktionieren daher weiterhin normal.
+	logoImg := canvas.NewImageFromResource(fyne.NewStaticResource("nexus-dp-hell.png", nexusLogoPNG))
+	// ImageFillContain: skaliert das Bild UNTER BEIBEHALTUNG des Seitenverhaeltnisses
+	// in die MinSize hinein (kein Stretch/Verzerren, ggf. Leerraum) - bewusst NICHT
+	// ImageFillStretch. 141x36 entspricht (wie zuvor 86x22) nahezu exakt dem
+	// Originalverhaeltnis der PNG (188x48 = 3.917 : 1), nur groesser dargestellt.
+	logoImg.FillMode = canvas.ImageFillContain
+	logoImg.SetMinSize(fyne.NewSize(141, 36))
+	logoOverlay := container.New(&topRightOverlayLayout{rightMargin: 8, yOffset: -8}, logoImg)
+
+	// Statuszeile ganz unten am Fenster (wie bei anderen Windows-Anwendungen) -
+	// tabuebergreifend sichtbar, unabhaengig davon ob STT oder Einstellungen
+	// aktiv ist.
+	statusBar := container.NewVBox(
+		widget.NewSeparator(),
+		container.NewPadded(container.NewHBox(recPill.box, postPill.box, anaPill.box)),
+	)
+
+	win.SetContent(container.NewBorder(nil, statusBar, nil, nil, container.NewStack(tabs, logoOverlay)))
+	restoreWindowPosition(win)
+	setWindowSquare(win, isClassic(config.Theme)) // eckiger Fensterrahmen im klassischen Design
+	win.ShowAndRun()
+}
+
+func toggleRecording() {
+	if !isRecording.Load() {
+		// Device ist bereits gestartet durch prepareAudio() beim Init/Wechsel
+		now := time.Now()
+		lastSoundTime.Store(&now)
+		isSilent.Store(false)
+		lastSpeaker = "" // Neustart -> erstes Segment bekommt wieder ein Label
+		pendingRaw.Reset()
+		pendingSpeaker = ""
+		inProgress = nil
+		isRecording.Store(true)
+		micBtn.SetText("Erkennung stoppen")
+		micBtn.tip = "Erkennung stoppen"
+		micBtn.Importance = widget.DangerImportance
+		statusLabel.SetText("Höre zu...")
+	} else {
+		// Offenen Whisper+LLM-Block beim Stoppen noch korrigieren (läuft im Main-Thread).
+		if atHasPostProc.Load() {
+			flushPendingToCorrection()
+		}
+		statusLabel.SetText("Bereit")
+		isRecording.Store(false)
+		micBtn.SetText("Erkennung starten")
+		micBtn.tip = "Erkennung starten"
+		micBtn.Importance = widget.HighImportance
+	}
+	micBtn.Refresh()
+}
+
+func prepareAudio() {
+	// Serialisiert parallele Aufrufe (Init-Goroutine vs. Geräte-Wechsel im UI-Thread).
+	audioMu.Lock()
+	defer audioMu.Unlock()
+
+	// Zuvor laufende Buffer-Goroutinen beenden. Non-blocking: die alten Goroutinen
+	// erkennen das Cancel beim nächsten select-Durchlauf und kehren selbst zurück
+	// (kein <-drain im UI-Thread mehr -> kein GUI-Freeze, kein Deadlock).
+	if agentBufCancel != nil {
+		agentBufCancel()
+		agentBufCancel = nil
+	}
+	if callerBufCancel != nil {
+		callerBufCancel()
+		callerBufCancel = nil
+	}
+
+	if mctx == nil {
+		backends := []malgo.Backend{}
+		if runtime.GOOS == "windows" {
+			backends = append(backends, malgo.BackendWasapi)
+		}
+		c, err := malgo.InitContext(backends, malgo.ContextConfig{}, nil)
+		if err != nil {
+			Log(fmt.Sprintf("FATAL: Audio-Kontext-Fehler: %v", err))
+			return
+		}
+		mctx = c
+	}
+
+	// 1. Mikrofon (Agent)
+	if audioDevice != nil {
+		audioDevice.Uninit()
+	}
+
+	configMic := malgo.DefaultDeviceConfig(malgo.Capture)
+	configMic.Capture.Format = malgo.FormatS16
+	configMic.Capture.Channels = 1
+	configMic.SampleRate = 16000
+	if selectedMicID != nil {
+		configMic.Capture.DeviceID = selectedMicID.Pointer()
+	}
+
+	sampleChanAgent := make(chan []byte, 100)
+	onDataMic := func(pOutput, pInput []byte, frameCount uint32) {
+		if len(pInput) > 0 {
+			// Digitale Verstärkung (Gain) anwenden — Gain einmal lokal lesen für Race-Free
+			gain := loadF64(&atMicGain)
+			if gain > 1.0 {
+				for i := 0; i < len(pInput); i += 2 {
+					val := int16(binary.LittleEndian.Uint16(pInput[i : i+2]))
+					boosted := float64(val) * gain
+
+					// Clipping-Schutz
+					if boosted > 32767 {
+						boosted = 32767
+					}
+					if boosted < -32768 {
+						boosted = -32768
+					}
+
+					binary.LittleEndian.PutUint16(pInput[i:i+2], uint16(int16(boosted)))
+				}
+			}
+
+			// Pegel berechnen (immer aktiv)
+			var peak float64
+			for i := 0; i < len(pInput); i += 2 {
+				val := int16(binary.LittleEndian.Uint16(pInput[i : i+2]))
+				fval := float64(val)
+				if fval < 0 {
+					fval = -fval
+				}
+				if fval > peak {
+					peak = fval
+				}
+			}
+			level := peak / 20000.0
+			fyne.Do(func() {
+				agentLevel.SetValue(level)
+				if level > agentMarkerVal { // Peak-Hold: höchsten Ausschlag als Richtwert merken
+					agentMarkerVal = level
+					if agentMeter != nil {
+						agentMeter.Refresh()
+					}
+				}
+			})
+
+			if isRecording.Load() {
+				detectSilence(pInput)
+				c := make([]byte, len(pInput))
+				copy(c, pInput)
+				// Non-blocking: Audio-Callback darf niemals blockieren. Läuft der
+				// Puffer wegen langsamer Transkription voll, wird das Segment verworfen.
+				select {
+				case sampleChanAgent <- c:
+				default:
+					Log("WARN: Agent-Audiopuffer voll – Segment verworfen")
+				}
+			}
+		}
+	}
+
+	if devMic, err := malgo.InitDevice(mctx.Context, configMic, malgo.DeviceCallbacks{Data: onDataMic}); err == nil {
+		audioDevice = devMic
+		audioDevice.Start() // Sofort starten für Pegelanzeige
+	}
+
+	// 2. Loopback (Anrufer) - Nur Windows
+	if callerDevice != nil {
+		callerDevice.Uninit()
+	}
+
+	sampleChanCaller := make(chan []byte, 100)
+	if runtime.GOOS == "windows" {
+		configLoop := malgo.DefaultDeviceConfig(malgo.Loopback)
+		configLoop.Capture.Format = malgo.FormatS16
+		configLoop.Capture.Channels = 1
+		configLoop.SampleRate = 16000
+		if selectedSpeakerID != nil {
+			configLoop.Playback.DeviceID = selectedSpeakerID.Pointer()
+		}
+
+		onDataLoop := func(pOutput, pInput []byte, frameCount uint32) {
+			if len(pInput) > 0 {
+				// Digitale Verstärkung (Gain) anwenden — Gain einmal lokal lesen für Race-Free
+				gainSpk := loadF64(&atSpkGain)
+				if gainSpk > 1.0 {
+					for i := 0; i < len(pInput); i += 2 {
+						val := int16(binary.LittleEndian.Uint16(pInput[i : i+2]))
+						boosted := float64(val) * gainSpk
+
+						// Clipping-Schutz
+						if boosted > 32767 {
+							boosted = 32767
+						}
+						if boosted < -32768 {
+							boosted = -32768
+						}
+
+						binary.LittleEndian.PutUint16(pInput[i:i+2], uint16(int16(boosted)))
+					}
+				}
+
+				// Pegel berechnen (immer aktiv im Modus)
+				var peak float64
+				for i := 0; i < len(pInput); i += 2 {
+					val := int16(binary.LittleEndian.Uint16(pInput[i : i+2]))
+					fval := float64(val)
+					if fval < 0 {
+						fval = -fval
+					}
+					if fval > peak {
+						peak = fval
+					}
+				}
+				level := peak / 20000.0
+				fyne.Do(func() {
+					callerLevel.SetValue(level)
+					if level > callerMarkerVal { // Peak-Hold als Richtwert
+						callerMarkerVal = level
+						if callerMeter != nil {
+							callerMeter.Refresh()
+						}
+					}
+				})
+
+				if isRecording.Load() && atHeadsetMode.Load() {
+					c := make([]byte, len(pInput))
+					copy(c, pInput)
+					// Non-blocking (siehe Mic-Callback)
+					select {
+					case sampleChanCaller <- c:
+					default:
+						Log("WARN: Anrufer-Audiopuffer voll – Segment verworfen")
+					}
+				}
+			}
+		}
+
+		if devLoop, err := malgo.InitDevice(mctx.Context, configLoop, malgo.DeviceCallbacks{Data: onDataLoop}); err == nil {
+			callerDevice = devLoop
+			callerDevice.Start() // Sofort starten für Pegelanzeige
+		}
+	}
+
+	// Agent Buffer Loop
+	agentCtx, agentCancel := context.WithCancel(context.Background())
+	go func() {
+		var audioBuffer []byte
+		const secondsToBuffer = 4
+		const bytesPerSecond = 16000 * 2
+		for {
+			select {
+			case <-agentCtx.Done():
+				return
+			case samples, ok := <-sampleChanAgent:
+				if !ok {
+					return
+				}
+				audioBuffer = append(audioBuffer, samples...)
+				if len(audioBuffer) >= bytesPerSecond*secondsToBuffer {
+					processSegment(audioBuffer, "Agent")
+					// Nicht-überlappendes Fenster: vorher wurden 3 von 4 s erneut
+					// transkribiert und doppelt angehängt. Buffer komplett leeren.
+					audioBuffer = nil
+				}
+			}
+		}
+	}()
+
+	// Caller Buffer Loop
+	callerCtx, callerCancel := context.WithCancel(context.Background())
+	go func() {
+		var audioBuffer []byte
+		const secondsToBuffer = 4
+		const bytesPerSecond = 16000 * 2
+		for {
+			select {
+			case <-callerCtx.Done():
+				return
+			case samples, ok := <-sampleChanCaller:
+				if !ok {
+					return
+				}
+				audioBuffer = append(audioBuffer, samples...)
+				if len(audioBuffer) >= bytesPerSecond*secondsToBuffer {
+					processSegment(audioBuffer, "Anrufer")
+					// Nicht-überlappendes Fenster (siehe Agent-Loop)
+					audioBuffer = nil
+				}
+			}
+		}
+	}()
+
+	// Cancel-Funktionen der NEUEN Goroutinen global merken, damit der nächste
+	// prepareAudio-Aufruf genau diese (und nicht sich selbst) beenden kann.
+	agentBufCancel = agentCancel
+	callerBufCancel = callerCancel
+}
+
+func getDeviceList(kind malgo.DeviceType) ([]string, map[string]malgo.DeviceID) {
+	if mctx == nil {
+		backends := []malgo.Backend{}
+		if runtime.GOOS == "windows" {
+			backends = append(backends, malgo.BackendWasapi)
+		}
+		c, _ := malgo.InitContext(backends, malgo.ContextConfig{}, nil)
+		mctx = c
+	}
+
+	devices, _ := mctx.Devices(kind)
+	names := []string{"System-Standard"}
+	mapping := make(map[string]malgo.DeviceID)
+
+	for _, d := range devices {
+		name := d.Name()
+		names = append(names, name)
+		mapping[name] = d.ID
+	}
+	return names, mapping
+}
+
+func detectSilence(samples []byte) {
+	var max int16
+	for i := 0; i < len(samples); i += 2 {
+		val := int16(binary.LittleEndian.Uint16(samples[i : i+2]))
+		if val < 0 {
+			val = -val
+		}
+		if val > max {
+			max = val
+		}
+	}
+
+	// Threshold für Stille (ca. 2% Amplitude)
+	if max > 600 {
+		now := time.Now()
+		lastSoundTime.Store(&now)
+		isSilent.Store(false)
+	} else {
+		// lastSoundTime kann beim allerersten Aufruf noch leer sein (nil interface),
+		// daher abgesicherte Type-Assertion statt direktem Dereferenzieren.
+		lt, ok := lastSoundTime.Load().(*time.Time)
+		if !isSilent.Load() && ok && time.Since(*lt) > time.Duration(loadF64(&atPauseThresh)*1000)*time.Millisecond {
+			isSilent.Store(true)
+			if atHasPostProc.Load() {
+				// Whisper+LLM: Sprechpause beendet den Satz -> zur LLM-Korrektur geben.
+				fyne.Do(flushPendingToCorrection)
+			}
+			// Ohne Nachbearbeitung: kein Umbruch bei Pause – Absätze entstehen nur
+			// bei Sprecherwechsel (siehe writeSpeakerPrefix).
+		}
+	}
+}
+
+// nowStamp liefert den Zeitstempel für ein Sprecher-Label: TT.MM.JJJJ - HH:MM:SS.
+func nowStamp() string { return time.Now().Format("02.01.2006 - 15:04:05") }
+
+// correctionJob ist ein an die LLM-Satzkorrektur (Whisper+LLM) übergebener Block.
+type correctionJob struct {
+	speaker string
+	raw     string
+	ts      string
+}
+
+// pendingBlock ist ein Whisper-Rohblock, der gerade per LLM korrigiert wird. Sein
+// Rohtext bleibt im Transkript sichtbar, bis die Korrektur eintrifft und ihn
+// ersetzt – so verschwindet während der Korrektur kein bereits erkannter Text.
+type pendingBlock struct {
+	speaker string
+	text    string
+	ts      string
+}
+
+// refreshOutput baut das Transkript aus drei Ebenen zusammen: dem finalisierten
+// Text (currentText), den noch in Korrektur befindlichen Rohblöcken (inProgress)
+// und dem aktuell laufenden Live-Rohblock (pendingRaw). Sprecher-Labels nur bei
+// Wechsel. MUSS im Fyne-Main-Thread laufen.
+func refreshOutput() {
+	var sb strings.Builder
+	sb.WriteString(currentText.String())
+	lastSp := lastSpeaker // lokale Fortschreibung für noch nicht finalisierte Teile
+	emit := func(sp, ts, text string) {
+		if text == "" {
+			return
+		}
+		if sp != lastSp {
+			if lastSp != "" {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(fmt.Sprintf("%s [%s]: ", ts, sp))
+			lastSp = sp
+		} else {
+			sb.WriteString(" ")
+		}
+		sb.WriteString(text)
+	}
+	for _, pb := range inProgress {
+		emit(pb.speaker, pb.ts, pb.text)
+	}
+	if pendingRaw.Len() > 0 {
+		emit(pendingSpeaker, pendingTs, pendingRaw.String())
+	}
+	full := strings.TrimLeft(sb.String(), " ")
+	outputArea.SetText(full)
+	outputArea.CursorRow = len(strings.Split(full, "\n"))
+}
+
+func appendToOutput(text string) {
+	// Wird aus Worker-Goroutinen / Audio-Callbacks aufgerufen. Fyne (>=2.6)
+	// verlangt UI-Zugriffe über fyne.Do; das schützt zugleich currentText.
+	fyne.Do(func() {
+		currentText.WriteString(text)
+		refreshOutput()
+	})
+}
+
+// writeSpeakerPrefix schreibt das Label [Sprecher] in currentText – aber nur bei
+// Sprecherwechsel (sonst nur ein Trennzeichen). marker kennzeichnet die Pipeline
+// (z.B. "*" für Gemma Native). Erwartet Ausführung im Main-Thread.
+func writeSpeakerPrefix(speaker, marker, ts string) {
+	if speaker != lastSpeaker {
+		if lastSpeaker != "" {
+			currentText.WriteString("\n") // Sprecherwechsel -> neuer Absatz/Zeile
+		}
+		currentText.WriteString(fmt.Sprintf("%s [%s%s]: ", ts, speaker, marker))
+		lastSpeaker = speaker
+	} else {
+		currentText.WriteString(" ") // gleicher Sprecher -> fortlaufend, kein Label/Umbruch
+	}
+}
+
+// appendSpeakerSegment hängt einen fertigen Abschnitt an (Whisper+Gemma, Gemma
+// Native). Sprecher-Label nur bei Wechsel (siehe writeSpeakerPrefix).
+func appendSpeakerSegment(speaker, marker, text string) {
+	fyne.Do(func() {
+		writeSpeakerPrefix(speaker, marker, nowStamp())
+		currentText.WriteString(text)
+		refreshOutput()
+	})
+}
+
+// appendPendingRaw fügt einen Whisper-Rohabschnitt zum laufenden Block hinzu
+// (live sichtbar). Bei Sprecherwechsel ohne Pause wird der bisherige Block zuvor
+// zur Korrektur übergeben.
+func appendPendingRaw(speaker, text string) {
+	fyne.Do(func() {
+		if pendingRaw.Len() > 0 && speaker != pendingSpeaker {
+			flushPendingToCorrection()
+		}
+		if pendingRaw.Len() == 0 {
+			pendingTs = nowStamp() // Zeitstempel beim Block-Start fixieren
+		}
+		pendingSpeaker = speaker
+		if pendingRaw.Len() > 0 {
+			pendingRaw.WriteString(" ")
+		}
+		pendingRaw.WriteString(text)
+		refreshOutput()
+	})
+}
+
+// flushPendingToCorrection übergibt den aktuellen Rohblock an die Korrektur-
+// Warteschlange. Der Block bleibt als inProgress-Eintrag SICHTBAR (Rohtext), bis
+// die Korrektur eintrifft. MUSS im Main-Thread laufen (Zugriff pendingRaw).
+func flushPendingToCorrection() {
+	if pendingRaw.Len() == 0 {
+		return
+	}
+	speaker := pendingSpeaker
+	ts := pendingTs
+	raw := strings.TrimSpace(pendingRaw.String())
+	pendingRaw.Reset()
+	pendingSpeaker = ""
+	select {
+	case correctionJobs <- correctionJob{speaker: speaker, raw: raw, ts: ts}:
+		// Rohblock weiterhin anzeigen, bis der Worker ihn korrigiert ersetzt.
+		inProgress = append(inProgress, &pendingBlock{speaker: speaker, text: raw, ts: ts})
+	default:
+		// Warteschlange voll: Rohtext sofort final übernehmen (nichts geht verloren).
+		writeSpeakerPrefix(speaker, "", ts)
+		currentText.WriteString(raw)
+	}
+	refreshOutput()
+}
+
+// correctionWorker arbeitet Korrektur-Jobs seriell ab (stabile Reihenfolge).
+// Das Ergebnis ersetzt den jeweils ältesten inProgress-Block: dieser wandert
+// korrigiert in den finalisierten Text – der angezeigte Rohtext wird dadurch
+// in-place ersetzt, ohne zwischenzeitlich zu verschwinden.
+func correctionWorker() {
+	for job := range correctionJobs {
+		corr := correctWithLLM(job.raw)
+		fyne.Do(func() {
+			if len(inProgress) > 0 {
+				pb := inProgress[0]
+				inProgress = inProgress[1:]
+				writeSpeakerPrefix(pb.speaker, "", pb.ts)
+				currentText.WriteString(corr)
+			}
+			refreshOutput()
+		})
+	}
+}
+
+// correctWithLLM lässt den Rohtext vom aktuell gewählten Analyse-Backend
+// grammatikalisch korrigieren. Bei Fehler wird der Rohtext unverändert behalten.
+func correctWithLLM(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return raw
+	}
+	const prompt = "Korrigiere den folgenden gesprochenen Text in Grammatik, Zeichensetzung und Groß-/Kleinschreibung. Behalte Sinn und Sprache exakt bei. Gib AUSSCHLIESSLICH den korrigierten Text zurück – ohne Einleitung, Anführungszeichen oder Erklärungen."
+	res := strings.TrimSpace(runLLM(config.PostProcModel, raw, prompt))
+	if res == "" || strings.HasPrefix(res, "Fehler") || strings.HasPrefix(res, "KI-Fehler") {
+		Log("Whisper+LLM: Korrektur fehlgeschlagen, nutze Rohtext. (" + res + ")")
+		return raw
+	}
+	return res
+}
+
+// hasSpeech schätzt per Energie (RMS), ob ein Segment überhaupt Sprache enthält.
+// Stille/Rauschen wird NICHT transkribiert – das verhindert Whisper-Halluzinationen
+// ("Vielen Dank", "Untertitelung …" u.ä.) auf einem stillen Kanal. Die RMS wird
+// gegen den Kanal-Gain normalisiert, da das Audio bereits verstärkt vorliegt.
+func hasSpeech(audio []byte, speaker string) bool {
+	if len(audio) < 2 {
+		return false
+	}
+	var sumSq float64
+	n := 0
+	for i := 0; i+1 < len(audio); i += 2 {
+		v := float64(int16(binary.LittleEndian.Uint16(audio[i : i+2])))
+		sumSq += v * v
+		n++
+	}
+	if n == 0 {
+		return false
+	}
+	rms := math.Sqrt(sumSq / float64(n))
+	gain := loadF64(&atMicGain)
+	if speaker == "Anrufer" {
+		gain = loadF64(&atSpkGain)
+	}
+	if gain < 1 {
+		gain = 1
+	}
+	return rms/gain > 200 // Schwelle auf das Roh-Audio (vor Verstärkung)
+}
+
+func processSegment(audio []byte, speaker string) {
+	if !hasSpeech(audio, speaker) {
+		return // stilles Segment überspringen (Schutz vor Whisper-Halluzinationen)
+	}
+	if !atWhisperLocal.Load() {
+		// Erkennung über den Remote-GPU-Whisper-Server (Ergebnis kommt asynchron).
+		remoteTranscribe(audio, speaker)
+		return
+	}
+	// Whisper lokal (whisper-cli)
+	tmpFile := filepath.Join(exeDir, fmt.Sprintf("tmp_%s_%d.wav", speaker, time.Now().UnixNano()))
+	if err := writeWav(tmpFile, audio); err != nil {
+		return
+	}
+	defer os.Remove(tmpFile)
+
+	whisperBin := filepath.Join(exeDir, "libs", "whisper-cli")
+	if runtime.GOOS == "windows" {
+		whisperBin = filepath.Join(exeDir, "libs", "whisper-cli.exe")
+	}
+
+	modelPath := filepath.Join(exeDir, "models", "whisper-base.bin")
+	cmd := exec.Command(whisperBin, "-m", modelPath, "-f", tmpFile, "-l", "de", "-nt")
+
+	// Setzt den Silent-Mode (plattformspezifisch)
+	setSilent(cmd)
+
+	// Wir loggen den Befehl, aber zeigen ihn nicht in der Konsole
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return
+	}
+
+	rawText := string(out)
+
+	// CPU/GPU Erkennung
+	if strings.Contains(rawText, "backend from") || strings.Contains(rawText, "backend_init_gpu") {
+		engineText := "Engine: GPU beschleunigt"
+		if strings.Contains(rawText, "CPU") && !strings.Contains(rawText, "GPU") {
+			engineText = "Engine: CPU (AVX2/512)"
+		}
+		fyne.Do(func() { engineInfo.SetText(engineText) })
+	}
+	lines := strings.Split(rawText, "\n")
+	var cleanLines []string
+	re := regexp.MustCompile(`^(whisper_|load_|main:|system_info:|[^A-Za-z0-9äöüÄÖÜ])`)
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && !re.MatchString(trimmed) {
+			cleanLines = append(cleanLines, trimmed)
+		}
+	}
+
+	if len(cleanLines) > 0 {
+		text := strings.Join(cleanLines, " ")
+		if atHasPostProc.Load() {
+			// Rohtext live anzeigen; Korrektur erfolgt am Satzende (siehe detectSilence).
+			appendPendingRaw(speaker, text)
+		} else {
+			appendSpeakerSegment(speaker, "", text)
+		}
+	}
+}
+
+func runAnalysisLogic(text, userPrompt string) string {
+	return runLLM(config.AnalysisModel, text, userPrompt)
+}
+
+// runLLM routet eine LLM-Anfrage nach Modell-Symbol: "e2b"/"12b" an den jeweiligen
+// lokalen Server, "remote" an das in der 'remote LLM'-Sektion gewählte Backend.
+func runLLM(modelSymbol, text, userPrompt string) string {
+	switch modelSymbol {
+	case "e2b", "12b":
+		inst := instanceFor(modelSymbol)
+		if inst == nil {
+			return "Fehler: unbekanntes lokales Modell."
+		}
+		return runLocalAnalysisAt(inst, text, userPrompt)
+	case "remote":
+		switch config.RemoteBackend {
+		case "Google Flash":
+			return runGeminiAnalysis(text, userPrompt)
+		case "Ollama":
+			return runOllamaAnalysis(text, userPrompt)
+		default:
+			return runVllmAnalysis(text, userPrompt)
+		}
+	}
+	return "Fehler: kein Modell konfiguriert."
+}
+
+// runLocalAnalysisAt führt die Anfrage gegen den lokalen Server der Instanz aus.
+func runLocalAnalysisAt(inst *llamaInstance, text, userPrompt string) string {
+	if inst.restarting.Load() {
+		return "Das lokale Modell wird gerade neu geladen. Bitte einen Moment warten und erneut versuchen."
+	}
+	if !inst.ready.Load() {
+		return fmt.Sprintf("Das lokale Modell '%s' ist nicht bereit (Server nicht gestartet?).", inst.symbol)
+	}
+	inst.busy.Add(1)
+	defer inst.busy.Add(-1)
+
+	prompt := fmt.Sprintf("<|turn|>system\n<|think|>Gib AUSSCHLIESSLICH das Ergebnis der Analyse aus. Keine Einleitung, kein 'Thinking Process', keine technischen Erklärungen. Deine Antwort darf NUR die Zusammenfassung oder Auswertung enthalten.<turn|>\n<|turn|>user\nAnweisung: %s\n\nText:\n%s<turn|>\n<|turn|>model\n", userPrompt, text)
+
+	payload := map[string]interface{}{
+		"model": "gemma-4",
+		"messages": []map[string]interface{}{
+			{
+				"role":    "user",
+				"content": prompt,
+			},
+		},
+		"stream":      false,
+		"temperature": 0.3,
+		"top_p":       0.9,
+	}
+
+	jsonData, _ := json.Marshal(payload)
+
+	// Timeout massiv erhöhen für langsame lokale Inferenz großer Texte
+	client := &http.Client{Timeout: 600 * time.Second}
+	resp, err := client.Post(inst.baseURL()+"/v1/chat/completions", "application/json", bytes.NewBuffer(jsonData))
+
+	if err != nil {
+		Log("ANALYSE-SERVER-ERROR: " + err.Error())
+		return "Fehler: Der lokale Gemma-Server ist noch nicht bereit oder ausgelastet. Bitte warte einen Moment."
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Sprintf("Fehler: Server antwortet mit Status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "Fehler beim Dekodieren der Analyse-Antwort."
+	}
+
+	if len(result.Choices) > 0 {
+		resRaw := result.Choices[0].Message.Content
+
+		// Falls doch noch 'Thinking' Tags drin sind, wegschneiden
+		if idx := strings.LastIndex(resRaw, "[End thinking]"); idx != -1 {
+			resRaw = resRaw[idx+len("[End thinking]"):]
+		}
+		if idx := strings.LastIndex(resRaw, "<|think|>"); idx != -1 {
+			// Falls es nach dem think-Tag kommt
+			parts := strings.Split(resRaw, "<turn|>")
+			if len(parts) > 1 {
+				resRaw = parts[len(parts)-1]
+			}
+		}
+
+		return strings.TrimSpace(resRaw)
+	}
+
+	return "Keine Analyse-Ergebnisse empfangen."
+}
+
+func updateWindowTitle(w fyne.Window) {
+	title := "Portable Realtime STT (Whisper + Gemma 4)"
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		title = fmt.Sprintf("%s — %s", title, u.Username) // u.Username liefert unter Windows bereits "DOMAIN\Nutzer"
+	}
+	w.SetTitle(title)
+}
+
+func createWavData(data []byte) []byte {
+	h := [44]byte{}
+	copy(h[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(h[4:8], uint32(36+len(data)))
+	copy(h[8:12], "WAVE")
+	copy(h[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(h[16:20], 16)
+	binary.LittleEndian.PutUint16(h[20:22], 1)
+	binary.LittleEndian.PutUint16(h[22:24], 1)
+	binary.LittleEndian.PutUint32(h[24:28], 16000)
+	binary.LittleEndian.PutUint32(h[28:32], 16000*2)
+	binary.LittleEndian.PutUint16(h[32:34], 2)
+	binary.LittleEndian.PutUint16(h[34:36], 16)
+	copy(h[36:40], "data")
+	binary.LittleEndian.PutUint32(h[40:44], uint32(len(data)))
+
+	result := make([]byte, 44+len(data))
+	copy(result[0:44], h[:])
+	copy(result[44:], data)
+	return result
+}
+
+func writeWav(filename string, data []byte) error {
+	wav := createWavData(data)
+	return os.WriteFile(filename, wav, 0644)
+}
+
+// ========= Remote LLM Implementations =========
+
+type geminiRequest struct {
+	Contents []struct {
+		Parts []struct {
+			Text string `json:"text"`
+		} `json:"parts"`
+	} `json:"contents"`
+}
+
+type geminiResponse struct {
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
+}
+
+func runGeminiAnalysis(text, userPrompt string) string {
+	if config.Flash.ApiKey == "" {
+		return "Fehler: Kein Gemini API Key hinterlegt."
+	}
+
+	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=" + config.Flash.ApiKey
+
+	prompt := fmt.Sprintf("Anweisung: %s\n\nText:\n%s", userPrompt, text)
+
+	reqBody := geminiRequest{}
+	reqBody.Contents = []struct {
+		Parts []struct {
+			Text string `json:"text"`
+		} `json:"parts"`
+	}{{
+		Parts: []struct {
+			Text string `json:"text"`
+		}{{Text: prompt}},
+	}}
+
+	jsonData, _ := json.Marshal(reqBody)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "Fehler bei Gemini-Verbindung: " + err.Error()
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "Fehler beim Lesen der Gemini-Antwort: " + err.Error()
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		Log(fmt.Sprintf("GEMINI-API-ERROR: Status %d | Body: %s", resp.StatusCode, string(body)))
+		return fmt.Sprintf("KI-Fehler (Status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var gResp geminiResponse
+	if err := json.Unmarshal(body, &gResp); err != nil {
+		return "Fehler beim Dekodieren der Gemini-Antwort: " + err.Error()
+	}
+
+	if len(gResp.Candidates) > 0 && len(gResp.Candidates[0].Content.Parts) > 0 {
+		return strings.TrimSpace(gResp.Candidates[0].Content.Parts[0].Text)
+	}
+
+	return "Keine Antwort von Gemini erhalten. Status: " + resp.Status
+}
+
+type ollamaRequest struct {
+	Model   string         `json:"model"`
+	Prompt  string         `json:"prompt"`
+	System  string         `json:"system"`
+	Stream  bool           `json:"stream"`
+	Options map[string]any `json:"options"`
+}
+
+type ollamaResponse struct {
+	Response string `json:"response"`
+}
+
+func runOllamaAnalysis(text, userPrompt string) string {
+	url := strings.TrimRight(config.Ollama.Url, "/") + "/api/generate"
+
+	// Wenn der Server sehr alt ist oder Parameter blockiert, übergeben wir "Gewalt-Prompting",
+	// indem wir die Systemrolle und die Temperatur (falls unterstützt) zwingend als hart kodierten String senden.
+	prompt := fmt.Sprintf("<start_of_turn>user\nWICHTIGE SYSTEMREGEL: Du bist ein extrem präziser, medizinischer Assistent. Gib zu 100%% NUR das gefilterte Ergebnis aus. Erfinde auf gar keinen Fall externe Nummern (wie LANR, BSNR) und nenne KEINE Einleitungs- oder Schlussformeln.\n\nANWEISUNG ZUM TEXT:\n%s\n\nTEXT:\n%s<end_of_turn>\n<start_of_turn>model\n", userPrompt, text)
+
+	payload := map[string]interface{}{
+		"model":  config.Ollama.Model,
+		"prompt": prompt,
+		"stream": false,
+		"options": map[string]interface{}{
+			"temperature": 0.05,
+			"top_p":       0.9,
+		},
+	}
+
+	jsonData, _ := json.Marshal(payload)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "Fehler bei Server-Verbindung: " + err.Error()
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "Fehler beim Lesen der Antwort: " + err.Error()
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Sprintf("Fehler: Server antwortet mit %s.\nRaw-Antwort:\n\n%s", resp.Status, string(body))
+	}
+
+	var oResp struct {
+		Response string `json:"response"`
+	}
+	if err := json.Unmarshal(body, &oResp); err != nil {
+		return "Fehler beim Dekodieren der JSON-Antwort: " + err.Error() + "\nRaw:\n" + string(body)
+	}
+
+	res := strings.TrimSpace(oResp.Response)
+	if res == "" {
+		return fmt.Sprintf("Der Server hat erfolgreich geantwortet, lieferte aber keinen Text zurück.\nRaw:\n%s", string(body))
+	}
+	return res
+}
+
+// ========= vLLM Integration =========
+
+// httpGetJSON führt ein GET mit optionalem Bearer-Token aus und gibt den Body
+// zurück. Liefert aussagekräftige Fehler (Verbindung, HTTP-Status), damit die
+// Discovery nicht stillschweigend "keine Modelle" meldet.
+func httpGetJSON(url, apiKey string) ([]byte, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Server nicht erreichbar (%s):\n%v", url, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d von %s", resp.StatusCode, url)
+	}
+	return body, nil
+}
+
+// vllmBaseURL bereinigt eine vLLM-/OpenAI-Basis-URL: entfernt abschließende
+// Slashes und ein optionales "/v1"-Suffix. So führt eine vom Nutzer inkl. "/v1"
+// eingegebene URL nicht zu doppelten Pfaden wie ".../v1/v1/models".
+func vllmBaseURL(raw string) string {
+	u := strings.TrimRight(strings.TrimSpace(raw), "/")
+	u = strings.TrimSuffix(u, "/v1")
+	return strings.TrimRight(u, "/")
+}
+
+// fetchVllmModels fragt die verfügbaren Modelle eines OpenAI-kompatiblen Servers
+// (vLLM) über GET /v1/models ab.
+func fetchVllmModels(baseURL, apiKey string) ([]string, error) {
+	url := vllmBaseURL(baseURL) + "/v1/models"
+	body, err := httpGetJSON(url, apiKey)
+	if err != nil {
+		Log(fmt.Sprintf("vLLM Model-Discover-Fehler: %v", err))
+		return nil, err
+	}
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		Log("vLLM /v1/models Rohantwort: " + string(body))
+		return nil, fmt.Errorf("Antwort nicht im erwarteten Format: %v", err)
+	}
+	var models []string
+	for _, m := range result.Data {
+		if m.ID != "" {
+			models = append(models, m.ID)
+		}
+	}
+	return models, nil
+}
+
+// fetchOllamaModels fragt die lokal installierten Modelle eines Ollama-Servers
+// über GET /api/tags ab.
+func fetchOllamaModels(baseURL, apiKey string) ([]string, error) {
+	url := strings.TrimRight(baseURL, "/") + "/api/tags"
+	body, err := httpGetJSON(url, apiKey)
+	if err != nil {
+		Log(fmt.Sprintf("Ollama Model-Discover-Fehler: %v", err))
+		return nil, err
+	}
+	var result struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		Log("Ollama /api/tags Rohantwort: " + string(body))
+		return nil, fmt.Errorf("Antwort nicht im erwarteten Format: %v", err)
+	}
+	var models []string
+	for _, m := range result.Models {
+		if m.Name != "" {
+			models = append(models, m.Name)
+		}
+	}
+	return models, nil
+}
+
+// runVllmAnalysis analysiert Text über den vLLM Server (OpenAI-kompatible Chat Completions API)
+func runVllmAnalysis(text, userPrompt string) string {
+	baseURL := vllmBaseURL(config.Vllm.Url)
+	if baseURL == "" {
+		return "Fehler: Keine vLLM-Server-URL konfiguriert."
+	}
+	if config.Vllm.Model == "" {
+		return "Fehler: Kein vLLM-Modell ausgewählt."
+	}
+
+	apiURL := baseURL + "/v1/chat/completions"
+
+	prompt := fmt.Sprintf("Du bist ein präziser Assistent. Gib AUSSCHLIESSLICH das Ergebnis der Analyse aus. Keine Einleitung, kein 'Thinking Process', keine technischen Erklärungen.\n\nAnweisung: %s\n\nText:\n%s", userPrompt, text)
+
+	payload := map[string]interface{}{
+		"model": config.Vllm.Model,
+		"messages": []map[string]interface{}{
+			{
+				"role":    "user",
+				"content": prompt,
+			},
+		},
+		"stream":      false,
+		"temperature": 0.3,
+		"top_p":       0.9,
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return "Fehler beim Erstellen der Anfrage: " + err.Error()
+	}
+
+	client := &http.Client{Timeout: 600 * time.Second}
+	resp, err := client.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "Fehler bei vLLM-Server-Verbindung: " + err.Error()
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Sprintf("Fehler: vLLM antwortet mit Status %d.\nRaw:\n%s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "Fehler beim Lesen der vLLM-Antwort: " + err.Error()
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "Fehler beim Dekodieren der vLLM-Antwort: " + err.Error() + "\nRaw:\n" + string(body)
+	}
+
+	if len(result.Choices) > 0 && result.Choices[0].Message.Content != "" {
+		return strings.TrimSpace(result.Choices[0].Message.Content)
+	}
+
+	return "Keine Antwort von vLLM erhalten."
+}

@@ -1,0 +1,24 @@
+# --- Secrets / Laufzeit-Zustand (NICHT einchecken!) ---
+# config.json enthält den Jarvis-API-Key + persönliche Einstellungen
+config.json
+log.txt
+
+# --- Zur Laufzeit heruntergeladene Binaries/Modelle (~2 GB) ---
+libs/
+models/
+
+# --- Build-Artefakte ---
+stt-app
+stt-app.exe
+*.wav
+tmp_*.wav
+
+# --- Test-/Debug-Logs ---
+test_llama.log
+test_llama_out.log
+
+# --- Lokale Entwickler-/Claude-Helfer (nicht Teil der App) ---
+.claude-memory/
+.claude/
+session.bat
+session.sh

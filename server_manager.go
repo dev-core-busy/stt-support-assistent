@@ -158,7 +158,14 @@ func ensureLocalServers() {
 	needed := map[string]bool{}
 	for _, sym := range []string{config.PostProcModel, config.AnalysisModel} {
 		if sym == "e2b" || sym == "12b" {
-			needed[sym] = true
+			// "download on demand": einen lokalen Server nur dann starten, wenn das
+			// Modell auch wirklich vorhanden ist. So verursacht eine (Default-)Auswahl,
+			// deren Modell noch nie geladen wurde, beim Start keinen Fehlversuch; das
+			// Modell wird erst nach bewusster Auswahl+Download in den Einstellungen
+			// bereitgestellt (siehe selectLocalModel in main.go).
+			if localModelExists(modelFileForSymbol(sym)) {
+				needed[sym] = true
+			}
 		}
 	}
 	for sym, inst := range localServers {

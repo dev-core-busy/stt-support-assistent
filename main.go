@@ -2200,30 +2200,68 @@ func main() {
 	}
 	updateAnalysisUI() // Initialer Aufruf
 
-	// prepareSelection lädt bei Bedarf das lokale Modell eines Pulldown-Symbols
-	// herunter und startet/stoppt die lokalen Server passend zur aktuellen Auswahl.
-	prepareSelection := func(sym string) {
+	// suppressModelChange unterdrückt den OnChanged-Handler der Modell-Dropdowns,
+	// während wir sie programmatisch (per SetSelected) auf einen alten Wert
+	// zurücksetzen – sonst würde das Zurücksetzen erneut selectLocalModel und damit
+	// eine zweite Rückfrage auslösen.
+	var suppressModelChange bool
+
+	// selectLocalModel setzt die "download on demand"-Logik der Modell-Auswahl um:
+	// Ist zum gewählten Symbol ein lokales Modell nötig und noch NICHT vorhanden,
+	// wird der Download nur nach Rückfrage gestartet. onOK (dort: config setzen +
+	// SaveConfig) wird ausschließlich aufgerufen, wenn das Modell lokal existiert –
+	// erst dann darf die Auswahl gespeichert werden. Bei Abbruch oder Download-
+	// Fehler läuft revert (Dropdown auf die zuletzt gespeicherte Auswahl zurück)
+	// und es wird nichts gespeichert.
+	selectLocalModel := func(sym string, onOK func(), revert func()) {
 		f := modelFileForSymbol(sym)
-		if f == "" { // "none"/"remote": kein lokales Modell nötig
+		if f == "" || localModelExists(f) {
+			// "none"/"remote" (kein lokales Modell nötig) oder Modell schon lokal:
+			// direkt übernehmen.
+			onOK()
 			go ensureLocalServers()
 			updatePills()
 			return
 		}
-		prog := widget.NewProgressBarInfinite()
-		info := widget.NewLabel("Bereite Modell vor …")
-		dlg := dialog.NewCustom("Modell wird vorbereitet", "Im Hintergrund weiter", container.NewVBox(info, prog), win)
-		dlg.Show()
-		go func() {
-			if err := ensureLocalModel(f, func(task string, p float64) {
-				fyne.Do(func() { info.SetText(task) })
-			}); err != nil {
-				Log("Modell-Download-Fehler: " + err.Error())
-				fyne.Do(func() { info.SetText("Download fehlgeschlagen:\n" + err.Error()) })
-				return
-			}
-			ensureLocalServers()
-			fyne.Do(func() { dlg.Hide(); updatePills() })
-		}()
+		// Modell fehlt lokal -> herunterladen anbieten.
+		label := f
+		if m := findLocalModel(f); m != nil {
+			label = m.Label
+		}
+		dialog.ShowConfirm("Modell herunterladen?",
+			fmt.Sprintf("Das lokale Modell „%s“ ist noch nicht vorhanden.\n"+
+				"Es muss einmalig heruntergeladen werden (mehrere GB), bevor die\n"+
+				"Auswahl aktiv wird.\n\nJetzt herunterladen?", label),
+			func(ok bool) {
+				if !ok {
+					revert() // Auswahl verworfen, nicht gespeichert
+					return
+				}
+				prog := widget.NewProgressBarInfinite()
+				info := widget.NewLabel("Bereite Modell vor …")
+				dlg := dialog.NewCustom("Modell wird geladen", "Im Hintergrund weiter", container.NewVBox(info, prog), win)
+				dlg.Show()
+				go func() {
+					if err := ensureLocalModel(f, func(task string, p float64) {
+						fyne.Do(func() { info.SetText(task) })
+					}); err != nil {
+						Log("Modell-Download-Fehler: " + err.Error())
+						fyne.Do(func() {
+							dlg.Hide()
+							showErr(fmt.Errorf("Download fehlgeschlagen:\n%v", err), win)
+							revert() // ohne Modell keine gültige Auswahl
+						})
+						return
+					}
+					// Modell liegt jetzt lokal vor -> Auswahl übernehmen & speichern.
+					// Reihenfolge wichtig: erst onOK (setzt config.*Model), dann
+					// ensureLocalServers – Letzteres entscheidet anhand der config,
+					// welcher Server laufen muss.
+					onOK()
+					ensureLocalServers()
+					fyne.Do(func() { dlg.Hide(); updatePills() })
+				}()
+			}, win)
 	}
 
 	// --- Erkennung: Whisper lokal vs. Remote Whisper (GPU) ---
@@ -2256,12 +2294,27 @@ func main() {
 	}
 
 	// --- Nachbearbeitung der Erkennung ---
-	postProcSelect := NewMinSizeSelect([]string{"ohne", "Gemma 4 E2B", "Gemma 4 12B", "remote LLM"}, func(s string) {
-		config.PostProcModel = modelSymbolFromLabel(s)
-		SaveConfig()
-		prepareSelection(config.PostProcModel)
+	var postProcSelect *MinSizeSelect
+	postProcSelect = NewMinSizeSelect([]string{"ohne", "Gemma 4 E2B", "Gemma 4 12B", "remote LLM"}, func(s string) {
+		if suppressModelChange {
+			return
+		}
+		prev := config.PostProcModel // gespeicherte Auswahl (für Zurücksetzen bei Abbruch)
+		sym := modelSymbolFromLabel(s)
+		selectLocalModel(sym,
+			func() { config.PostProcModel = sym; SaveConfig() },
+			func() {
+				suppressModelChange = true
+				postProcSelect.SetSelected(modelLabelFromSymbol(prev))
+				suppressModelChange = false
+			})
 	}, 170)
+	// Initiale Anzeige der gespeicherten Auswahl: nur Label setzen, KEIN
+	// On-Demand-Download/Dialog (die gespeicherte Auswahl impliziert ein bereits
+	// vorhandenes Modell; die lokalen Server startet ensureLocalServers separat).
+	suppressModelChange = true
 	postProcSelect.SetSelected(modelLabelFromSymbol(config.PostProcModel))
+	suppressModelChange = false
 	postProcHelpBtn := widget.NewButtonWithIcon("", theme.QuestionIcon(), func() {
 		showInfo("Spracherkennung & Nachbearbeitung",
 			"Erkennung:\n"+
@@ -2275,12 +2328,24 @@ func main() {
 	postProcHelpBtn.Importance = widget.LowImportance // kein grauer Button-Hintergrund fuer das Hilfe-Symbol
 
 	// --- Analyse (manuell, mit Prompt) ---
-	analysisSelect := NewMinSizeSelect([]string{"Gemma 4 E2B", "Gemma 4 12B", "remote LLM"}, func(s string) {
-		config.AnalysisModel = modelSymbolFromLabel(s)
-		SaveConfig()
-		prepareSelection(config.AnalysisModel)
+	var analysisSelect *MinSizeSelect
+	analysisSelect = NewMinSizeSelect([]string{"Gemma 4 E2B", "Gemma 4 12B", "remote LLM"}, func(s string) {
+		if suppressModelChange {
+			return
+		}
+		prev := config.AnalysisModel
+		sym := modelSymbolFromLabel(s)
+		selectLocalModel(sym,
+			func() { config.AnalysisModel = sym; SaveConfig() },
+			func() {
+				suppressModelChange = true
+				analysisSelect.SetSelected(modelLabelFromSymbol(prev))
+				suppressModelChange = false
+			})
 	}, 170)
+	suppressModelChange = true
 	analysisSelect.SetSelected(modelLabelFromSymbol(config.AnalysisModel))
+	suppressModelChange = false
 
 	saveBtn := widget.NewButtonWithIcon("Einstellungen jetzt speichern", theme.DocumentSaveIcon(), func() {
 		Log("Manuelle Konfigurationsspeicherung ausgelöst")

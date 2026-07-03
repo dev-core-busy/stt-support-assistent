@@ -97,6 +97,17 @@ func modelSymbolFromLabel(label string) string {
 	return "e2b"
 }
 
+// localModelExists prüft, ob die GGUF-Datei eines lokalen Modells bereits in
+// ./models/ liegt. Leerer Dateiname (z.B. "none"/"remote") gilt als "nicht
+// lokal" – dort ist ohnehin kein Download nötig.
+func localModelExists(file string) bool {
+	if file == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(exeDir, "models", file))
+	return err == nil
+}
+
 // ensureLocalModel lädt das angegebene Modell herunter, falls noch nicht vorhanden.
 // Der Multimodal-Projektor wird NICHT geladen (nur Text-Nutzung – siehe startInstance).
 // Unbekannte Dateinamen werden übersprungen.
@@ -135,15 +146,13 @@ func EnsureDependencies(progress func(string, float64)) error {
 		progress("Whisper-Modell (Lokal)", 1.0)
 	}
 
-	// 2. Lokale Gemma-Modelle, die von Nachbearbeitung/Analyse referenziert werden
-	//    (+ jeweiliger Multimodal-Projektor), bei Bedarf herunterladen.
-	for _, sym := range []string{config.PostProcModel, config.AnalysisModel} {
-		if f := modelFileForSymbol(sym); f != "" {
-			if err := ensureLocalModel(f, progress); err != nil {
-				return err
-			}
-		}
-	}
+	// 2. Lokale Gemma-Modelle werden bewusst NICHT mehr beim Start geladen
+	//    (früher: pauschaler Download der in config gewählten Modelle). Statt
+	//    dessen "download on demand": erst wenn ein lokales Modell in den
+	//    Einstellungen gewählt wird und noch fehlt, wird es nach Rückfrage
+	//    geladen (siehe selectLocalModel in main.go). Erst danach lässt sich die
+	//    Auswahl speichern, d.h. eine gespeicherte Auswahl impliziert ein lokal
+	//    vorhandenes Modell.
 
 	// 3. Binaries für Windows
 	if runtime.GOOS == "windows" {

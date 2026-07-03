@@ -539,14 +539,14 @@ func askCRMSelection(number string, matches []jiraPhoneMatch) string {
 		}
 		selectRow(0) // Vorauswahl: erster Treffer
 
-		info := widget.NewLabel(fmt.Sprintf("Zu Rufnummer %s wurden %d CRM-Kunden gefunden.\nEinen Kunden anklicken und „Übernehmen“ – oder per Doppelklick direkt wählen:", number, len(matches)))
+		info := widget.NewLabel(fmt.Sprintf(T("Zu Rufnummer %s wurden %d CRM-Kunden gefunden.\nEinen Kunden anklicken und „Übernehmen“ – oder per Doppelklick direkt wählen:"), number, len(matches)))
 		info.Wrapping = fyne.TextWrapWord
 
 		scroll := container.NewVScroll(listBox)
 		scroll.SetMinSize(fyne.NewSize(520, 300))
 		content := container.NewBorder(info, nil, nil, nil, scroll)
 
-		dlg = dialog.NewCustomConfirm("CRM-Kunde auswählen", "Übernehmen", "Abbrechen", content, func(ok bool) {
+		dlg = dialog.NewCustomConfirm(T("CRM-Kunde auswählen"), T("Übernehmen"), T("Abbrechen"), content, func(ok bool) {
 			if !ok || selected < 0 || selected >= len(matches) {
 				send("")
 				return
@@ -605,7 +605,7 @@ func setCallerNumber(number string) {
 	if callerNumberLabel == nil {
 		return
 	}
-	fyne.Do(func() { callerNumberLabel.SetText("Anruf von: " + number) })
+	fyne.Do(func() { callerNumberLabel.SetText(T("Anruf von: ") + number) })
 }
 
 // getLastCallerNumber liefert die zuletzt empfangene Rufnummer (für den

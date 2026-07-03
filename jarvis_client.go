@@ -103,7 +103,7 @@ func jarvisPost(path string, reqBody interface{}, out interface{}) error {
 	baseURL := strings.TrimRight(strings.TrimSpace(config.Jarvis.Url), "/")
 	apiKey := strings.TrimSpace(config.Jarvis.ApiKey)
 	if baseURL == "" || apiKey == "" {
-		err := fmt.Errorf("Jarvis-Server-URL und/oder API-Key sind nicht konfiguriert (siehe Einstellungen).")
+		err := fmt.Errorf(T("Jarvis-Server-URL und/oder API-Key sind nicht konfiguriert (siehe Einstellungen)."))
 		Log("Jarvis " + path + ": " + err.Error())
 		return err
 	}
@@ -123,7 +123,7 @@ func jarvisPost(path string, reqBody interface{}, out interface{}) error {
 
 	resp, err := jarvisHTTPClient().Do(req)
 	if err != nil {
-		wrapped := fmt.Errorf("Jarvis-Server nicht erreichbar (%s): %v", baseURL, err)
+		wrapped := fmt.Errorf(T("Jarvis-Server nicht erreichbar (%s): %v"), baseURL, err)
 		Log("Jarvis " + path + ": " + wrapped.Error())
 		return wrapped
 	}
@@ -131,7 +131,7 @@ func jarvisPost(path string, reqBody interface{}, out interface{}) error {
 
 	body, _ := io.ReadAll(resp.Body)
 	if err := json.Unmarshal(body, out); err != nil {
-		wrapped := fmt.Errorf("Antwort nicht im erwarteten Format (HTTP %d): %v", resp.StatusCode, err)
+		wrapped := fmt.Errorf(T("Antwort nicht im erwarteten Format (HTTP %d): %v"), resp.StatusCode, err)
 		Log("Jarvis " + path + ": " + wrapped.Error() + " | Rohantwort: " + string(body))
 		return wrapped
 	}
@@ -237,7 +237,7 @@ func jarvisPhoneLookup(phone string) (*jiraPhoneResponse, string, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(config.Jarvis.Url), "/")
 	apiKey := strings.TrimSpace(config.Jarvis.ApiKey)
 	if baseURL == "" || apiKey == "" {
-		err := fmt.Errorf("Jarvis-Server-URL und/oder API-Key sind nicht konfiguriert (siehe Einstellungen).")
+		err := fmt.Errorf(T("Jarvis-Server-URL und/oder API-Key sind nicht konfiguriert (siehe Einstellungen)."))
 		Log("Jarvis /api/jira/phonenumber: " + err.Error())
 		return nil, "", err
 	}
@@ -251,7 +251,7 @@ func jarvisPhoneLookup(phone string) (*jiraPhoneResponse, string, error) {
 
 	resp, err := jarvisHTTPClient().Do(req)
 	if err != nil {
-		wrapped := fmt.Errorf("Jarvis-Server nicht erreichbar (%s): %v", baseURL, err)
+		wrapped := fmt.Errorf(T("Jarvis-Server nicht erreichbar (%s): %v"), baseURL, err)
 		Log("Jarvis /api/jira/phonenumber: " + wrapped.Error())
 		return nil, "", wrapped
 	}
@@ -261,7 +261,7 @@ func jarvisPhoneLookup(phone string) (*jiraPhoneResponse, string, error) {
 	raw := string(body)
 	var out jiraPhoneResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		wrapped := fmt.Errorf("Antwort nicht im erwarteten Format (HTTP %d): %v", resp.StatusCode, err)
+		wrapped := fmt.Errorf(T("Antwort nicht im erwarteten Format (HTTP %d): %v"), resp.StatusCode, err)
 		Log("Jarvis /api/jira/phonenumber: " + wrapped.Error() + " | Rohantwort: " + raw)
 		return nil, raw, wrapped
 	}
@@ -476,18 +476,18 @@ func jarvisSourceRow(b jarvisBlock, win fyne.Window) fyne.CanvasObject {
 				path, err := downloadJarvisFile(u, dlName)
 				fyne.Do(func() {
 					if err != nil {
-						showErr(fmt.Errorf("Quelle konnte nicht geladen werden: %v", err), win)
+						showErr(fmt.Errorf(T("Quelle konnte nicht geladen werden: %v"), err), win)
 						return
 					}
 					if err := openPath(path); err != nil {
-						showErr(fmt.Errorf("Datei konnte nicht geöffnet werden: %v", err), win)
+						showErr(fmt.Errorf(T("Datei konnte nicht geöffnet werden: %v"), err), win)
 					}
 				})
 			}()
 		}
 	}
 
-	prefix := widget.NewLabelWithStyle("Quelle:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	prefix := widget.NewLabelWithStyle(T("Quelle:"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	return container.NewBorder(nil, nil, prefix, nil, link)
 }
 
@@ -523,13 +523,13 @@ func collapseText(s string, maxLines, maxChars int) (string, bool) {
 func ticketSummaryControls(key string) (*widget.Button, *fyne.Container) {
 	holder := container.NewVBox()
 	var btn *widget.Button
-	btn = widget.NewButton("KI-Zusammenfassung", func() {
+	btn = widget.NewButton(T("KI-Zusammenfassung"), func() {
 		if len(holder.Objects) > 0 { // bereits eingeblendet -> zuklappen
 			holder.RemoveAll()
 			holder.Refresh()
 			return
 		}
-		holder.Add(widget.NewLabel("KI-Zusammenfassung wird geladen …"))
+		holder.Add(widget.NewLabel(T("KI-Zusammenfassung wird geladen …")))
 		holder.Refresh()
 		btn.Disable()
 		go func() {
@@ -540,9 +540,9 @@ func ticketSummaryControls(key string) (*widget.Button, *fyne.Container) {
 				var lbl *widget.Label
 				switch {
 				case err != nil:
-					lbl = widget.NewLabel("Fehler: " + err.Error())
+					lbl = widget.NewLabel(T("Fehler: ") + err.Error())
 				case sum == "":
-					lbl = widget.NewLabel("(keine Zusammenfassung erhalten)")
+					lbl = widget.NewLabel(T("(keine Zusammenfassung erhalten)"))
 				default:
 					lbl = widget.NewLabel(sum)
 				}
@@ -585,9 +585,12 @@ const ticketSearchPlaceholder = "[Textfenster]"
 // vorherige Automatik-Suche laeuft (Ueberlappschutz).
 func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedText string, trigger *widget.Button, auto bool, crmFallback bool), func()) {
 	// --- Ergebnisbereich (wird nach jeder Suche neu befuellt) ---
-	resultsBox := container.NewVBox(
-		widget.NewLabel("Noch keine Suche durchgeführt."),
-	)
+	// placeholderLbl ist ein DAUERHAFTES, übersetzbares Label (trLabel registriert
+	// einen Sprachwechsel-Callback). Es wird im Platzhalter-Zustand wieder-
+	// verwendet statt bei jedem clearResults neu erzeugt - so folgt der Platzhalter
+	// auch einem Sprachwechsel, ohne dass zuvor eine Suche laufen musste.
+	placeholderLbl := trLabel("Noch keine Suche durchgeführt.")
+	resultsBox := container.NewVBox(placeholderLbl)
 	resultsScroll := container.NewVScroll(resultsBox)
 	resultsBg := canvas.NewRectangle(color.White)
 	resultsArea := container.NewStack(resultsBg, resultsScroll)
@@ -598,7 +601,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// CRM und ist ungueltig). Muss im Fyne-Main-Thread laufen.
 	clearResults := func() {
 		resultsBox.RemoveAll()
-		resultsBox.Add(widget.NewLabel("Noch keine Suche durchgeführt."))
+		resultsBox.Add(placeholderLbl)
 		resultsBox.Refresh()
 	}
 
@@ -608,7 +611,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	renderResults := func(query string, res *jarvisQueryResponse, duration time.Duration, hideRanking bool) {
 		resultsBox.RemoveAll()
 
-		status := widget.NewLabel(fmt.Sprintf("Ergebnis für „%s“ (%d Treffer · %d ms)", query, len(res.Blocks), duration.Milliseconds()))
+		status := widget.NewLabel(fmt.Sprintf(T("Ergebnis für „%s“ (%d Treffer · %d ms)"), query, len(res.Blocks), duration.Milliseconds()))
 
 		// Volltext-Filter der bereits geladenen Treffer (rein clientseitig, KEINE
 		// neue Server-Anfrage und keine Verbindung zum Suchtext/Prompt). Jede
@@ -622,7 +625,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		}
 		var cards []filterCard
 		filterEntry := widget.NewEntry()
-		filterEntry.SetPlaceHolder("Treffer filtern …")
+		filterEntry.SetPlaceHolder(T("Treffer filtern …"))
 		filterEntry.OnChanged = func(q string) {
 			ql := strings.ToLower(strings.TrimSpace(q))
 			for _, c := range cards {
@@ -646,7 +649,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		}
 
 		if summary := strings.TrimSpace(res.AISummary); summary != "" {
-			header := canvas.NewText("KI-GESAMTZUSAMMENFASSUNG", kiAccent)
+			header := canvas.NewText(T("KI-GESAMTZUSAMMENFASSUNG"), kiAccent)
 			header.TextStyle = fyne.TextStyle{Bold: true}
 			header.TextSize = 12
 			// Bewusst Label statt RichTextFromMarkdown: die KI-Zusammenfassung ist
@@ -665,15 +668,15 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			short, truncated := collapseText(summary, 10, 700)
 			if truncated {
 				expanded := false
-				toggle := widget.NewButton("mehr", nil)
+				toggle := widget.NewButton(T("mehr"), nil)
 				toggle.Importance = widget.LowImportance
 				apply := func() {
 					if expanded {
 						body.SetText(summary)
-						toggle.SetText("weniger")
+						toggle.SetText(T("weniger"))
 					} else {
 						body.SetText(short + " …")
-						toggle.SetText("mehr")
+						toggle.SetText(T("mehr"))
 					}
 				}
 				toggle.OnTapped = func() {
@@ -766,14 +769,14 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		}
 
 		if len(res.Blocks) == 0 && strings.TrimSpace(res.AISummary) == "" {
-			resultsBox.Add(widget.NewLabel("Keine Treffer."))
+			resultsBox.Add(widget.NewLabel(T("Keine Treffer.")))
 		}
 		resultsBox.Refresh()
 	}
 
 	renderError := func(err error) {
 		resultsBox.RemoveAll()
-		errText := canvas.NewText("Fehler: "+err.Error(), kiAccent)
+		errText := canvas.NewText(T("Fehler: ")+err.Error(), kiAccent)
 		errText.TextStyle = fyne.TextStyle{Bold: true}
 		resultsBox.Add(errText)
 		resultsBox.Refresh()
@@ -787,21 +790,21 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// Sitzungseingabe ohne jede Verbindung zu einem in "Einstellungen"
 	// hinterlegten Prompt (LLM-Anfragen und Suchtext sind unabhaengige Dinge).
 	queryEntry := widget.NewEntry()
-	queryEntry.SetPlaceHolder("Suchtext, z. B. \"Drucker im 2. OG offline\"")
+	trPlaceholder(queryEntry, "Suchtext, z. B. \"Drucker im 2. OG offline\"")
 
 	// "Jira Tickets" und "offene Jira Tickets" schliessen sich gegenseitig aus
 	// (maximal eins von beiden aktiv, oder keins). Beide Checks muessen vor dem
 	// initialen SetChecked existieren, da SetChecked den jeweils anderen ueber
 	// OnChanged bereits referenziert. Zustand wird in config.json gemerkt.
 	var jiraCheck, openOnlyCheck *widget.Check
-	jiraCheck = widget.NewCheck("Jira Tickets", func(checked bool) {
+	jiraCheck = trCheck("Jira Tickets", func(checked bool) {
 		if checked {
 			openOnlyCheck.SetChecked(false)
 		}
 		config.JarvisJira = checked
 		saveConfigDebounced()
 	})
-	openOnlyCheck = widget.NewCheck("offene Jira Tickets", func(checked bool) {
+	openOnlyCheck = trCheck("offene Jira Tickets", func(checked bool) {
 		if checked {
 			jiraCheck.SetChecked(false)
 		}
@@ -810,17 +813,17 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	})
 	jiraCheck.SetChecked(config.JarvisJira)
 	openOnlyCheck.SetChecked(config.JarvisOpenOnly)
-	confluenceCheck := widget.NewCheck("Confluence", func(b bool) {
+	confluenceCheck := trCheck("Confluence", func(b bool) {
 		config.JarvisConfluence = b
 		saveConfigDebounced()
 	})
 	confluenceCheck.SetChecked(config.JarvisConfluence)
-	ragCheck := widget.NewCheck("Wissen", func(b bool) {
+	ragCheck := trCheck("Wissen", func(b bool) {
 		config.JarvisRAG = b
 		saveConfigDebounced()
 	})
 	ragCheck.SetChecked(config.JarvisRAG)
-	aiCheck := widget.NewCheck("KI-Gesamtzusammenfassung", func(b bool) {
+	aiCheck := trCheck("KI-Gesamtzusammenfassung", func(b bool) {
 		config.JarvisAISummary = b
 		saveConfigDebounced()
 	})
@@ -848,8 +851,8 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	advanced := container.NewVBox(
 		widget.NewSeparator(),
 		container.New(&compactFormLayout{},
-			widget.NewLabel("Jira-Limit:"), jiraLimitEntry,
-			widget.NewLabel("Summary-Zeilen:"), summaryLinesEntry,
+			trLabel("Jira-Limit:"), jiraLimitEntry,
+			trLabel("Summary-Zeilen:"), summaryLinesEntry,
 		),
 	)
 
@@ -870,7 +873,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	runSearch := func() {
 		text := strings.TrimSpace(queryEntry.Text)
 		if text == "" {
-			showErr(fmt.Errorf("Bitte einen Suchtext eingeben."), win)
+			showErr(fmt.Errorf(T("Bitte einen Suchtext eingeben.")), win)
 			return
 		}
 		jiraLimit, _ := strconv.Atoi(strings.TrimSpace(jiraLimitEntry.Text))
@@ -921,7 +924,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		})
 	}
 
-	searchBtn = widget.NewButton("Suchen", runSearch)
+	searchBtn = trButton("Suchen", runSearch)
 	searchBtn.Importance = widget.HighImportance
 	queryEntry.OnSubmitted = func(string) { runSearch() }
 
@@ -943,7 +946,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	}
 
 	top := container.NewVBox(
-		widget.NewLabel("Portal Suche"),
+		trLabel("Portal Suche"),
 		searchCard,
 	)
 
@@ -970,7 +973,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		// Ohne CRM: Automatik still überspringen, manuell mit Hinweis.
 		if !hasCRM() {
 			if !auto {
-				showErr(fmt.Errorf("Im CRM Feld steht keine gültige CRM-Nummer. Die Ticketsuche ist erst mit einer CRM möglich."), win)
+				showErr(fmt.Errorf(T("Im CRM Feld steht keine gültige CRM-Nummer. Die Ticketsuche ist erst mit einer CRM möglich.")), win)
 			}
 			return
 		}

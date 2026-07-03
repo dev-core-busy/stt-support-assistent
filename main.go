@@ -402,11 +402,12 @@ func newCollapsibleSection(title string, content fyne.CanvasObject, initialExpan
 		}
 	}
 	expanded := initialExpanded
-	toggle = widget.NewButtonWithIcon(title, theme.MenuDropDownIcon(), func() {
+	toggle = widget.NewButtonWithIcon(T(title), theme.MenuDropDownIcon(), func() {
 		expanded = !expanded
 		apply(expanded)
 		persist(expanded)
 	})
+	onLangChange(func() { toggle.SetText(T(title)) }) // Titel bei Sprachwechsel mitziehen
 	toggle.Importance = widget.LowImportance
 	toggle.Alignment = widget.ButtonAlignLeading
 	apply(expanded)
@@ -867,8 +868,8 @@ var (
 	clearTicketResults func()
 	autoScanCancel     context.CancelFunc
 	autoScanBusy       atomic.Bool
-	currentText           strings.Builder
-	lastSpeaker           string // zuletzt ins Transkript geschriebener Sprecher; nur in fyne.Do-Callbacks
+	currentText        strings.Builder
+	lastSpeaker        string // zuletzt ins Transkript geschriebener Sprecher; nur in fyne.Do-Callbacks
 	// Whisper+LLM: aktueller, noch nicht korrigierter Rohblock (live angezeigt,
 	// bei Sprechpause/Sprecherwechsel an die LLM-Korrektur übergeben). Nur fyne.Do.
 	pendingRaw     strings.Builder
@@ -1247,7 +1248,7 @@ type pill struct {
 func newPill() *pill {
 	dot := canvas.NewText("●", color.NRGBA{R: 190, G: 40, B: 40, A: 255})
 	dot.TextSize = 16
-	lbl := widget.NewLabel("…")
+	lbl := trLabel("…")
 	return &pill{dot: dot, lbl: lbl, box: container.NewHBox(dot, lbl)}
 }
 
@@ -1267,7 +1268,7 @@ func (p *pill) set(ok bool, text string) {
 func showInfo(title, msg string, parent fyne.Window) {
 	lbl := widget.NewLabel(msg)
 	lbl.Alignment = fyne.TextAlignLeading
-	dialog.ShowCustom(title, "OK", lbl, parent)
+	dialog.ShowCustom(title, T("OK"), lbl, parent)
 }
 
 // showErr zeigt eine Fehlermeldung mit LINKSBÜNDIGEM Text (Ersatz für das
@@ -1275,7 +1276,7 @@ func showInfo(title, msg string, parent fyne.Window) {
 func showErr(err error, parent fyne.Window) {
 	lbl := widget.NewLabel(err.Error())
 	lbl.Alignment = fyne.TextAlignLeading
-	dialog.ShowCustom("Fehler", "OK", lbl, parent)
+	dialog.ShowCustom(T("Fehler"), T("OK"), lbl, parent)
 }
 
 // showConfirm zeigt eine Ja/Nein-Sicherheitsabfrage mit LINKSBÜNDIGEM Text
@@ -1283,7 +1284,29 @@ func showErr(err error, parent fyne.Window) {
 func showConfirm(title, msg string, cb func(bool), parent fyne.Window) {
 	lbl := widget.NewLabel(msg)
 	lbl.Alignment = fyne.TextAlignLeading
-	dialog.ShowCustomConfirm(title, "Ja", "Nein", lbl, cb, parent)
+	dialog.ShowCustomConfirm(title, T("Ja"), T("Nein"), lbl, cb, parent)
+}
+
+// lastStatusDE/lastEngineDE halten den zuletzt gesetzten DEUTSCHEN Text der
+// dynamischen Statusanzeigen. Diese Labels ändern ihren Text zur Laufzeit und
+// können daher keinen statischen trXxx-Callback nutzen; stattdessen merken wir
+// den deutschen Schlüssel und übersetzen ihn bei Sprachwechsel neu (Callback in
+// main()). setStatus/setEngineInfo sind die einzigen Schreibpfade.
+var lastStatusDE = "Initialisiere..."
+var lastEngineDE = "Engine: Wartet..."
+
+func setStatus(de string) {
+	lastStatusDE = de
+	if statusLabel != nil {
+		statusLabel.SetText(T(de))
+	}
+}
+
+func setEngineInfo(de string) {
+	lastEngineDE = de
+	if engineInfo != nil {
+		engineInfo.SetText(T(de))
+	}
 }
 
 // debugPreviewAndConfirm zeigt im Debug-Modus (config.DebugMode) vor dem
@@ -1309,7 +1332,7 @@ func debugPreviewAndConfirm(win fyne.Window, title, payload string, proceed func
 	}
 	scroll := container.NewScroll(body)
 	scroll.SetMinSize(fyne.NewSize(560, 320))
-	dialog.ShowCustomConfirm(title, "Senden", "Abbrechen", scroll, func(send bool) {
+	dialog.ShowCustomConfirm(title, T("Senden"), T("Abbrechen"), scroll, func(send bool) {
 		if send {
 			proceed()
 		}
@@ -1333,7 +1356,7 @@ func showDebugResponse(title, payload string) {
 	}
 	scroll := container.NewScroll(body)
 	scroll.SetMinSize(fyne.NewSize(560, 320))
-	dialog.ShowCustom(title, "OK", scroll, mainWin)
+	dialog.ShowCustom(title, T("OK"), scroll, mainWin)
 }
 
 // contains prüft, ob s in slice enthalten ist.
@@ -1418,6 +1441,7 @@ func main() {
 
 	// Konfiguration laden (mit Migration)
 	LoadConfig(myApp)
+	initLang() // App-Sprache (currentLang) aus config.JarvisLang setzen, vor UI-Aufbau
 
 	// Theme laden & anwenden (Hell = Windows-Look, sonst Dunkel)
 	applyTheme(myApp, config.Theme)
@@ -1447,14 +1471,14 @@ func main() {
 
 	// 2. UI Widgets
 	outputArea = widget.NewMultiLineEntry()
-	outputArea.SetPlaceHolder("Gesprochener Text erscheint hier...")
+	trPlaceholder(outputArea, "Gesprochener Text erscheint hier...")
 	outputArea.Wrapping = fyne.TextWrapWord
 
-	statusLabel = widget.NewLabel("Initialisiere...")
+	statusLabel = widget.NewLabel(T("Initialisiere...")) // dynamisch: SetText-Aufrufe nutzen T()
 	statusLabel.Alignment = fyne.TextAlignCenter
 	statusLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-	engineInfo = widget.NewLabel("Engine: Wartet...")
+	engineInfo = widget.NewLabel(T("Engine: Wartet..."))
 	engineInfo.Alignment = fyne.TextAlignCenter
 
 	progressBar = widget.NewProgressBar()
@@ -1500,9 +1524,27 @@ func main() {
 	// Pulse Animation - entfernt: nutzlos und erzeugt Data Race
 
 	micBtn = newTooltipButton(nil, toggleRecording, "Mitschrift")
-	micBtn.SetText("Mitschrift")
+	micBtn.SetText(T("Mitschrift"))
 	micBtn.Importance = widget.HighImportance
 	micBtn.Disable()
+
+	// Dynamische Statuselemente bei Sprachwechsel neu übersetzen (sie halten
+	// ihren zuletzt gesetzten deutschen Schlüssel bzw. leiten aus dem Zustand ab).
+	onLangChange(func() {
+		if statusLabel != nil {
+			statusLabel.SetText(T(lastStatusDE))
+		}
+		if engineInfo != nil {
+			engineInfo.SetText(T(lastEngineDE))
+		}
+		if micBtn != nil {
+			if isRecording.Load() {
+				micBtn.SetText(T("Mitschrift stoppen"))
+			} else {
+				micBtn.SetText(T("Mitschrift"))
+			}
+		}
+	})
 
 	InitLogger()
 	Log("GUI gestartet")
@@ -1522,11 +1564,11 @@ func main() {
 		fyne.Do(func() { progressBar.Hide() })
 
 		if err != nil {
-			fyne.Do(func() { statusLabel.SetText("Fehler bei Dependencies!") })
+			fyne.Do(func() { setStatus("Fehler bei Dependencies!") })
 			return
 		}
 		fyne.Do(func() {
-			statusLabel.SetText("Bereit")
+			setStatus("Bereit")
 			micBtn.Enable()
 		})
 
@@ -1541,7 +1583,7 @@ func main() {
 
 	// Analysis UI: editierbares Dropdown mit gespeicherten Analyse-Vorgaben.
 	analysisPrompt := widget.NewSelectEntry(config.AnalysisPrompts)
-	analysisPrompt.SetPlaceHolder("KI-Analyse Prompt (z.B. Fasse zusammen)")
+	bindText(func(s string) { analysisPrompt.SetPlaceHolder(s) }, "KI-Analyse Prompt (z.B. Fasse zusammen)")
 	analysisPrompt.SetText(config.AnalysisPrompt)
 	analysisPrompt.OnChanged = func(s string) {
 		config.AnalysisPrompt = s
@@ -1565,10 +1607,10 @@ func main() {
 	delPromptBtn := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
 		p := strings.TrimSpace(analysisPrompt.Text)
 		if p == "" || !contains(config.AnalysisPrompts, p) {
-			showInfo("Vorgabe löschen", "Diese Vorgabe ist nicht in der Liste gespeichert.", win)
+			showInfo(T("Vorgabe löschen"), T("Diese Vorgabe ist nicht in der Liste gespeichert."), win)
 			return
 		}
-		showConfirm("Vorgabe löschen", "Analyse-Vorgabe wirklich löschen?\n\n\""+p+"\"", func(ok bool) {
+		showConfirm(T("Vorgabe löschen"), T("Analyse-Vorgabe wirklich löschen?")+"\n\n\""+p+"\"", func(ok bool) {
 			if !ok {
 				return
 			}
@@ -1586,7 +1628,7 @@ func main() {
 		}, win)
 	})
 
-	analysisBtn := widget.NewButton("Analysieren", func() {
+	analysisBtn := trButton("Analysieren", func() {
 		if isRecording.Load() {
 			toggleRecording()
 		}
@@ -1594,7 +1636,7 @@ func main() {
 		prompt := analysisPrompt.Text
 		if len(strings.TrimSpace(text)) < 10 {
 			Log("Analyse übersprungen: Zu wenig Text")
-			showErr(fmt.Errorf("Zu wenig Text für eine Analyse vorhanden."), win)
+			showErr(fmt.Errorf(T("Zu wenig Text für eine Analyse vorhanden.")), win)
 			return
 		}
 		rememberPrompt() // genutzten Prompt in die Auswahlliste übernehmen
@@ -1607,7 +1649,7 @@ func main() {
 
 		debugPreviewAndConfirm(win, "Analyse-Anfrage", preview, func() {
 			Log(fmt.Sprintf("KI-Analyse gestartet (Prompt: '%s' | Text-Länge: %d)", prompt, len(text)))
-			statusLabel.SetText("Analysiere...")
+			setStatus("Analysiere...")
 			analysisProgress.Show()
 
 			start := time.Now()
@@ -1624,7 +1666,7 @@ func main() {
 					resRichText := widget.NewRichTextFromMarkdown(res)
 					resRichText.Wrapping = fyne.TextWrapWord
 
-					copyBtn := widget.NewButtonWithIcon("In Zwischenablage kopieren", theme.ContentCopyIcon(), func() {
+					copyBtn := widget.NewButtonWithIcon(T("In Zwischenablage kopieren"), theme.ContentCopyIcon(), func() {
 						cleanText := strings.ReplaceAll(res, "**", "")
 						cleanText = strings.ReplaceAll(cleanText, "## ", "")
 						cleanText = strings.ReplaceAll(cleanText, "### ", "")
@@ -1642,7 +1684,7 @@ func main() {
 					moveWindowNear(win2, win)
 					win2.Show()
 
-					statusLabel.SetText("Bereit")
+					setStatus("Bereit")
 				})
 			}()
 		})
@@ -1687,7 +1729,7 @@ func main() {
 	}
 	customerEntry.SetText("CRM-10550")
 	setCurrentCRM(validCRM(customerEntry.Text)) // Startwert sicher setzen (nicht nur via OnChanged)
-	customerRow := container.NewHBox(widget.NewLabel("CRM Feld"), customerEntry)
+	customerRow := container.NewHBox(trLabel("CRM Feld"), customerEntry)
 
 	// Label zwischen Feld und Start-Button: zeigt die per Webhook empfangene
 	// Rufnummer des aktuellen Anrufers (leer, bis der erste Anruf eingeht).
@@ -1700,7 +1742,7 @@ func main() {
 	repeatLookupBtn := newTooltipButton(theme.ViewRefreshIcon(), func() {
 		num := getLastCallerNumber()
 		if num == "" {
-			showInfo("Keine Rufnummer", "Es liegt noch keine Rufnummer eines Anrufs vor, die wiederholt werden könnte.", mainWin)
+			showInfo(T("Keine Rufnummer"), T("Es liegt noch keine Rufnummer eines Anrufs vor, die wiederholt werden könnte."), mainWin)
 			return
 		}
 		go handleIncomingCaller(num, false)
@@ -1743,20 +1785,14 @@ func main() {
 	// Hilfe-Button zur Pegelanzeige – rechts in der Mic-Zeile. Hier definiert, damit
 	// die Spk-Zeile mit einem gleich breiten Platzhalter rechtsbündig abschließt.
 	pegelHelpBtn := widget.NewButtonWithIcon("", theme.QuestionIcon(), func() {
-		showInfo("Pegelanzeige & Aussteuerung",
-			"Der Balken zeigt die aktuelle Lautstärke (Pegel) des Kanals.\n\n"+
-				"🟢 Grüner Strich (80 %): Ziel-Aussteuerung – hierhin sollte laute Sprache reichen.\n\n"+
-				"🟠 Oranger Strich: höchster zuletzt erreichter Pegel (Spitzenwert). Er klingt nach Sprechpausen langsam ab und steigt bei neuen, lauteren Stellen sofort wieder.\n\n"+
-				"So stellst du den Gain (Schieberegler) ein:\n"+
-				"• Oranger Strich bleibt deutlich LINKS vom grünen → Gain erhöhen (zu leise).\n"+
-				"• Oranger Strich klebt ganz RECHTS am Anschlag → Gain senken (Übersteuerung/Verzerrung).\n"+
-				"• Optimal: bei lauter Sprache landet Orange etwa auf dem grünen Strich.", win)
+		lmT, lmB := helpLevelMeter()
+		showInfo(lmT, lmB, win)
 	})
 	pegelHelpBtn.Importance = widget.LowImportance // kein grauer Button-Hintergrund fuer das Hilfe-Symbol
 	spkSpacer := canvas.NewRectangle(color.Transparent)
 	spkSpacer.SetMinSize(fyne.NewSize(pegelHelpBtn.MinSize().Width, 0))
 
-	speakerControlGroup = container.NewBorder(nil, nil, widget.NewLabel("Spk:"), spkSpacer, speakerSection)
+	speakerControlGroup = container.NewBorder(nil, nil, trLabel("Spk:"), spkSpacer, speakerSection)
 
 	if config.AppMode != "Headset-Betrieb" {
 		speakerControlGroup.Hide()
@@ -1779,19 +1815,19 @@ func main() {
 	modelState := func(sym string) (bool, string) {
 		switch sym {
 		case "none":
-			return true, "ohne"
+			return true, T("ohne")
 		case "e2b", "12b":
 			inst := instanceFor(sym)
-			return inst != nil && inst.ready.Load(), modelLabelFromSymbol(sym)
+			return inst != nil && inst.ready.Load(), modelLabelFromSymbol(sym) // Modellname = Eigenname
 		case "remote":
 			return remoteConfigured(), "remote (" + config.RemoteBackend + ")"
 		}
 		return false, "—"
 	}
 	updatePills := func() {
-		recOK, recTxt := true, "Erkennung: Whisper lokal"
+		recOK, recTxt := true, T("Erkennung: Whisper lokal")
 		if !config.WhisperLocal {
-			recOK, recTxt = atRemoteWhisperOK.Load(), "Erkennung: Remote Whisper (GPU)"
+			recOK, recTxt = atRemoteWhisperOK.Load(), T("Erkennung: Remote Whisper (GPU)")
 		} else if !whisperReady() {
 			recOK = false
 		}
@@ -1799,9 +1835,10 @@ func main() {
 		anaOK, anaTxt := modelState(config.AnalysisModel)
 
 		recPill.set(recOK, recTxt)
-		postPill.set(postOK, "Nachbearb.: "+postTxt)
-		anaPill.set(anaOK, "Analyse: "+anaTxt)
+		postPill.set(postOK, T("Nachbearb.: ")+postTxt)
+		anaPill.set(anaOK, T("Analyse: ")+anaTxt)
 	}
+	onLangChange(updatePills) // Pills bei Sprachwechsel sofort neu beschriften
 	// Periodischer Live-Check der lokalen Server (aktualisiert die ready-Flags).
 	go func() {
 		t := time.NewTicker(2 * time.Second)
@@ -1821,7 +1858,7 @@ func main() {
 	// automatisch neu).
 	var refreshDiktatTab func()
 	meterContent := container.NewVBox(
-		container.NewBorder(nil, nil, widget.NewLabel("Mic:"), pegelHelpBtn,
+		container.NewBorder(nil, nil, trLabel("Mic:"), pegelHelpBtn,
 			container.NewVBox(
 				agentMeter,
 				container.NewBorder(nil, nil, gainLabel, nil, gainSlider),
@@ -1849,7 +1886,7 @@ func main() {
 	saveTranscriptBtn := widget.NewButtonWithIcon("", theme.DocumentSaveIcon(), func() {
 		text := outputArea.Text
 		if len(strings.TrimSpace(text)) == 0 {
-			showErr(fmt.Errorf("Kein Text zum Speichern vorhanden."), win)
+			showErr(fmt.Errorf(T("Kein Text zum Speichern vorhanden.")), win)
 			return
 		}
 		filename := fmt.Sprintf("transkript_%s.txt", time.Now().Format("20060102_150405"))
@@ -1857,11 +1894,11 @@ func main() {
 		if err != nil {
 			showErr(err, win)
 		} else {
-			showInfo("Export erfolgreich", "Text gespeichert unter:\n"+filename, win)
+			showInfo(T("Export erfolgreich"), T("Text gespeichert unter:")+"\n"+filename, win)
 		}
 	})
 
-	clearBtn := widget.NewButton("Inhalt leeren", func() {
+	clearBtn := trButton("Inhalt leeren", func() {
 		// Sowohl Anzeige als auch internen Puffer zurücksetzen, damit neuer Text
 		// nicht an den alten Inhalt angehängt wird (currentText speist appendToOutput).
 		currentText.Reset()
@@ -1879,7 +1916,7 @@ func main() {
 	// (paketweit) wird nach dem Panel-Bau zugewiesen. auto=false: manueller Klick
 	// mit Debug-Popup (falls aktiv).
 	var ticketSearchBtn *widget.Button
-	ticketSearchBtn = widget.NewButtonWithIcon("Suche passende Tickets", theme.SearchIcon(), func() {
+	ticketSearchBtn = trButtonIcon("Suche passende Tickets", theme.SearchIcon(), func() {
 		if searchMatchingTickets != nil {
 			// crmFallback=true: bei leerem Textfenster offene Tickets zur CRM suchen.
 			searchMatchingTickets(outputArea.Text, ticketSearchBtn, false, true)
@@ -1892,7 +1929,7 @@ func main() {
 			engineInfo,
 			analysisProgress,
 			container.NewBorder(
-				widget.NewLabelWithStyle("LLM Prompt zur Analyse:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+				trLabelStyle("LLM Prompt zur Analyse:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 				nil, nil, nil,
 				container.NewBorder(nil, nil, nil, container.NewHBox(delPromptBtn, analysisBtn), analysisPrompt),
 			),
@@ -1910,8 +1947,37 @@ func main() {
 	// Audio Device Selection Placeholder
 	var speakerSelect *widget.Select
 
-	// Mode Switcher (RadioGroup)
-	modeRadio := widget.NewRadioGroup([]string{"Standard-Betrieb", "Headset-Betrieb"}, func(s string) {
+	// Mode Switcher (RadioGroup) - Label/Wert-Trennung: interne Werte
+	// "Standard-Betrieb"/"Headset-Betrieb" (in config.AppMode gespeichert, an
+	// mehreren Stellen verglichen) bleiben fest, angezeigt werden übersetzte
+	// Labels. currentMode hält den internen Wert sprachunabhängig.
+	modeValues := []string{"Standard-Betrieb", "Headset-Betrieb"}
+	modeLabels := func() []string {
+		out := make([]string, len(modeValues))
+		for i, v := range modeValues {
+			out[i] = T(v)
+		}
+		return out
+	}
+	valueForModeLabel := func(label string) string {
+		for _, v := range modeValues {
+			if T(v) == label {
+				return v
+			}
+		}
+		return "Standard-Betrieb"
+	}
+	currentMode := config.AppMode
+	if currentMode != "Headset-Betrieb" {
+		currentMode = "Standard-Betrieb"
+	}
+	suppressModeChange := false
+	modeRadio := widget.NewRadioGroup(modeLabels(), func(label string) {
+		if suppressModeChange {
+			return
+		}
+		s := valueForModeLabel(label)
+		currentMode = s
 		config.AppMode = s
 		SaveConfig()
 		if s == "Standard-Betrieb" {
@@ -1928,41 +1994,27 @@ func main() {
 		Log("Betriebsmodus gewechselt: " + s)
 	})
 	modeRadio.Horizontal = true
-	modeRadio.SetSelected(config.AppMode)
-	if config.AppMode == "Standard-Betrieb" {
-		// Platzhalter-Logik entfernt
-	}
+	modeRadio.SetSelected(T(currentMode))
+	onLangChange(func() {
+		suppressModeChange = true
+		modeRadio.Options = modeLabels()
+		modeRadio.SetSelected(T(currentMode))
+		suppressModeChange = false
+		modeRadio.Refresh()
+	})
 
 	modeInfoBtn := newTooltipButton(theme.InfoIcon(), func() {
-		infoText := "Wenn deine Kommunikations-Software (z.B. Teams/Zoom) beim Start der App verstummt,\n" +
-			"musst du die Exklusiv-Rechte von Windows deaktivieren, damit \n" +
-			"diese App und Teams gleichzeitig auf das Headset zugreifen können.\n\n" +
-			"Öffne die Soundeinstellungen durch Klick auf den Button unten, " +
-			"scrolle nach unten zu „Erweitert“,\nklicke auf „Weitere Soundeinstellungen“.\n\n" +
-			"🔊 Für dein Headset (Wiedergabe)\n" +
-			"1. Tab „Wiedergabe“\n" +
-			"2. Doppelklick auf dein Headset\n" +
-			"3. Tab „Erweitert“\n" +
-			"4. Entferne die Haken bei:\n" +
-			"   o „Anwendungen haben alleinige Kontrolle über das Gerät“\n" +
-			"   o „Anwendungen im exklusiven Modus haben Priorität“\n" +
-			"5. Übernehmen\n" +
-			"________________________________________\n" +
-			"🎤 Für dein Mikrofon (Aufnahme)\n" +
-			"6. Tab „Aufnahme“\n" +
-			"7. Doppelklick auf dein Mikrofon\n" +
-			"8. Tab „Erweitert“\n" +
-			"9. Die gleichen beiden Haken entfernen\n" +
-			"10. Übernehmen"
-
+		helpTitle, infoText := helpHeadset()
+		// "Soundeinstellungen ändern" hier bewusst mit T() (transientes Fenster,
+		// kein trButtonIcon/Callback - das Fenster wird bei jedem Klick neu erzeugt).
 		content := container.NewVBox(
 			widget.NewLabel(infoText),
-			widget.NewButtonWithIcon("Soundeinstellungen ändern", theme.SettingsIcon(), func() {
+			widget.NewButtonWithIcon(T("Soundeinstellungen ändern"), theme.SettingsIcon(), func() {
 				cmd := exec.Command("cmd", "/c", "start", "ms-settings:sound")
 				cmd.Start()
 			}),
 		)
-		winHelp := fyne.CurrentApp().NewWindow("Hilfe: Headset-Betrieb (Stumme Leitung fixen)")
+		winHelp := fyne.CurrentApp().NewWindow(helpTitle)
 		winHelp.SetContent(content)
 		winHelp.Resize(fyne.NewSize(550, 500))
 		moveWindowNear(winHelp, win)
@@ -2003,18 +2055,19 @@ func main() {
 	}
 
 	// Pause Slider
-	pauseLabel := widget.NewLabel(fmt.Sprintf("Satzpause: %.1fs", config.PauseThreshold))
+	pauseLabel := widget.NewLabel(fmt.Sprintf(T("Satzpause: %.1fs"), config.PauseThreshold))
+	onLangChange(func() { pauseLabel.SetText(fmt.Sprintf(T("Satzpause: %.1fs"), config.PauseThreshold)) })
 	pauseSlider := widget.NewSlider(0.5, 5.0)
 	pauseSlider.Step = 0.5
 	pauseSlider.SetValue(config.PauseThreshold)
 	pauseSlider.OnChanged = func(v float64) {
 		config.PauseThreshold = v
 		saveConfigDebounced()
-		pauseLabel.SetText(fmt.Sprintf("Satzpause: %.1fs", v))
+		pauseLabel.SetText(fmt.Sprintf(T("Satzpause: %.1fs"), v))
 	}
 
 	// Logging Toggle
-	logCheck := widget.NewCheck("System-Logging aktivieren", func(b bool) {
+	logCheck := trCheck("System-Logging aktivieren", func(b bool) {
 		config.LoggingEnabled = b
 		SaveConfig()
 		if b {
@@ -2023,7 +2076,7 @@ func main() {
 	})
 	logCheck.SetChecked(config.LoggingEnabled)
 
-	debugCheck := widget.NewCheck("Debug-Modus (Anfrage vor Versand anzeigen: Suchen/Analysieren)", func(b bool) {
+	debugCheck := trCheck("Debug-Modus (Anfrage vor Versand anzeigen: Suchen/Analysieren)", func(b bool) {
 		config.DebugMode = b
 		SaveConfig()
 	})
@@ -2058,7 +2111,7 @@ func main() {
 
 	// Verbindungsfelder des gewählten Remote-Backends (currentBackend).
 	apiKeyEntry := NewMinSizeEntry(200)
-	apiKeyEntry.Entry.SetPlaceHolder("API Key")
+	trPlaceholder(&apiKeyEntry.Entry, "API Key")
 	apiKeyEntry.Entry.OnChanged = func(s string) {
 		if b := currentBackend(); b != nil {
 			b.ApiKey = s
@@ -2076,7 +2129,7 @@ func main() {
 	}
 
 	modelEntry := NewMinSizeEntry(200)
-	modelEntry.Entry.SetPlaceHolder("Modell-Name")
+	trPlaceholder(&modelEntry.Entry, "Modell-Name")
 	modelEntry.Entry.OnChanged = func(s string) {
 		if b := currentBackend(); b != nil {
 			b.Model = s
@@ -2093,24 +2146,23 @@ func main() {
 		saveConfigDebounced()
 	}
 	jarvisApiKeyEntry := widget.NewPasswordEntry()
-	jarvisApiKeyEntry.SetPlaceHolder("API-Key")
+	trPlaceholder(jarvisApiKeyEntry, "API-Key")
 	jarvisApiKeyEntry.SetText(config.Jarvis.ApiKey)
 	jarvisApiKeyEntry.OnChanged = func(s string) {
 		config.Jarvis.ApiKey = s
 		saveConfigDebounced()
 	}
 
-	// DE/EN-Anzeige (Segment-Pill, siehe design.png "de_en.png") - Umschalten ist
-	// BEWUSST deaktiviert: solange keine i18n-/Uebersetzungsschicht existiert,
-	// laeuft die App (und die Jarvis-Suche) fest auf Deutsch. Pille bleibt
-	// sichtbar, reagiert aber nicht auf Klicks. TODO: nach Einfuehrung von i18n
-	// wieder anklickbar machen (config.JarvisLang "de"/"en"), s. Memory
-	// [[i18n-todo-de-en-toggle]].
-	config.JarvisLang = "de"
+	// DE/EN-Umschalter (Segment-Pill, siehe design.png "de_en.png"). Klick
+	// wechselt live die App-Sprache (currentLang / config.JarvisLang) über
+	// setLanguage; alle übersetzbaren Widgets folgen via onLangChange. Die Pille
+	// selbst besteht aus canvas-Objekten und wird per newTappable klickbar
+	// gemacht; applyLangPill spiegelt die aktive Sprache optisch wider. Siehe
+	// i18n.go und Memory [[i18n-todo-de-en-toggle]].
 	deFg := canvas.NewText("DE", color.White)
 	deFg.TextStyle = fyne.TextStyle{Bold: true}
 	deFg.TextSize = 11
-	enFg := canvas.NewText("EN", theme.Color(theme.ColorNameDisabled))
+	enFg := canvas.NewText("EN", color.White)
 	enFg.TextStyle = fyne.TextStyle{Bold: true}
 	enFg.TextSize = 11
 	deBg := canvas.NewRectangle(kiAccent)
@@ -2119,12 +2171,40 @@ func main() {
 	enBg.CornerRadius = 9
 	jarvisLangTrack := canvas.NewRectangle(color.NRGBA{R: 0xEA, G: 0xEA, B: 0xEA, A: 255})
 	jarvisLangTrack.CornerRadius = 9
-	jarvisLangToggle := container.NewHBox(container.NewStack(
-		jarvisLangTrack,
-		container.New(&segmentLayout{},
-			container.NewStack(deBg, container.NewPadded(deFg)),
-			container.NewStack(enBg, container.NewPadded(enFg)),
+	applyLangPill := func() {
+		if currentLang == "en" {
+			enBg.FillColor = kiAccent
+			enFg.Color = color.White
+			deBg.FillColor = color.Transparent
+			deFg.Color = theme.Color(theme.ColorNameDisabled)
+		} else {
+			deBg.FillColor = kiAccent
+			deFg.Color = color.White
+			enBg.FillColor = color.Transparent
+			enFg.Color = theme.Color(theme.ColorNameDisabled)
+		}
+		deBg.Refresh()
+		enBg.Refresh()
+		deFg.Refresh()
+		enFg.Refresh()
+	}
+	onLangChange(applyLangPill)
+	applyLangPill() // Startzustand (z.B. wenn beim Start bereits EN aktiv ist)
+	jarvisLangToggle := container.NewHBox(newTappable(
+		container.NewStack(
+			jarvisLangTrack,
+			container.New(&segmentLayout{},
+				container.NewStack(deBg, container.NewPadded(deFg)),
+				container.NewStack(enBg, container.NewPadded(enFg)),
+			),
 		),
+		func() {
+			if currentLang == "de" {
+				setLanguage("en")
+			} else {
+				setLanguage("de")
+			}
+		},
 	))
 
 	// Auto-Discovery der Modelle des gewählten Remote-Backends.
@@ -2136,7 +2216,7 @@ func main() {
 		mode := config.RemoteBackend
 		srvUrl := b.Url
 		apiKey := b.ApiKey
-		statusLabel.SetText("Suche Modelle...")
+		setStatus("Suche Modelle...")
 		go func() {
 			var models []string
 			var derr error
@@ -2147,13 +2227,13 @@ func main() {
 				models, derr = fetchOllamaModels(srvUrl, apiKey)
 			}
 			fyne.Do(func() {
-				statusLabel.SetText("Bereit")
+				setStatus("Bereit")
 				if derr != nil {
 					showErr(derr, win)
 					return
 				}
 				if len(models) == 0 {
-					showErr(fmt.Errorf("Server unter %s erreichbar, meldet aber keine Modelle.", srvUrl), win)
+					showErr(fmt.Errorf(T("Server unter %s erreichbar, meldet aber keine Modelle."), srvUrl), win)
 					return
 				}
 				sel := widget.NewSelect(models, nil)
@@ -2162,7 +2242,7 @@ func main() {
 					widget.NewLabel(fmt.Sprintf("%d Modelle erkannt:", len(models))),
 					sel,
 				)
-				dialog.ShowCustomConfirm("Modell auswählen", "Auswählen", "Abbrechen", content, func(ok bool) {
+				dialog.ShowCustomConfirm(T("Modell auswählen"), T("Auswählen"), T("Abbrechen"), content, func(ok bool) {
 					if ok && sel.Selected != "" {
 						modelEntry.Entry.SetText(sel.Selected)
 					}
@@ -2228,18 +2308,18 @@ func main() {
 		if m := findLocalModel(f); m != nil {
 			label = m.Label
 		}
-		dialog.ShowConfirm("Modell herunterladen?",
-			fmt.Sprintf("Das lokale Modell „%s“ ist noch nicht vorhanden.\n"+
+		dialog.ShowConfirm(T("Modell herunterladen?"),
+			fmt.Sprintf(T("Das lokale Modell „%s“ ist noch nicht vorhanden.\n"+
 				"Es muss einmalig heruntergeladen werden (mehrere GB), bevor die\n"+
-				"Auswahl aktiv wird.\n\nJetzt herunterladen?", label),
+				"Auswahl aktiv wird.\n\nJetzt herunterladen?"), label),
 			func(ok bool) {
 				if !ok {
 					revert() // Auswahl verworfen, nicht gespeichert
 					return
 				}
 				prog := widget.NewProgressBarInfinite()
-				info := widget.NewLabel("Bereite Modell vor …")
-				dlg := dialog.NewCustom("Modell wird geladen", "Im Hintergrund weiter", container.NewVBox(info, prog), win)
+				info := widget.NewLabel(T("Bereite Modell vor …"))
+				dlg := dialog.NewCustom(T("Modell wird geladen"), T("Im Hintergrund weiter"), container.NewVBox(info, prog), win)
 				dlg.Show()
 				go func() {
 					if err := ensureLocalModel(f, func(task string, p float64) {
@@ -2272,8 +2352,22 @@ func main() {
 		config.RemoteWhisperUrl = s
 		saveConfigDebounced()
 	}
-	whisperRadio := widget.NewRadioGroup([]string{"Whisper lokal", "Remote GPU"}, func(s string) {
-		b := s == "Whisper lokal"
+	// Label/Wert-Trennung wie bei den anderen Radios: die Auswahl steuert den
+	// bool config.WhisperLocal; angezeigt werden übersetzte Labels ("Remote GPU"
+	// bleibt sprachneutral).
+	whisperLabels := func() []string { return []string{T("Whisper lokal"), T("Remote GPU")} }
+	whisperSel := func() string {
+		if config.WhisperLocal {
+			return T("Whisper lokal")
+		}
+		return T("Remote GPU")
+	}
+	suppressWhisperChange := false
+	whisperRadio := widget.NewRadioGroup(whisperLabels(), func(label string) {
+		if suppressWhisperChange {
+			return
+		}
+		b := label == T("Whisper lokal")
 		config.WhisperLocal = b
 		SaveConfig()
 		if b {
@@ -2285,13 +2379,19 @@ func main() {
 		updatePills()
 	})
 	whisperRadio.Horizontal = true
+	whisperRadio.SetSelected(whisperSel())
 	if config.WhisperLocal {
-		whisperRadio.SetSelected("Whisper lokal")
 		remoteUrlEntry.Disable()
 	} else {
-		whisperRadio.SetSelected("Remote GPU")
 		remoteUrlEntry.Enable()
 	}
+	onLangChange(func() {
+		suppressWhisperChange = true
+		whisperRadio.Options = whisperLabels()
+		whisperRadio.SetSelected(whisperSel())
+		suppressWhisperChange = false
+		whisperRadio.Refresh()
+	})
 
 	// --- Nachbearbeitung der Erkennung ---
 	var postProcSelect *MinSizeSelect
@@ -2316,14 +2416,8 @@ func main() {
 	postProcSelect.SetSelected(modelLabelFromSymbol(config.PostProcModel))
 	suppressModelChange = false
 	postProcHelpBtn := widget.NewButtonWithIcon("", theme.QuestionIcon(), func() {
-		showInfo("Spracherkennung & Nachbearbeitung",
-			"Erkennung:\n"+
-				"• Whisper lokal: lokaler whisper-cli (CPU).\n"+
-				"• Remote GPU: GPU-Whisper-Server über die WebSocket-URL.\n\n"+
-				"Nachbearbeitung: Verbessert den erkannten Text.\n"+
-				"• ohne: roher Text\n"+
-				"• Gemma 4 E2B / 12B: lokale Korrektur (12B genauer, aber langsam auf CPU)\n"+
-				"• remote LLM: Korrektur über das unten gewählte Remote-Backend", win)
+		rcT, rcB := helpRecognition()
+		showInfo(rcT, rcB, win)
 	})
 	postProcHelpBtn.Importance = widget.LowImportance // kein grauer Button-Hintergrund fuer das Hilfe-Symbol
 
@@ -2347,11 +2441,11 @@ func main() {
 	analysisSelect.SetSelected(modelLabelFromSymbol(config.AnalysisModel))
 	suppressModelChange = false
 
-	saveBtn := widget.NewButtonWithIcon("Einstellungen jetzt speichern", theme.DocumentSaveIcon(), func() {
+	saveBtn := trButtonIcon("Einstellungen jetzt speichern", theme.DocumentSaveIcon(), func() {
 		Log("Manuelle Konfigurationsspeicherung ausgelöst")
 		SaveConfig()
 		restartWebhookServer() // geänderte Webhook-Einstellungen (aktiv/Port/Pfad) übernehmen
-		showInfo("Erfolg", "Alle Einstellungen wurden dauerhaft gespeichert.", win)
+		showInfo(T("Erfolg"), T("Alle Einstellungen wurden dauerhaft gespeichert."), win)
 	})
 
 	// KI-Support: zweite Haelfte NUR des STT-Tabs, Anbindung an die Jarvis-Support-API.
@@ -2387,20 +2481,21 @@ func main() {
 	// eines alignedFormLayout und ist dadurch links/rechts buendig zum Eingabefeld
 	// "Prompt für passende Tickets".
 	config.AutoScanInterval = clampAutoScanInterval(config.AutoScanInterval)
-	autoScanIntervalLabel := widget.NewLabel(fmt.Sprintf("Scan-Intervall: %d s", config.AutoScanInterval))
+	autoScanIntervalLabel := widget.NewLabel(fmt.Sprintf(T("Scan-Intervall: %d s"), config.AutoScanInterval))
+	onLangChange(func() { autoScanIntervalLabel.SetText(fmt.Sprintf(T("Scan-Intervall: %d s"), config.AutoScanInterval)) })
 	autoScanSlider := widget.NewSlider(5, 60)
 	autoScanSlider.Step = 5
 	autoScanSlider.SetValue(float64(config.AutoScanInterval))
 	autoScanSlider.OnChanged = func(v float64) {
 		config.AutoScanInterval = clampAutoScanInterval(int(v))
-		autoScanIntervalLabel.SetText(fmt.Sprintf("Scan-Intervall: %d s", config.AutoScanInterval))
+		autoScanIntervalLabel.SetText(fmt.Sprintf(T("Scan-Intervall: %d s"), config.AutoScanInterval))
 		saveConfigDebounced()
 		// Laeuft gerade ein Scan-Zyklus, mit neuem Intervall neu starten.
 		if isRecording.Load() && config.AutoScanEnabled {
 			startAutoScan()
 		}
 	}
-	autoScanCheck := widget.NewCheck("aktiviert", func(b bool) {
+	autoScanCheck := trCheck("aktiviert", func(b bool) {
 		config.AutoScanEnabled = b
 		saveConfigDebounced()
 		if b {
@@ -2413,35 +2508,41 @@ func main() {
 			stopAutoScan()
 		}
 	})
-	autoScanCheck.SetChecked(config.AutoScanEnabled)
-	if !config.AutoScanEnabled {
-		autoScanSlider.Disable() // Slider nur bei aktivierter Checkbox verschiebbar
-	}
+	// "Automatische Ticketsuche" ist bis auf weiteres deaktiviert: Checkbox
+	// ausgegraut (kein Häkchen setzbar) und die Automatik zwangsweise aus –
+	// unabhängig von einem evtl. gespeichert 'true', damit sie nicht doch über
+	// config.AutoScanEnabled anläuft. Zum Reaktivieren diese drei Zeilen durch die
+	// ursprüngliche Zustandslogik ersetzen:
+	//   autoScanCheck.SetChecked(config.AutoScanEnabled)
+	//   if !config.AutoScanEnabled { autoScanSlider.Disable() }
+	config.AutoScanEnabled = false
+	autoScanCheck.Disable()
+	autoScanSlider.Disable()
 	// Fertige Zeilen fuer die Platzierung hinter "Analyse (manuell, mit Prompt)":
 	// Checkbox "aktiviert" in der Wert-Spalte, Beschreibung links davon; darunter
 	// der Slider in der Wert-Spalte (buendig zum Prompt-Eingabefeld).
-	autoScanCheckRow := container.New(&alignedFormLayout{}, widget.NewLabel("Automatische Ticketsuche"), autoScanCheck)
+	autoScanCheckRow := container.New(&alignedFormLayout{}, trLabel("Automatische Ticketsuche"), autoScanCheck)
 	autoScanIntervalRow := container.New(&alignedFormLayout{}, autoScanIntervalLabel, autoScanSlider)
 
 	// "Anrufer automatisch suchen": bei eingehendem Anruf automatisch die CRM-
 	// Suche zur Rufnummer starten (Default an). Reiner Konfig-Schalter (Wirkung in
 	// handleIncomingCaller, webhook.go); kein Sofort-Effekt beim Umschalten.
-	autoSearchCheck := widget.NewCheck("aktiviert", func(b bool) {
+	autoSearchCheck := trCheck("aktiviert", func(b bool) {
 		config.AutoSearchCaller = b
 		saveConfigDebounced()
 	})
 	autoSearchCheck.SetChecked(config.AutoSearchCaller)
-	autoSearchCheckRow := container.New(&alignedFormLayout{}, widget.NewLabel("Anrufer automatisch suchen"), autoSearchCheck)
+	autoSearchCheckRow := container.New(&alignedFormLayout{}, trLabel("Anrufer automatisch suchen"), autoSearchCheck)
 
 	// "Mitschrift bei Anruf starten": startet bei eingehendem Anruf (Webhook)
 	// automatisch die Aufnahme. Reiner Konfig-Schalter (Wirkung in
 	// maybeAutoStartRecording, webhook.go); kein Sofort-Effekt beim Umschalten.
-	autoRecordCheck := widget.NewCheck("aktiviert", func(b bool) {
+	autoRecordCheck := trCheck("aktiviert", func(b bool) {
 		config.AutoRecordOnCall = b
 		saveConfigDebounced()
 	})
 	autoRecordCheck.SetChecked(config.AutoRecordOnCall)
-	autoRecordCheckRow := container.New(&alignedFormLayout{}, widget.NewLabel("Mitschrift bei Anruf starten"), autoRecordCheck)
+	autoRecordCheckRow := container.New(&alignedFormLayout{}, trLabel("Mitschrift bei Anruf starten"), autoRecordCheck)
 
 	// "Mehrere CRM-Treffer": Verhalten, wenn die Rufnummernsuche >1 Treffer
 	// liefert - Auswahl-Popup zeigen (Default) oder still den ersten nehmen.
@@ -2459,12 +2560,12 @@ func main() {
 	} else {
 		callerMatchSelect.SetSelected(crmChoiceShow)
 	}
-	callerMatchRow := container.New(&alignedFormLayout{}, widget.NewLabel("Mehrere CRM-Treffer"), framedSelect(callerMatchSelect))
+	callerMatchRow := container.New(&alignedFormLayout{}, trLabel("Mehrere CRM-Treffer"), framedSelect(callerMatchSelect))
 
 	// --- Rufnummern Übergabe (eingehender Webhook, s. webhook.go) ---
 	// Aktiv-Checkbox startet/stoppt den Listener sofort; Port/Pfad werden beim
 	// manuellen Speichern (saveBtn) übernommen (restartWebhookServer).
-	webhookEnableCheck := widget.NewCheck("aktiviert", func(b bool) {
+	webhookEnableCheck := trCheck("aktiviert", func(b bool) {
 		config.WebhookEnabled = b
 		saveConfigDebounced()
 		restartWebhookServer()
@@ -2488,53 +2589,41 @@ func main() {
 	}
 
 	webhookHelpBtn := widget.NewButtonWithIcon("", theme.QuestionIcon(), func() {
-		showInfo("Rufnummern-Übergabe (Webhook)",
-			"Ein externer Trigger (z.B. die Telefonanlage) übergibt beim eingehenden Anruf die Rufnummer an diese App. Damit wird in Jira gesucht und der Issue-Key des besten Treffers ins CRM Feld eingetragen.\n\n"+
-				fmt.Sprintf("Der Server lauscht auf ALLEN Netzwerk-Adressen:\n    http://<Rechner-IP>:%d%s\n\n", effectiveWebhookPort(), effectiveWebhookPath())+
-				"Rufnummer übergeben – zwei Wege:\n"+
-				"• GET:   Rufnummer als Query-Parameter anhängen.\n"+
-				"• POST:  JSON-Body {\"number\":\"...\"} (Content-Type application/json) oder als Formularfeld.\n\n"+
-				"Akzeptierte Parameter-/Feldnamen (Groß-/Kleinschreibung beachten):\n"+
-				"    number, num, nummer, phone, tel, telefon, caller, callerid, rufnummer\n\n"+
-				"Ein führendes \"+\" (z.B. +49...) bleibt erhalten.\n\n"+
-				"Beispiel (GET):\n"+
-				fmt.Sprintf("    http://%s:%d%s?nummer=+492056261551\n\n", getLocalIPHint(), effectiveWebhookPort(), effectiveWebhookPath())+
-				"Beispiel (POST):\n"+
-				fmt.Sprintf("    curl -X POST -H \"Content-Type: application/json\" \\\n         -d '{\"nummer\":\"+492056261551\"}' \\\n         http://%s:%d%s\n\n", getLocalIPHint(), effectiveWebhookPort(), effectiveWebhookPath())+
-				"Änderungen an Port/Pfad werden mit \"Einstellungen jetzt speichern\" übernommen.", win)
+		whT, whB := helpWebhook()
+		showInfo(whT, whB, win)
 	})
 	webhookHelpBtn.Importance = widget.LowImportance
 
 	settingsContent := container.New(&compactVBoxLayout{},
-		widget.NewLabelWithStyle("Betriebsmodus", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		trLabelStyle("Betriebsmodus", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.NewHBox(modeRadio, modeInfoBtn),
 
 		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Audio-Geräte", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		trLabelStyle("Audio-Geräte", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.New(&alignedFormLayout{},
-			widget.NewLabel("Mikrofon:"), framedSelect(micSelect),
-			widget.NewLabel("Lautsprecher:"), framedSelect(speakerSelect),
+			trLabel("Mikrofon:"), framedSelect(micSelect),
+			trLabel("Lautsprecher:"), framedSelect(speakerSelect),
 		),
 
 		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Spracherkennung und Analyse", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		trLabelStyle("Spracherkennung und Analyse", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.New(&alignedFormLayout{},
-			widget.NewLabel("Transkribierung über:"), whisperRadio,
-			widget.NewLabel("Nachbearbeitung:"), container.NewBorder(nil, nil, nil, postProcHelpBtn, framedSelect(postProcSelect)),
+			trLabel("Transkribierung über:"), whisperRadio,
+			trLabel("Nachbearbeitung:"), container.NewBorder(nil, nil, nil, postProcHelpBtn, framedSelect(postProcSelect)),
 		),
-		container.New(&alignedFormLayout{}, widget.NewLabel("Remote-Whisper-URL:"), remoteUrlEntry),
-		container.New(&alignedFormLayout{}, widget.NewLabel("Analyse (manuell, mit Prompt):"), framedSelect(analysisSelect)),
+		container.New(&alignedFormLayout{}, trLabel("Remote-Whisper-URL:"), remoteUrlEntry),
+		container.New(&alignedFormLayout{}, trLabel("Analyse (manuell, mit Prompt):"), framedSelect(analysisSelect)),
 
 		// Automatischer zyklischer Ticket-Scan - inhaltlich zur Erkennung/Analyse
 		// gehoerig, daher hier direkt hinter "Analyse (manuell, mit Prompt)".
 		// Reihenfolge: Ueberschrift, Prompt, Checkbox-Zeile, Intervall-Slider.
 		widget.NewLabel(""), // Leerzeile vor der Ueberschrift
-		widget.NewLabelWithStyle("Suche nach passenden Tickets", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		trLabelStyle("Suche nach passenden Tickets", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		autoSearchCheckRow,
 		autoRecordCheckRow,
 		callerMatchRow,
 		container.New(&alignedFormLayout{},
-			widget.NewLabel("Prompt für passende Tickets:"), jarvisTicketSearchPromptEntry,
+			trLabel("Prompt für passende Tickets:"), jarvisTicketSearchPromptEntry,
 		),
 		autoScanCheckRow,
 		autoScanIntervalRow,
@@ -2543,64 +2632,104 @@ func main() {
 
 		// remote LLM - 3 Zeilen, 3 Spalten: Radio(180) | Label | Value
 		func() fyne.CanvasObject {
-			header := widget.NewLabelWithStyle("remote LLM konfigurieren", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+			header := trLabelStyle("remote LLM konfigurieren", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 			return container.New(&llmTableLayout{},
 				header,
-				flashRadio, widget.NewLabel("API key:"), apiKeyEntry,
-				ollamaRadio, widget.NewLabel("URL:"), urlEntry,
-				vllmRadio, widget.NewLabel("Modelname:"), modelRow,
+				flashRadio, trLabel("API key:"), apiKeyEntry,
+				ollamaRadio, trLabel("URL:"), urlEntry,
+				vllmRadio, trLabel("Modelname:"), modelRow,
 			)
 		}(),
 
 		widget.NewSeparator(),
-		widget.NewLabelWithStyle("KI-Support (Jarvis)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		trLabelStyle("KI-Support (Jarvis)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.New(&alignedFormLayout{},
-			widget.NewLabel("Server-URL:"), jarvisServerEntry,
-			widget.NewLabel("API-Key:"), jarvisApiKeyEntry,
-			widget.NewLabel("Prompt für Suchen:"), jarvisSearchPromptEntry,
+			trLabel("Server-URL:"), jarvisServerEntry,
+			trLabel("API-Key:"), jarvisApiKeyEntry,
+			trLabel("Prompt für Suchen:"), jarvisSearchPromptEntry,
 		),
 
 		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Rufnummern Übergabe", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		trLabelStyle("Rufnummern Übergabe", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.New(&alignedFormLayout{},
-			widget.NewLabel("Webhook aktiv:"), container.NewHBox(webhookEnableCheck, webhookHelpBtn),
-			widget.NewLabel("Webhook-URL (Pfad):"), webhookPathEntry,
-			widget.NewLabel("Port:"), webhookPortEntry,
+			trLabel("Webhook aktiv:"), container.NewHBox(webhookEnableCheck, webhookHelpBtn),
+			trLabel("Webhook-URL (Pfad):"), webhookPathEntry,
+			trLabel("Port:"), webhookPortEntry,
 		),
 
 		widget.NewSeparator(),
-		widget.NewLabelWithStyle("System-Einstellungen", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		trLabelStyle("System-Einstellungen", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		container.New(&compactFormLayout{},
-			widget.NewLabel("Sprache:"), jarvisLangToggle,
+			trLabel("Sprache:"), jarvisLangToggle,
 		),
 		logCheck,
 		debugCheck,
 
 		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Design", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		trLabelStyle("Design", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		func() *widget.RadioGroup {
-			r := widget.NewRadioGroup([]string{"Hell (klassisch)", "Hell (modern)", "Dunkel (modern)"}, func(s string) {
-				config.Theme = s
-				SaveConfig()
-				applyTheme(myApp, s)
-				setWindowSquare(win, isClassic(s)) // klassisch -> eckiger Fensterrahmen
-			})
+			// Interne Theme-Werte (werden in config.Theme gespeichert und von
+			// applyTheme/isClassic geparst) getrennt von den angezeigten,
+			// übersetzten Labels. valueForLabel mappt das gewählte Label auf den
+			// festen internen Wert zurück.
+			themeValues := []string{"Hell (klassisch)", "Hell (modern)", "Dunkel (modern)"}
+			themeLabels := func() []string {
+				out := make([]string, len(themeValues))
+				for i, v := range themeValues {
+					out[i] = T(v)
+				}
+				return out
+			}
+			valueForLabel := func(label string) string {
+				for _, v := range themeValues {
+					if T(v) == label {
+						return v
+					}
+				}
+				return "Hell (modern)"
+			}
+			cur := "Hell (modern)"
 			switch config.Theme {
 			case "Dunkel", "Dunkel (modern)":
-				r.SetSelected("Dunkel (modern)")
+				cur = "Dunkel (modern)"
 			case "Klassisch", "Hell (klassisch)":
-				r.SetSelected("Hell (klassisch)")
-			default:
-				r.SetSelected("Hell (modern)")
+				cur = "Hell (klassisch)"
 			}
+			// currentThemeValue hält den gewählten INTERNEN Wert (sprachunabhängig).
+			// Nicht aus r.Selected zurückmappen: nach einem Sprachwechsel enthielte
+			// r.Selected noch das Label der alten Sprache, während valueForLabel
+			// bereits in der neuen Sprache vergliche.
+			currentThemeValue := cur
+			suppressThemeChange := false
+			r := widget.NewRadioGroup(themeLabels(), func(label string) {
+				if suppressThemeChange {
+					return
+				}
+				v := valueForLabel(label)
+				currentThemeValue = v
+				config.Theme = v
+				SaveConfig()
+				applyTheme(myApp, v)
+				setWindowSquare(win, isClassic(v)) // klassisch -> eckiger Fensterrahmen
+			})
+			r.SetSelected(T(cur))
 			r.Horizontal = true
+			// Sprachwechsel: Labels + Auswahl neu setzen, ohne OnChanged (und damit
+			// applyTheme) erneut auszulösen - der interne Wert bleibt unverändert.
+			onLangChange(func() {
+				suppressThemeChange = true
+				r.Options = themeLabels()
+				r.SetSelected(T(currentThemeValue))
+				suppressThemeChange = false
+				r.Refresh()
+			})
 			return r
 		}(),
 
 		widget.NewSeparator(),
-		widget.NewLabelWithStyle("Speicherpfade", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewLabel("Binaries: ./libs/"),
-		widget.NewLabel("Modelle: ./models/"),
+		trLabelStyle("Speicherpfade", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		trLabel("Binaries: ./libs/"),
+		trLabel("Modelle: ./models/"),
 	)
 
 	// Weisser Hintergrund statt des Theme-Graus (klassischer Modus) - wie beim
@@ -2617,8 +2746,12 @@ func main() {
 
 	tabs := container.NewAppTabs(
 		container.NewTabItemWithIcon("STT", theme.MediaRecordIcon(), sttSplit),
-		container.NewTabItemWithIcon("Einstellungen", theme.SettingsIcon(), configTab),
+		container.NewTabItemWithIcon(T("Einstellungen"), theme.SettingsIcon(), configTab),
 	)
+	onLangChange(func() {
+		tabs.Items[1].Text = T("Einstellungen")
+		tabs.Refresh()
+	})
 
 	// Firmenlogo oben rechts, auf gleicher Hoehe wie die Tab-Reiter. AppTabs hat
 	// keinen eigenen Slot dafuer - das Logo wird per Stack ueber die Tabs gelegt
@@ -2723,10 +2856,10 @@ func toggleRecording() {
 		pendingSpeaker = ""
 		inProgress = nil
 		isRecording.Store(true)
-		micBtn.SetText("Mitschrift stoppen")
+		micBtn.SetText(T("Mitschrift stoppen"))
 		micBtn.tip = "Mitschrift stoppen"
 		micBtn.Importance = widget.DangerImportance
-		statusLabel.SetText("Höre zu...")
+		setStatus("Höre zu...")
 		startAutoScan() // zyklischen Ticket-Scan starten (No-op, wenn deaktiviert)
 	} else {
 		stopAutoScan()
@@ -2734,9 +2867,9 @@ func toggleRecording() {
 		if atHasPostProc.Load() {
 			flushPendingToCorrection()
 		}
-		statusLabel.SetText("Bereit")
+		setStatus("Bereit")
 		isRecording.Store(false)
-		micBtn.SetText("Mitschrift")
+		micBtn.SetText(T("Mitschrift"))
 		micBtn.tip = "Mitschrift"
 		micBtn.Importance = widget.HighImportance
 	}
@@ -3274,7 +3407,7 @@ func processSegment(audio []byte, speaker string) {
 		if strings.Contains(rawText, "CPU") && !strings.Contains(rawText, "GPU") {
 			engineText = "Engine: CPU (AVX2/512)"
 		}
-		fyne.Do(func() { engineInfo.SetText(engineText) })
+		fyne.Do(func() { setEngineInfo(engineText) })
 	}
 	lines := strings.Split(rawText, "\n")
 	var cleanLines []string

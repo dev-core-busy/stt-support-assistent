@@ -33,7 +33,7 @@ import (
 
 // AppVersion — aktuelle Programmversion (ohne "v"-Praefix). Vor jedem Release
 // hochzaehlen (und in README.md spiegeln), danach release.sh ausfuehren.
-const AppVersion = "0.8.4"
+const AppVersion = "0.8.5"
 
 // githubRepo — "Besitzer/Repo" fuer die GitHub-Releases-API.
 const githubRepo = "dev-core-busy/stt-support-assistent"
@@ -82,9 +82,9 @@ func runUpdateCheck(win fyne.Window) {
 	Log(fmt.Sprintf("Update verfuegbar: v%s -> %s", AppVersion, rel.TagName))
 	fyne.Do(func() {
 		msg := fmt.Sprintf(
-			"Eine neue Version ist verfuegbar:\n\n    Installiert:  v%s\n    Verfuegbar:   %s\n\nJetzt herunterladen, installieren und die App neu starten?",
+			T("Eine neue Version ist verfuegbar:\n\n    Installiert:  v%s\n    Verfuegbar:   %s\n\nJetzt herunterladen, installieren und die App neu starten?"),
 			AppVersion, rel.TagName)
-		showConfirm("Update verfuegbar", msg, func(ok bool) {
+		showConfirm(T("Update verfuegbar"), msg, func(ok bool) {
 			if !ok {
 				return
 			}
@@ -171,10 +171,10 @@ func parseVersion(v string) [3]int {
 func startDownloadAndRestart(win fyne.Window, url, tag string) {
 	prog := widget.NewProgressBarInfinite()
 	content := container.NewVBox(
-		widget.NewLabel("Lade "+tag+" herunter und installiere...\nDie App startet anschliessend automatisch neu."),
+		widget.NewLabel(fmt.Sprintf(T("Lade %s herunter und installiere...\nDie App startet anschliessend automatisch neu."), tag)),
 		prog,
 	)
-	d := dialog.NewCustomWithoutButtons("Update wird installiert", content, win)
+	d := dialog.NewCustomWithoutButtons(T("Update wird installiert"), content, win)
 	d.Show()
 
 	go func() {
@@ -182,7 +182,7 @@ func startDownloadAndRestart(win fyne.Window, url, tag string) {
 			Log("Update fehlgeschlagen: " + err.Error())
 			fyne.Do(func() {
 				d.Hide()
-				showErr(fmt.Errorf("Update fehlgeschlagen:\n%v", err), win)
+				showErr(fmt.Errorf(T("Update fehlgeschlagen:\n%v"), err), win)
 			})
 		}
 	}()

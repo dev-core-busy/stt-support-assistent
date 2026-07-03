@@ -20,8 +20,6 @@ Start automatisch heruntergeladen; danach läuft sie voll offline.
   Wissens-Dateien werden mit API-Key geladen (siehe `jarvis_api.md`).
 - **Suche passende Tickets**: findet per Knopfdruck zum erkannten Text passende
   Jira-Tickets (Prompt-Vorlage in den Einstellungen hinterlegbar).
-- **Automatischer zyklischer Scan**: sucht bei aktiver Erkennung optional
-  zyklisch (Intervall 0–30 s, 0 = aus) passende Tickets zum laufenden Text.
 - **Auto-Update über GitHub**: prüft beim Start still das neueste Release; ist
   eine neuere Version verfügbar, wird sie nach Rückfrage heruntergeladen,
   installiert und die App automatisch neu gestartet. Die aktuelle Version steht

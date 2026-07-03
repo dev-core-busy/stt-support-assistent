@@ -93,6 +93,8 @@ var enOverrides = map[string]string{
 	"weniger":                           "less",
 	"Suchen":                            "Search",
 	"Portal Suche":                      "Portal search",
+	"Tickets zur CRM":                   "Tickets for CRM",
+	"offene Tickets":                    "open tickets",
 	"Jira Tickets":                      "Jira tickets",
 	"offene Jira Tickets":               "Open Jira tickets",
 	"Wissen":                            "Knowledge",

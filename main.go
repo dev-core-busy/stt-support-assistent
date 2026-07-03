@@ -850,7 +850,7 @@ var (
 	engineInfo        *widget.Label
 	progressBar       *widget.ProgressBar
 	micBtn            *tooltipButton
-	customerEntry     *MinSizeEntry // CRM Feld; per Rufnummern-Webhook befuellt
+	customerField     *widget.Label // CRM Feld (reines Anzeige-Label); per Rufnummern-Webhook befuellt
 	callerNumberLabel *widget.Label // zeigt die per Webhook empfangene Rufnummer (zwischen Feld und Start-Button)
 	mainWin           fyne.Window   // Hauptfenster, u.a. fuer Dialoge aus webhook.go
 	lastSoundTime     atomic.Value  // *time.Time, atomar für Zugriff aus Goroutines
@@ -1710,26 +1710,12 @@ func main() {
 	// CRM Feld zwischen Statuszeile ("Bereit") und Start-Button.
 	// Wird per Rufnummern-Webhook (s. webhook.go) mit dem Jira-Issue-Key (CRM) des
 	// zur eingehenden Rufnummer passenden Tickets befuellt bzw. "nicht gefunden".
-	// Default "CRM-10550".
-	customerEntry = NewMinSizeEntry(160)
-	// currentCRM (webhook.go) spiegelt den validierten Feldinhalt: Die Ticketsuche
-	// ist freigeschaltet, sobald hier eine gültige CRM steht — egal ob per Webhook
-	// gesetzt oder manuell eingetippt. OnChanged VOR SetText, damit der Default
-	// "CRM-10550" den Status gleich mitsetzt (SetText löst OnChanged aus).
-	customerEntry.Entry.OnChanged = func(s string) {
-		setCurrentCRM(validCRM(s))
-		// Feldinhalt geändert -> die bisherige Ticketliste gehört zu einer anderen
-		// CRM und wird geleert. Beim Webhook-Treffer folgt unmittelbar eine neue
-		// Suche, die die Liste wieder füllt; bei manueller Änderung bleibt sie leer.
-		// (nil bis buildKISupportPanel gebaut ist, s.u. — Default-SetText ist dann
-		// noch ein No-op.)
-		if clearTicketResults != nil {
-			clearTicketResults()
-		}
-	}
-	customerEntry.SetText("CRM-10550")
-	setCurrentCRM(validCRM(customerEntry.Text)) // Startwert sicher setzen (nicht nur via OnChanged)
-	customerRow := container.NewHBox(trLabel("CRM Feld"), customerEntry)
+	// Default "CRM-10550". Reines Anzeige-Label (kein Textfeld mehr): einzige
+	// Schreibquelle ist setCustomerField (webhook.go), das auch den CRM-Status
+	// (currentCRM) pflegt und die Ticketliste leert; manuelles Eintippen entfaellt.
+	customerField = widget.NewLabel("CRM-10550")
+	setCurrentCRM(validCRM(customerField.Text)) // Startwert setzen
+	customerRow := container.NewHBox(trLabel("CRM Feld"), customerField)
 
 	// Label zwischen Feld und Start-Button: zeigt die per Webhook empfangene
 	// Rufnummer des aktuellen Anrufers (leer, bis der erste Anruf eingeht).
@@ -1918,7 +1904,7 @@ func main() {
 	var ticketSearchBtn *widget.Button
 	ticketSearchBtn = trButtonIcon("Suche passende Tickets", theme.SearchIcon(), func() {
 		if searchMatchingTickets != nil {
-			// crmFallback=true: bei leerem Textfenster offene Tickets zur CRM suchen.
+			// crmFallback=true: bei leerem Textfenster alle Tickets zur CRM laden.
 			searchMatchingTickets(outputArea.Text, ticketSearchBtn, false, true)
 		}
 	})

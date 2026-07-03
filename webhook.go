@@ -6,7 +6,7 @@ package main
 // eine URL dieser App auf und übergibt die Rufnummer des Anrufers. Die App
 // sucht mit der Rufnummer in Jira (über die bestehende Jarvis-Jira-Suche) und
 // trägt den Issue-Key des Top-Treffers ins CRM Feld
-// (customerEntry) ein.
+// (customerField, reines Anzeige-Label) ein.
 //
 // Der Server lauscht auf 0.0.0.0:<Port><Pfad> (Port/Pfad in den Einstellungen,
 // Abschnitt "Rufnummern Übergabe"; Portvorgabe 5555, Pfadvorgabe "/rufnummer").
@@ -41,8 +41,9 @@ var (
 	webhookServer *http.Server
 
 	// currentCRM spiegelt die aktuell im CRM Feld stehende, gültige
-	// CRM-Nummer (Issue-Key). Wird über customerEntry.OnChanged gepflegt — egal ob
-	// der Wert per Webhook-Treffer oder manuell ins Feld kam. Leer, wenn im Feld
+	// CRM-Nummer (Issue-Key). Wird über setCustomerField gepflegt (das Feld ist
+	// ein reines Anzeige-Label, Webhook/Wiederhol-Button sind die einzigen
+	// Schreibquellen). Leer, wenn im Feld
 	// keine gültige CRM steht (z.B. "nicht gefunden" oder leer). Die Ticketsuche
 	// (manuell + Auto-Scan) läuft nur, wenn hier eine CRM steht (s. hasCRM).
 	// Mutex-geschützt, da aus dem UI-Thread gesetzt und aus dem Auto-Scan gelesen.
@@ -308,7 +309,7 @@ func queryValuePreservingPlus(rawQuery, key string) string {
 // Trigger (Wiederhol-Button) - sucht immer.
 func handleIncomingCaller(number string, auto bool) {
 	// Rufnummer im Label anzeigen. Der CRM-Status folgt dem Feldinhalt
-	// (customerEntry.OnChanged) und wird durch das Ergebnis unten aktualisiert.
+	// (setCustomerField) und wird durch das Ergebnis unten aktualisiert.
 	setCallerNumber(number)
 
 	if auto && !config.AutoSearchCaller {
@@ -327,7 +328,7 @@ func handleIncomingCaller(number string, auto bool) {
 
 // performCallerJiraLookup fragt über GET /api/jira/phonenumber die CRM zur
 // Rufnummer ab und trägt sie ins CRM Feld ein, sonst
-// "nicht gefunden". setCustomerField aktualisiert das Feld; dessen OnChanged
+// "nicht gefunden". setCustomerField aktualisiert das Feld und
 // pflegt currentCRM (Freigabe der Ticketsuche).
 func performCallerJiraLookup(number string) {
 	res, raw, err := jarvisPhoneLookup(number)
@@ -558,14 +559,15 @@ func askCRMSelection(number string, matches []jiraPhoneMatch) string {
 	return <-ch
 }
 
-// applyCRM übernimmt die (ggf. ausgewählte) CRM: setzt den CRM-Status explizit
-// (unabhängig von customerEntry.OnChanged), zeigt sie im CRM Feld
-// und stößt automatisch die Ticketsuche an – mit erkanntem Text, oder (bei
-// leerem Textfenster) alle offenen Tickets zur CRM. Aus Goroutine-Kontext
-// aufrufen (nutzt fyne.Do).
+// applyCRM übernimmt die (ggf. ausgewählte) CRM: zeigt sie im CRM Feld
+// (setCustomerField pflegt dabei auch den CRM-Status) und stößt automatisch
+// die Ticketsuche an – mit erkanntem Text, oder (bei leerem Textfenster) alle
+// Tickets zur CRM (nicht-offene anfangs per Checkbox ausgeblendet). Aus
+// Goroutine-Kontext aufrufen (nutzt fyne.Do). Die Suche ist NACH
+// setCustomerField eingereiht, der CRM-Status steht also bereits, wenn sie
+// läuft (fyne.Do arbeitet die Closures in Reihenfolge ab).
 func applyCRM(number, crm string) {
 	Log(fmt.Sprintf("Rufnummern-Webhook: Rufnummer %q -> CRM %s", number, crm))
-	setCurrentCRM(crm)
 	setCustomerField(crm)
 	fyne.Do(func() {
 		if searchMatchingTickets != nil && outputArea != nil {
@@ -574,13 +576,31 @@ func applyCRM(number, crm string) {
 	})
 }
 
-// setCustomerField setzt den Text des Felds "erkannter Kunde" thread-sicher
-// über den Fyne-Main-Loop.
+// setCustomerField setzt den Text des CRM Felds thread-sicher über den
+// Fyne-Main-Loop und pflegt den daraus abgeleiteten CRM-Status (currentCRM,
+// Freigabe der Ticketsuche). Das erledigte frueher das OnChanged des
+// Textfelds; seit der Umstellung auf ein reines Anzeige-Label ist diese
+// Funktion die einzige Schreibquelle. Neuer Feldinhalt -> die bisherige
+// Ticketliste gehoert zu einer anderen CRM und wird geleert; beim
+// Webhook-Treffer folgt unmittelbar eine neue Suche, die sie wieder fuellt.
 func setCustomerField(text string) {
-	if customerEntry == nil {
+	if customerField == nil {
 		return
 	}
-	fyne.Do(func() { customerEntry.SetText(text) })
+	fyne.Do(func() {
+		// Unveraenderter Wert: nichts tun. Das alte Textfeld-OnChanged feuerte
+		// nur bei echter Aenderung - ohne diesen Guard wuerde z.B. ein
+		// Wiederhol-Lookup mit derselben CRM die angezeigte Ticketliste
+		// grundlos leeren und die ausgedehnte Ansicht zuklappen.
+		if customerField.Text == text {
+			return
+		}
+		customerField.SetText(text)
+		setCurrentCRM(validCRM(text))
+		if clearTicketResults != nil {
+			clearTicketResults()
+		}
+	})
 }
 
 // prettyJSON gibt s eingerückt zurück, wenn es gültiges JSON ist, sonst s

@@ -25,11 +25,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -556,6 +558,72 @@ func ticketSummaryControls(key string) (*widget.Button, *fyne.Container) {
 	return btn, holder
 }
 
+// newFilterWrap gibt einem Filter-Entry eine feste Breite fuer die rechte
+// Seite eines Border-Layouts (dort bekaeme er sonst nur seine schmale
+// Minimalbreite). Eine Stelle fuer beide Filterfelder (Status-Zeile und
+// CRM-Kopfzeile), damit die Breite nicht auseinanderlaeuft.
+func newFilterWrap(e *widget.Entry) fyne.CanvasObject {
+	return container.NewGridWrap(fyne.NewSize(220, e.MinSize().Height), e)
+}
+
+// highlightedSegments zerlegt text in RichText-Segmente, in denen alle
+// Vorkommen von query (case-insensitiv) fett in der Akzentfarbe markiert sind
+// - fuer die Treffer-Markierung beim Tippen im Volltext-Filter. Leere query
+// oder kein Treffer liefert ein einziges unmarkiertes Segment. Der Vergleich
+// laeuft allokationsfrei auf Rune-Basis (die Funktion wird pro Karte und
+// Tastendruck gerufen): strings.ToLower kann bei Sonderzeichen die
+// BYTE-Laenge aendern, Rune-Indizes von Original und Kleinschreibung bleiben
+// dagegen synchron (unicode.ToLower ist 1:1 pro Rune); aendert sich doch die
+// Rune-Anzahl, wird sicherheitshalber gar nicht markiert statt falsch
+// geschnitten.
+func highlightedSegments(text, query string) []widget.RichTextSegment {
+	plain := func(s string) widget.RichTextSegment {
+		return &widget.TextSegment{Text: s, Style: widget.RichTextStyleInline}
+	}
+	q := []rune(strings.ToLower(strings.TrimSpace(query)))
+	if len(q) == 0 {
+		return []widget.RichTextSegment{plain(text)}
+	}
+	r := []rune(text)
+	lr := []rune(strings.ToLower(text))
+	if len(lr) != len(r) || len(q) > len(r) {
+		return []widget.RichTextSegment{plain(text)}
+	}
+	matchAt := func(i int) bool {
+		for j, qr := range q {
+			if lr[i+j] != qr {
+				return false
+			}
+		}
+		return true
+	}
+	var segs []widget.RichTextSegment
+	start := 0
+	for i := 0; i+len(q) <= len(lr); {
+		if !matchAt(i) {
+			i++
+			continue
+		}
+		if i > start {
+			segs = append(segs, plain(string(r[start:i])))
+		}
+		segs = append(segs, &widget.TextSegment{Text: string(r[i : i+len(q)]), Style: widget.RichTextStyle{
+			Inline:    true,
+			ColorName: theme.ColorNamePrimary,
+			TextStyle: fyne.TextStyle{Bold: true},
+		}})
+		i += len(q)
+		start = i
+	}
+	if len(segs) == 0 { // kein Treffer im Text (Karte matcht z.B. nur im Titel)
+		return []widget.RichTextSegment{plain(text)}
+	}
+	if start < len(r) {
+		segs = append(segs, plain(string(r[start:])))
+	}
+	return segs
+}
+
 // defaultTicketSearchPrompt ist der Standard-Prompt fuer den Button "Suche
 // passende Tickets" (STT-Tab). "[Textfenster]" wird vor dem API-Call durch den
 // erkannten Text ersetzt. Ueberschreibbar in "Einstellungen"
@@ -595,20 +663,48 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	resultsBg := canvas.NewRectangle(color.White)
 	resultsArea := container.NewStack(resultsBg, resultsScroll)
 
+	// setCRMListExpanded blendet fuer die CRM-Ticketliste ("Tickets zur CRM")
+	// den kompletten Suchbereich oben aus, sodass die Liste die ganze rechte
+	// Haelfte einnimmt; stattdessen erscheint eine Kopfzeile mit ✕-Button zum
+	// Schliessen. Wird erst nach dem Bau des Panels zugewiesen (s.u.), daher
+	// ueberall nil-geschuetzt aufrufen.
+	var setCRMListExpanded func(expanded bool)
+
+	// crmOpenCheck/crmFilterEntry: Checkbox "offene Tickets" und Volltext-Filter
+	// der CRM-Ticketliste. Sie leben DAUERHAFT in der Kopfzeile "Tickets zur CRM"
+	// (s.u. crmHeader) - renderResults verdrahtet sie bei jedem CRM-Rendern neu
+	// mit der dann aktuellen Kartenliste und setzt sie zurueck (Checkbox an,
+	// Filter leer). Dauerhafte Widgets -> trCheck/trPlaceholder sind hier ok
+	// (registrieren ihren Sprachwechsel-Callback nur einmal).
+	crmOpenCheck := trCheck("offene Tickets", nil)
+	crmFilterEntry := widget.NewEntry()
+	trPlaceholder(crmFilterEntry, "Treffer filtern …")
+
 	// clearResults leert die Ergebnis-/Ticketliste und zeigt wieder den
 	// Platzhalter. Wird u.a. aufgerufen, wenn der Inhalt des CRM-Felds manuell
 	// geaendert wird (die bisherige Ticketliste gehoert dann zu einer anderen
 	// CRM und ist ungueltig). Muss im Fyne-Main-Thread laufen.
 	clearResults := func() {
+		if setCRMListExpanded != nil {
+			setCRMListExpanded(false)
+		}
 		resultsBox.RemoveAll()
 		resultsBox.Add(placeholderLbl)
 		resultsBox.Refresh()
 	}
 
-	// renderResults befuellt die Ergebnisliste. hideRanking blendet das Score-/
-	// Ranking-Badge aus (fuer die Ansicht "Tickets zu einer CRM", wo eine
-	// Relevanz-Prozentzahl keinen Sinn ergibt).
-	renderResults := func(query string, res *jarvisQueryResponse, duration time.Duration, hideRanking bool) {
+	// renderResults befuellt die Ergebnisliste. openKeys (nur CRM-Ticketliste,
+	// sonst nil) ist die Menge der Jira-Keys, die der Server als OFFEN gemeldet
+	// hat, und schaltet zugleich die CRM-Ansicht (crmView): Liste auf die
+	// komplette rechte Haelfte ausgedehnt, Score-/Ranking-Badge ausgeblendet
+	// (Relevanz-Prozent ergibt dort keinen Sinn), Checkbox "offene Tickets"
+	// (Start: an) blendet nicht-offene Tickets rein clientseitig aus/ein -
+	// KEINE neue Server-Anfrage beim Umschalten.
+	renderResults := func(query string, res *jarvisQueryResponse, duration time.Duration, openKeys map[string]bool) {
+		crmView := openKeys != nil
+		if setCRMListExpanded != nil {
+			setCRMListExpanded(crmView)
+		}
 		resultsBox.RemoveAll()
 
 		status := widget.NewLabel(fmt.Sprintf(T("Ergebnis für „%s“ (%d Treffer · %d ms)"), query, len(res.Blocks), duration.Milliseconds()))
@@ -622,14 +718,42 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		type filterCard struct {
 			obj  fyne.CanvasObject
 			text string
+			open bool
+			// snippet (RichText der Kartenbeschreibung) + raw (Originaltext):
+			// beim Tippen im Volltext-Filter werden die Fundstellen darin
+			// markiert. hlQuery ist der Filtertext der zuletzt gebauten
+			// Markierung - nur bei Aenderung wird neu gebaut (Checkbox-Umschalten
+			// und wieder eingeblendete Karten loesen sonst unnoetige, teure
+			// RichText-Rebuilds aus).
+			snippet *widget.RichText
+			raw     string
+			hlQuery string
 		}
 		var cards []filterCard
-		filterEntry := widget.NewEntry()
-		filterEntry.SetPlaceHolder(T("Treffer filtern …"))
-		filterEntry.OnChanged = func(q string) {
-			ql := strings.ToLower(strings.TrimSpace(q))
-			for _, c := range cards {
-				if ql == "" || strings.Contains(c.text, ql) {
+		// Volltext-Filter: in der CRM-Ansicht kommt der Filtertext aus dem
+		// dauerhaften Kopfzeilen-Entry, sonst aus einem lokalen Filterfeld in
+		// der Status-Zeile (nur dann wird es ueberhaupt gebaut).
+		filterSrc := crmFilterEntry
+		var filterEntry *widget.Entry
+		if !crmView {
+			filterEntry = widget.NewEntry()
+			filterEntry.SetPlaceHolder(T("Treffer filtern …"))
+			filterSrc = filterEntry
+		}
+		// applyFilters kombiniert Volltext-Filter und "offene Tickets"-Checkbox
+		// (Zustand direkt aus crmOpenCheck, nur CRM-Ansicht); beides rein
+		// clientseitig auf den bereits geladenen Karten.
+		applyFilters := func() {
+			ql := strings.ToLower(strings.TrimSpace(filterSrc.Text))
+			openOnly := crmView && crmOpenCheck.Checked
+			for i := range cards {
+				c := &cards[i]
+				if (ql == "" || strings.Contains(c.text, ql)) && (!openOnly || c.open) {
+					if c.hlQuery != ql {
+						c.snippet.Segments = highlightedSegments(c.raw, ql)
+						c.snippet.Refresh()
+						c.hlQuery = ql
+					}
 					c.obj.Show()
 				} else {
 					c.obj.Hide()
@@ -638,12 +762,25 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			resultsBox.Refresh()
 		}
 
-		// Filterfeld nur bei vorhandenen Treffern; rechtsbuendig neben dem Status
-		// mit fester Breite (Border-rechts wuerde dem Entry sonst nur seine
-		// schmale Minimalbreite geben).
-		if len(res.Blocks) > 0 {
-			filterWrap := container.NewGridWrap(fyne.NewSize(220, filterEntry.MinSize().Height), filterEntry)
-			resultsBox.Add(container.NewBorder(nil, nil, nil, filterWrap, status))
+		// Filter-Widgets auf DIESE Kartenliste verdrahten. In der CRM-Ansicht
+		// sind das Checkbox + Filterfeld der Kopfzeile "Tickets zur CRM"; sie
+		// werden dabei zurueckgesetzt (Checkbox an, Filter leer). Die Zuweisung
+		// von OnChanged ersetzt die Closure des vorherigen Renderns; deren
+		// Karten sind bereits aus der Liste entfernt.
+		if crmView {
+			crmOpenCheck.OnChanged = func(bool) { applyFilters() }
+			crmOpenCheck.SetChecked(true)
+			crmFilterEntry.OnChanged = func(string) { applyFilters() }
+			crmFilterEntry.SetText("")
+		} else {
+			filterEntry.OnChanged = func(string) { applyFilters() }
+		}
+
+		// Filterfeld nur bei vorhandenen Treffern, rechtsbuendig neben dem
+		// Status. In der CRM-Ticketliste entfaellt es hier - dort sitzen Filter
+		// und Checkbox in der Kopfzeile.
+		if len(res.Blocks) > 0 && !crmView {
+			resultsBox.Add(container.NewBorder(nil, nil, nil, newFilterWrap(filterEntry), status))
 		} else {
 			resultsBox.Add(status)
 		}
@@ -711,16 +848,16 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 				}
 				pills = append(pills, kiPill(strings.ToUpper(sourceLabel), kiAccentSoft, kiAccent))
 			}
-			if !hideRanking {
+			if !crmView {
 				pills = append(pills, kiPill(fmt.Sprintf("%d%%", b.Score), kiAccent, color.White))
 			}
 
 			// Rechts im Header: Badges (falls vorhanden) und - in der "Tickets zu
-			// einer CRM"-Liste (hideRanking) - der Button "KI-Zusammenfassung"
+			// einer CRM"-Liste - der Button "KI-Zusammenfassung"
 			// (rot/weiß). Der zugehoerige Inhalt (summaryHolder) wird unten angehaengt.
 			right := append([]fyne.CanvasObject{}, pills...)
 			var summaryHolder *fyne.Container
-			if hideRanking && isTicket {
+			if crmView && isTicket {
 				if key := strings.TrimSpace(b.Key); key != "" {
 					btn, holder := ticketSummaryControls(key)
 					summaryHolder = holder
@@ -739,11 +876,13 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			if len(right) > 0 {
 				headerRow = container.NewBorder(nil, nil, nil, container.NewHBox(right...), titleWidget)
 			}
-			// Bewusst Label statt RichTextFromMarkdown: der Snippet-Text vom Server
-			// ist freier Fliesstext, kein verlaesslich sauberes Markdown - einzelne
+			// Bewusst KEIN RichTextFromMarkdown: der Snippet-Text vom Server ist
+			// freier Fliesstext, kein verlaesslich sauberes Markdown - einzelne
 			// Zeichenfolgen wurden faelschlich als Ueberschrift interpretiert und
-			// dadurch riesig dargestellt. Label ist sicher, aber ohne Link-Klick.
-			snippet := widget.NewLabel(b.Summary)
+			// dadurch riesig dargestellt. RichText mit direkt gebauten Text-
+			// Segmenten (ohne Markdown-Parser) ist genauso sicher wie das fruehere
+			// Label und erlaubt zusaetzlich die Markierung der Filter-Treffer.
+			snippet := widget.NewRichText(highlightedSegments(b.Summary, "")...)
 			snippet.Wrapping = fyne.TextWrapWord
 
 			cardContent := container.NewVBox(headerRow, snippet)
@@ -761,9 +900,14 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			}
 			card := kiCard(cardContent)
 			// Durchsuchbarer Text der Karte fuer den Volltext-Filter oben.
+			// open: Nicht-Tickets (WISSEN/Confluence) gelten immer als "offen",
+			// damit die Checkbox sie nie ausblendet; Tickets nach Server-Meldung.
 			cards = append(cards, filterCard{
-				obj:  card,
-				text: strings.ToLower(strings.Join([]string{title, b.Summary, b.Key, b.Source, b.SourceLabel}, " ")),
+				obj:     card,
+				text:    strings.ToLower(strings.Join([]string{title, b.Summary, b.Key, b.Source, b.SourceLabel}, " ")),
+				open:    !crmView || !isTicket || openKeys[b.Key],
+				snippet: snippet,
+				raw:     b.Summary,
 			})
 			resultsBox.Add(card)
 		}
@@ -771,7 +915,9 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		if len(res.Blocks) == 0 && strings.TrimSpace(res.AISummary) == "" {
 			resultsBox.Add(widget.NewLabel(T("Keine Treffer.")))
 		}
-		resultsBox.Refresh()
+		// Anfangszustand der Filter anwenden (blendet in der CRM-Liste die
+		// nicht-offenen Tickets aus); ruft auch resultsBox.Refresh() auf.
+		applyFilters()
 	}
 
 	renderError := func(err error) {
@@ -918,7 +1064,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 						renderError(err)
 						return
 					}
-					renderResults(text, res, duration, false)
+					renderResults(text, res, duration, nil)
 				})
 			}()
 		})
@@ -930,12 +1076,21 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 
 	searchRow := container.NewBorder(nil, nil, nil, searchBtn, queryEntry)
 
+	// advancedSection buendelt Toggle + Inhalt der erweiterten Einstellungen als
+	// EINE verschiebbare Einheit: sie sitzt normalerweise in der Such-Karte
+	// (cardAdvSlot), wandert aber in der ausgedehnten CRM-Ticketliste unter deren
+	// Kopfzeile (crmAdvSlot, s.u.), damit Jira-Limit/Summary-Zeilen dort sichtbar
+	// und bedienbar bleiben. Ein Widget kann nur EINEN Parent haben, daher wird
+	// dieselbe Instanz zwischen den beiden Slots umgehaengt statt dupliziert
+	// (zwei Instanzen wuerden sich beim Tippen nicht synchronisieren).
+	advancedSection := container.NewVBox(advancedToggle, advanced)
+	cardAdvSlot := container.NewVBox(advancedSection)
+
 	searchCardBox := container.NewVBox(
 		searchRow,
 		container.NewHBox(jiraCheck, openOnlyCheck, confluenceCheck, ragCheck),
 		aiCheck,
-		advancedToggle,
-		advanced,
+		cardAdvSlot,
 		progress,
 	)
 	searchCard := kiCard(searchCardBox)
@@ -950,7 +1105,65 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		searchCard,
 	)
 
-	panel := container.NewBorder(top, nil, nil, nil, resultsArea)
+	// Kopfzeile der ausgedehnten CRM-Ticketliste: Titel links, rechts die
+	// Checkbox "offene Tickets", das Volltext-Filterfeld (beide dauerhaft, von
+	// renderResults pro Rendern neu verdrahtet, s.o.) und der ✕-Button. Der ✕
+	// schliesst die Liste komplett (clearResults klappt ueber setCRMListExpanded
+	// auch die Ansicht wieder ein, s.o.), wodurch der Suchbereich
+	// ("Portal Suche" + Such-Karte) wieder sichtbar wird.
+	crmCloseBtn := widget.NewButtonWithIcon("", theme.CancelIcon(), clearResults)
+	crmHeader := container.NewBorder(nil, nil, nil,
+		container.NewHBox(crmOpenCheck, newFilterWrap(crmFilterEntry), crmCloseBtn),
+		trLabelStyle("Tickets zur CRM", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}))
+
+	// crmAdvSlot nimmt in der ausgedehnten Ansicht die advancedSection auf
+	// ("Erweiterte Einstellungen" bleiben so sichtbar und bedienbar).
+	crmAdvSlot := container.NewVBox()
+	crmTop := container.NewVBox(crmHeader, crmAdvSlot)
+	crmTop.Hide()
+
+	// topWrap traegt beide Kopf-Varianten; VBox ueberspringt versteckte Kinder
+	// beim Layout, es ist also immer nur eine sichtbar.
+	topWrap := container.NewVBox(top, crmTop)
+	panel := container.NewBorder(topWrap, nil, nil, nil, resultsArea)
+
+	// refreshHeaderArea stoesst das Neu-Layout des Kopfbereichs an -
+	// Hide()/Show()/Umhaengen allein loest kein Neu-Layout der Umgebung aus
+	// (s.o. bei refreshSearchCard).
+	refreshHeaderArea := func() {
+		topWrap.Refresh()
+		panel.Refresh()
+	}
+
+	setCRMListExpanded = func(expanded bool) {
+		if expanded {
+			top.Hide()
+			// advancedSection unter die CRM-Kopfzeile umhaengen (idempotent:
+			// Remove eines Nicht-Kindes ist ein No-op, Add nur wenn leer).
+			cardAdvSlot.Remove(advancedSection)
+			if len(crmAdvSlot.Objects) == 0 {
+				crmAdvSlot.Add(advancedSection)
+			}
+			crmTop.Show()
+		} else {
+			crmTop.Hide()
+			crmAdvSlot.Remove(advancedSection)
+			if len(cardAdvSlot.Objects) == 0 {
+				cardAdvSlot.Add(advancedSection)
+			}
+			top.Show()
+		}
+		refreshHeaderArea()
+	}
+
+	// refreshSearchCard (Ein-/Ausklappen der erweiterten Einstellungen) muss
+	// auch die ausgedehnte CRM-Ansicht neu layouten, wenn die advancedSection
+	// gerade dort haengt.
+	baseRefreshSearchCard := refreshSearchCard
+	refreshSearchCard = func() {
+		baseRefreshSearchCard()
+		refreshHeaderArea()
+	}
 
 	// searchMatchingTickets: sucht zum erkannten Text passende Jira-Tickets.
 	// Manueller Trigger (Button "Suche passende Tickets") und automatischer Zyklus
@@ -964,12 +1177,13 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// ersetzt) wird im Feld prompt mitgeschickt (und ist im Debug-Fenster sichtbar).
 	// Der erkannte Text geht zusaetzlich als Suchtext (text) an die API.
 	// auto=true: automatischer Zyklus/Trigger (kein Debug-Popup, Ueberlappschutz).
-	// crmFallback=true: bei LEEREM erkannten Text nach allen OFFENEN Tickets zur
-	// gefundenen CRM suchen (Button + Webhook-Trigger), statt abzubrechen. Der
-	// zyklische Intervall-Scan (crmFallback=false) ueberspringt leeren Text still.
+	// crmFallback=true: bei LEEREM erkannten Text ALLE Tickets zur gefundenen CRM
+	// laden (Button + Webhook-Trigger), statt abzubrechen; nicht-offene Tickets
+	// sind anfangs per Checkbox "offene Tickets" ausgeblendet. Der zyklische
+	// Intervall-Scan (crmFallback=false) ueberspringt leeren Text still.
 	searchMatchingTickets := func(recognizedText string, trigger *widget.Button, auto bool, crmFallback bool) {
 		// Ticketsuche nur, wenn im CRM Feld eine gültige CRM steht
-		// (per Webhook gesetzt ODER manuell eingetippt, s. webhook.go/hasCRM).
+		// (per Webhook/Wiederhol-Button gesetzt, s. webhook.go/hasCRM).
 		// Ohne CRM: Automatik still überspringen, manuell mit Hinweis.
 		if !hasCRM() {
 			if !auto {
@@ -995,17 +1209,20 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		var req jarvisQueryRequest
 		text := strings.TrimSpace(recognizedText)
 		displayQuery := text
-		// hideRanking: bei "Tickets zu einer CRM" (alle offenen Tickets) ergibt eine
-		// Relevanz-Prozentzahl keinen Sinn -> Ranking-Badge ausblenden.
-		hideRanking := false
+		// reqAll (nur CRM-Ticketliste, sonst nil): ZWEITE Anfrage mit jira_all.
+		// Die Liste laedt ALLE Tickets zur CRM: req (jira_open) liefert die
+		// offenen - sie bleiben die verlaessliche "offen"-Quelle, denn die
+		// Treffer-Blocks der API tragen KEIN Status-Feld -, reqAll ergaenzt die
+		// nicht-offenen. Letztere blendet die Checkbox "offene Tickets" im
+		// Ergebnis clientseitig aus/ein (s. renderResults/openKeys).
+		var reqAll *jarvisQueryRequest
 		if text == "" {
 			// Kein erkannter Text: entweder still überspringen (zyklischer Scan)
-			// oder – bei Button/Webhook – alle OFFENEN Tickets zur CRM suchen.
+			// oder – bei Button/Webhook – alle Tickets zur CRM laden.
 			if !crmFallback {
 				return
 			}
-			displayQuery = "offene Tickets zu " + crm
-			hideRanking = true
+			displayQuery = "Tickets zu " + crm
 			req = jarvisQueryRequest{
 				Text:         crm,
 				OpenOnly:     true, // jira_open (schließt jira_all aus)
@@ -1013,6 +1230,10 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 				SummaryLines: summaryLines,
 				Lang:         lang,
 			}
+			all := req
+			all.OpenOnly = false
+			all.Jira = true // jira_all
+			reqAll = &all
 		} else {
 			promptTemplate := strings.TrimSpace(config.JarvisTicketSearchPrompt)
 			if promptTemplate == "" {
@@ -1041,7 +1262,51 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			start := time.Now()
 
 			go func() {
+				// CRM-Ticketliste: jira_open und jira_all PARALLEL laden - die
+				// Antworten haengen nicht voneinander ab, sequenziell wuerde sich
+				// die Wartezeit addieren.
+				var allRes *jarvisQueryResponse
+				var allErr error
+				var wg sync.WaitGroup
+				if reqAll != nil {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						allRes, allErr = jarvisQuery(*reqAll)
+					}()
+				}
 				res, err := jarvisQuery(req)
+				wg.Wait()
+				// Offene Keys aus der jira_open-Antwort merken, dann die
+				// nicht-offenen Tickets aus jira_all anhaengen (Duplikate und
+				// Nicht-Tickets ueberspringen - WISSEN/Confluence-Blocks kaemen
+				// sonst doppelt). Reihenfolge: offene zuerst, dann der Rest.
+				// openKeys ist durch das Jira-Limit gedeckelt: offene Tickets
+				// jenseits des Limits koennten in der jira_all-Liste als "nicht
+				// offen" einsortiert werden - die Standard-Ansicht (nur offene)
+				// entspricht aber weiterhin exakt der jira_open-Antwort und
+				// verliert dadurch nichts.
+				var openKeys map[string]bool
+				if err == nil && reqAll != nil {
+					openKeys = map[string]bool{}
+					for _, b := range res.Blocks {
+						if strings.EqualFold(b.Source, "JIRA") && b.Key != "" {
+							openKeys[b.Key] = true
+						}
+					}
+					if allErr != nil {
+						// Nur die ERGAENZUNG ist fehlgeschlagen: offene Tickets
+						// trotzdem anzeigen statt Totalausfall mit Fehlermeldung.
+						Log("CRM-Ticketliste: jira_all-Ergänzung fehlgeschlagen: " + allErr.Error())
+					} else {
+						for _, b := range allRes.Blocks {
+							if !strings.EqualFold(b.Source, "JIRA") || (b.Key != "" && openKeys[b.Key]) {
+								continue
+							}
+							res.Blocks = append(res.Blocks, b)
+						}
+					}
+				}
 				duration := time.Since(start)
 				fyne.Do(func() {
 					progress.Hide()
@@ -1051,11 +1316,18 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 					if auto {
 						autoScanBusy.Store(false)
 					}
+					// Veraltetes Ergebnis verwerfen: Hat sich die CRM waehrend der
+					// Anfrage geaendert (neuer Webhook-Anruf), gehoeren diese
+					// Tickets nicht mehr zum angezeigten CRM Feld - ohne den Guard
+					// erschiene die Liste der ALTEN CRM unter dem NEUEN Label.
+					if reqAll != nil && getCurrentCRM() != crm {
+						return
+					}
 					if err != nil {
 						renderError(err)
 						return
 					}
-					renderResults(displayQuery, res, duration, hideRanking)
+					renderResults(displayQuery, res, duration, openKeys)
 				})
 			}()
 		}
@@ -1069,7 +1341,11 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			run()
 			return
 		}
-		debugPreviewAndConfirm(win, "Anfrage: Passende Tickets (/api/support/query)", jarvisRequestPreview(req), run)
+		preview := jarvisRequestPreview(req)
+		if reqAll != nil {
+			preview += "\n\n--- 2. Anfrage (alle Tickets, jira_all) ---\n\n" + jarvisRequestPreview(*reqAll)
+		}
+		debugPreviewAndConfirm(win, "Anfrage: Passende Tickets (/api/support/query)", preview, run)
 	}
 
 	return panel, searchMatchingTickets, clearResults

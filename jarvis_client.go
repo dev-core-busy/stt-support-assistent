@@ -1,7 +1,7 @@
 package main
 
 // Anbindung an den internen Jarvis-Support-Assistenten (REST-API, siehe
-// jarvis_api.md). Bildet die rechte Fensterhaelfte "KI-Support" im STT-Tab:
+// Doku unter /support-api am Jarvis-Host). Bildet die rechte Fensterhaelfte "KI-Support" im STT-Tab:
 // Suche ueber RAG/Jira Tickets/Confluence mit optionaler KI-Zusammenfassung
 // sowie Zusammenfassung einzelner Jira-Tickets.
 //
@@ -39,7 +39,7 @@ var kiAccent = color.NRGBA{R: 0xB0, G: 0x1E, B: 0x2C, A: 255}
 var kiAccentSoft = color.NRGBA{R: 0xF6, G: 0xDF, B: 0xE1, A: 255}
 
 // jarvisHTTPClient: eigener Client mit deaktivierter TLS-Pruefung, da der
-// interne Jarvis-Server laut jarvis_api.md ein selbstsigniertes Zertifikat
+// interne Jarvis-Server laut Doku (/support-api) ein selbstsigniertes Zertifikat
 // verwendet (curl-Beispiele dort nutzen "-k"). Timeout grosszuegig, da eine
 // Suche mit KI-Zusammenfassung serverseitig RAG+Jira+LLM-Aufruf durchlaeuft.
 func jarvisHTTPClient() *http.Client {
@@ -97,7 +97,7 @@ type jarvisQueryResponse struct {
 
 // jarvisPost fuehrt einen POST mit JSON-Body gegen den Jarvis-Server aus und
 // dekodiert die Antwort in out. HTTP-Statuscodes 401/403/400 liefern laut
-// jarvis_api.md ebenfalls JSON ({"ok": false, "error": "..."}) - werden also
+// Doku (/support-api) ebenfalls JSON ({"ok": false, "error": "..."}) - werden also
 // hier bewusst nicht als Transport-Fehler behandelt, sondern durchgereicht.
 func jarvisPost(path string, reqBody interface{}, out interface{}) error {
 	baseURL := strings.TrimRight(strings.TrimSpace(config.Jarvis.Url), "/")
@@ -150,6 +150,48 @@ func jarvisQuery(req jarvisQueryRequest) (*jarvisQueryResponse, error) {
 	return &res, nil
 }
 
+// jarvisSummarizeRequest ist der Body (Mode A: einzelnes Jira-Ticket) für
+// POST /api/support/summarize.
+type jarvisSummarizeRequest struct {
+	Key    string `json:"key"`
+	Source string `json:"source"`
+	Lines  int    `json:"lines,omitempty"`
+	Lang   string `json:"lang,omitempty"`
+}
+
+// jarvisSummarizeResponse ist die Antwort für Mode A (einzelnes Ticket).
+type jarvisSummarizeResponse struct {
+	OK       bool   `json:"ok"`
+	Error    string `json:"error"`
+	Key      string `json:"key"`
+	Summary  string `json:"summary"`
+	JiraBase string `json:"jira_base"`
+}
+
+// jarvisSummarizeTicket holt die KI-Zusammenfassung eines einzelnen Jira-Tickets
+// (POST /api/support/summarize, Mode A). Rückgabe: Zusammenfassungstext.
+func jarvisSummarizeTicket(key string) (string, error) {
+	lang := config.JarvisLang
+	if lang == "" {
+		lang = "de"
+	}
+	req := jarvisSummarizeRequest{
+		Key:    key,
+		Source: "JIRA",
+		Lines:  config.JarvisSummaryLines, // 0 -> omitempty -> Serverdefault
+		Lang:   lang,
+	}
+	var res jarvisSummarizeResponse
+	if err := jarvisPost("/api/support/summarize", req, &res); err != nil {
+		return "", err
+	}
+	if !res.OK {
+		Log("Jarvis /api/support/summarize: Server meldet Fehler: " + res.Error)
+		return "", fmt.Errorf("%s", res.Error)
+	}
+	return strings.TrimSpace(res.Summary), nil
+}
+
 // jarvisRequestPreview formatiert eine Anfrage lesbar fuer den Debug-Modus
 // (siehe debugPreviewAndConfirm in main.go) - Server-URL, Endpunkt und der
 // JSON-Body, der tatsaechlich verschickt wuerde.
@@ -157,6 +199,83 @@ func jarvisRequestPreview(req jarvisQueryRequest) string {
 	body, _ := json.MarshalIndent(req, "", "  ")
 	baseURL := strings.TrimRight(strings.TrimSpace(config.Jarvis.Url), "/")
 	return fmt.Sprintf("POST %s/api/support/query\n\n%s", baseURL, string(body))
+}
+
+// jiraPhoneResponse ist die Antwort von GET /api/jira/phonenumber?phone=...
+// (Rufnummern-Webhook, s. webhook.go). Der Server ermittelt zur Rufnummer die
+// passende CRM-Nummer.
+// jiraPhoneMatch ist ein einzelner CRM-Treffer der Rufnummern-Suche. key ist die
+// CRM-Nummer (CRM-xxxxx), name der Kunden-/Entitätsname, type die Kategorie
+// (z.B. "Organisationen", "Organisationen Produktgruppen", "Personen").
+type jiraPhoneMatch struct {
+	Key  string `json:"key"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+type jiraPhoneResponse struct {
+	OK      bool             `json:"ok"`
+	Error   string           `json:"error"`
+	Phone   string           `json:"phone"`
+	CRM     string           `json:"crm"`
+	Found   bool             `json:"found"`
+	Matches []jiraPhoneMatch `json:"matches"`
+	Total   int              `json:"total"`
+	// JQL/IQL: die serverseitig ausgeführte Abfrage (Feldname je nach Backend
+	// "jql" oder "iql"). Variant: die tatsächlich gesuchte, normalisierte
+	// Nummern-Variante. Nur für Debug/Nachvollziehbarkeit, nicht logikrelevant.
+	JQL     string `json:"jql"`
+	IQL     string `json:"iql"`
+	Variant string `json:"variant"`
+}
+
+// jarvisPhoneLookup ruft GET /api/jira/phonenumber?phone=<phone> auf und liefert
+// die vom Server ermittelte CRM. Auth/Client wie bei jarvisPost (X-API-Key,
+// TLS-Skip für das selbstsignierte Zertifikat).
+// Rückgabe: geparste Antwort, Roh-Body (für die Debug-Anzeige) und Fehler.
+func jarvisPhoneLookup(phone string) (*jiraPhoneResponse, string, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(config.Jarvis.Url), "/")
+	apiKey := strings.TrimSpace(config.Jarvis.ApiKey)
+	if baseURL == "" || apiKey == "" {
+		err := fmt.Errorf("Jarvis-Server-URL und/oder API-Key sind nicht konfiguriert (siehe Einstellungen).")
+		Log("Jarvis /api/jira/phonenumber: " + err.Error())
+		return nil, "", err
+	}
+
+	reqURL := baseURL + "/api/jira/phonenumber?phone=" + url.QueryEscape(phone)
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("X-API-Key", apiKey)
+
+	resp, err := jarvisHTTPClient().Do(req)
+	if err != nil {
+		wrapped := fmt.Errorf("Jarvis-Server nicht erreichbar (%s): %v", baseURL, err)
+		Log("Jarvis /api/jira/phonenumber: " + wrapped.Error())
+		return nil, "", wrapped
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	raw := string(body)
+	var out jiraPhoneResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		wrapped := fmt.Errorf("Antwort nicht im erwarteten Format (HTTP %d): %v", resp.StatusCode, err)
+		Log("Jarvis /api/jira/phonenumber: " + wrapped.Error() + " | Rohantwort: " + raw)
+		return nil, raw, wrapped
+	}
+	if !out.OK {
+		Log("Jarvis /api/jira/phonenumber: Server meldet Fehler: " + out.Error)
+		return nil, raw, fmt.Errorf("%s", out.Error)
+	}
+	return &out, raw, nil
+}
+
+// jarvisPhonePreview formatiert die CRM-Abfrage lesbar für den Debug-Modus.
+func jarvisPhonePreview(phone string) string {
+	baseURL := strings.TrimRight(strings.TrimSpace(config.Jarvis.Url), "/")
+	return fmt.Sprintf("GET %s/api/jira/phonenumber?phone=%s", baseURL, url.QueryEscape(phone))
 }
 
 // kiCard umrahmt content mit einem duennen, abgerundeten Rand auf weissem/
@@ -372,6 +491,71 @@ func jarvisSourceRow(b jarvisBlock, win fyne.Window) fyne.CanvasObject {
 	return container.NewBorder(nil, nil, prefix, nil, link)
 }
 
+// collapseText kuerzt s auf hoechstens maxLines Zeilen bzw. maxChars Zeichen
+// (rune-sicher, Schnitt an Wortgrenze). Rueckgabe: gekuerzter Text und ob
+// ueberhaupt gekuerzt wurde (nur dann wird ein "mehr"/"weniger"-Umschalter
+// benoetigt). Dient dem Einklappen der KI-Zusammenfassung.
+func collapseText(s string, maxLines, maxChars int) (string, bool) {
+	truncated := false
+	lines := strings.Split(s, "\n")
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+		truncated = true
+	}
+	out := strings.Join(lines, "\n")
+	if runes := []rune(out); len(runes) > maxChars {
+		cut := string(runes[:maxChars])
+		if idx := strings.LastIndexAny(cut, " \n"); idx > 0 {
+			cut = cut[:idx]
+		}
+		out = strings.TrimRight(cut, " \n")
+		truncated = true
+	}
+	return out, truncated
+}
+
+// ticketSummaryControls baut die Bedienelemente der "KI-Zusammenfassung" eines
+// Ticket-Eintrags (nur in der "Tickets zu einer CRM"-Liste): einen Button (oben
+// rechts im Eintrag zu platzieren, rot mit weißer Schrift) und einen darunter
+// einzublendenden Inhalts-Container. Der Button laedt on demand die Einzelticket-
+// Zusammenfassung (POST /api/support/summarize) und blendet sie ein-/aus
+// (Toggle). Lade-/Fehlerzustand erscheinen im Inhalts-Container.
+func ticketSummaryControls(key string) (*widget.Button, *fyne.Container) {
+	holder := container.NewVBox()
+	var btn *widget.Button
+	btn = widget.NewButton("KI-Zusammenfassung", func() {
+		if len(holder.Objects) > 0 { // bereits eingeblendet -> zuklappen
+			holder.RemoveAll()
+			holder.Refresh()
+			return
+		}
+		holder.Add(widget.NewLabel("KI-Zusammenfassung wird geladen …"))
+		holder.Refresh()
+		btn.Disable()
+		go func() {
+			sum, err := jarvisSummarizeTicket(key)
+			fyne.Do(func() {
+				btn.Enable()
+				holder.RemoveAll()
+				var lbl *widget.Label
+				switch {
+				case err != nil:
+					lbl = widget.NewLabel("Fehler: " + err.Error())
+				case sum == "":
+					lbl = widget.NewLabel("(keine Zusammenfassung erhalten)")
+				default:
+					lbl = widget.NewLabel(sum)
+				}
+				lbl.Wrapping = fyne.TextWrapWord
+				holder.Add(lbl)
+				holder.Refresh()
+			})
+		}()
+	})
+	btn.Importance = widget.HighImportance // rot mit weißer Schrift (Theme-Primärfarbe)
+	return btn, holder
+}
+
 // defaultTicketSearchPrompt ist der Standard-Prompt fuer den Button "Suche
 // passende Tickets" (STT-Tab). "[Textfenster]" wird vor dem API-Call durch den
 // erkannten Text ersetzt. Ueberschreibbar in "Einstellungen"
@@ -399,7 +583,7 @@ const ticketSearchPlaceholder = "[Textfenster]"
 // eine normale Suche. Parameter auto=true unterdrueckt das Debug-Popup (sonst
 // erschiene es bei jedem Zyklus) und ueberspringt einen Zyklus, wenn noch eine
 // vorherige Automatik-Suche laeuft (Ueberlappschutz).
-func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedText string, trigger *widget.Button, auto bool)) {
+func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedText string, trigger *widget.Button, auto bool, crmFallback bool), func()) {
 	// --- Ergebnisbereich (wird nach jeder Suche neu befuellt) ---
 	resultsBox := container.NewVBox(
 		widget.NewLabel("Noch keine Suche durchgeführt."),
@@ -408,13 +592,60 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	resultsBg := canvas.NewRectangle(color.White)
 	resultsArea := container.NewStack(resultsBg, resultsScroll)
 
-	renderResults := func(query string, res *jarvisQueryResponse, duration time.Duration) {
+	// clearResults leert die Ergebnis-/Ticketliste und zeigt wieder den
+	// Platzhalter. Wird u.a. aufgerufen, wenn der Inhalt des CRM-Felds manuell
+	// geaendert wird (die bisherige Ticketliste gehoert dann zu einer anderen
+	// CRM und ist ungueltig). Muss im Fyne-Main-Thread laufen.
+	clearResults := func() {
+		resultsBox.RemoveAll()
+		resultsBox.Add(widget.NewLabel("Noch keine Suche durchgeführt."))
+		resultsBox.Refresh()
+	}
+
+	// renderResults befuellt die Ergebnisliste. hideRanking blendet das Score-/
+	// Ranking-Badge aus (fuer die Ansicht "Tickets zu einer CRM", wo eine
+	// Relevanz-Prozentzahl keinen Sinn ergibt).
+	renderResults := func(query string, res *jarvisQueryResponse, duration time.Duration, hideRanking bool) {
 		resultsBox.RemoveAll()
 
 		status := widget.NewLabel(fmt.Sprintf("Ergebnis für „%s“ (%d Treffer · %d ms)", query, len(res.Blocks), duration.Milliseconds()))
-		resultsBox.Add(status)
 
-		if strings.TrimSpace(res.AISummary) != "" {
+		// Volltext-Filter der bereits geladenen Treffer (rein clientseitig, KEINE
+		// neue Server-Anfrage und keine Verbindung zum Suchtext/Prompt). Jede
+		// Treffer-Karte wird mit ihrem durchsuchbaren Text (kleingeschrieben)
+		// gesammelt; beim Tippen werden nicht passende Karten ausgeblendet, ein
+		// leeres Feld zeigt wieder alle. Die KI-Zusammenfassung bleibt als
+		// Gesamtueberblick immer sichtbar.
+		type filterCard struct {
+			obj  fyne.CanvasObject
+			text string
+		}
+		var cards []filterCard
+		filterEntry := widget.NewEntry()
+		filterEntry.SetPlaceHolder("Treffer filtern …")
+		filterEntry.OnChanged = func(q string) {
+			ql := strings.ToLower(strings.TrimSpace(q))
+			for _, c := range cards {
+				if ql == "" || strings.Contains(c.text, ql) {
+					c.obj.Show()
+				} else {
+					c.obj.Hide()
+				}
+			}
+			resultsBox.Refresh()
+		}
+
+		// Filterfeld nur bei vorhandenen Treffern; rechtsbuendig neben dem Status
+		// mit fester Breite (Border-rechts wuerde dem Entry sonst nur seine
+		// schmale Minimalbreite geben).
+		if len(res.Blocks) > 0 {
+			filterWrap := container.NewGridWrap(fyne.NewSize(220, filterEntry.MinSize().Height), filterEntry)
+			resultsBox.Add(container.NewBorder(nil, nil, nil, filterWrap, status))
+		} else {
+			resultsBox.Add(status)
+		}
+
+		if summary := strings.TrimSpace(res.AISummary); summary != "" {
 			header := canvas.NewText("KI-GESAMTZUSAMMENFASSUNG", kiAccent)
 			header.TextStyle = fyne.TextStyle{Bold: true}
 			header.TextSize = 12
@@ -425,9 +656,36 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			// winzige Text-Segmente zerlegt, die dann einzeln umgebrochen wurden
 			// (sichtbar als Spalte aus Einzelbuchstaben-Zeilen). Gleiches Problem
 			// wie beim Snippet-Text unten, dort bereits mit Label geloest.
-			body := widget.NewLabel(res.AISummary)
+			body := widget.NewLabel("")
 			body.Wrapping = fyne.TextWrapWord
-			resultsBox.Add(kiCard(container.NewVBox(header, body)))
+
+			cardBox := container.NewVBox(header, body)
+			// Standardmaessig auf 10 Zeilen kuerzen; laengerer Text wird per
+			// "mehr"/"weniger" ein-/ausgeklappt.
+			short, truncated := collapseText(summary, 10, 700)
+			if truncated {
+				expanded := false
+				toggle := widget.NewButton("mehr", nil)
+				toggle.Importance = widget.LowImportance
+				apply := func() {
+					if expanded {
+						body.SetText(summary)
+						toggle.SetText("weniger")
+					} else {
+						body.SetText(short + " …")
+						toggle.SetText("mehr")
+					}
+				}
+				toggle.OnTapped = func() {
+					expanded = !expanded
+					apply()
+				}
+				apply()
+				cardBox.Add(container.NewHBox(toggle)) // Toggle linksbuendig
+			} else {
+				body.SetText(summary)
+			}
+			resultsBox.Add(kiCard(cardBox))
 		}
 
 		for i, b := range res.Blocks {
@@ -436,21 +694,48 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 				title = b.Key
 			}
 			titleWidget := jarvisTitleWidget(i+1, title, b.Link)
-			sourceLabel := b.SourceLabel
-			if sourceLabel == "" {
-				sourceLabel = b.Source
+
+			// Ticket-Treffer (JIRA): der Link steckt bereits im Titel-Header, daher
+			// KEINE Quelle-Bubble und KEINE "Quelle:"-Zeile. Nicht-Tickets
+			// (WISSEN/Confluence) behalten Quelle-Badge und -Zeile.
+			isTicket := strings.EqualFold(b.Source, "JIRA")
+
+			var pills []fyne.CanvasObject
+			if !isTicket {
+				sourceLabel := b.SourceLabel
+				if sourceLabel == "" {
+					sourceLabel = b.Source
+				}
+				pills = append(pills, kiPill(strings.ToUpper(sourceLabel), kiAccentSoft, kiAccent))
 			}
-			badges := container.NewHBox(
-				kiPill(strings.ToUpper(sourceLabel), kiAccentSoft, kiAccent),
-				kiPill(fmt.Sprintf("%d%%", b.Score), kiAccent, color.White),
-			)
+			if !hideRanking {
+				pills = append(pills, kiPill(fmt.Sprintf("%d%%", b.Score), kiAccent, color.White))
+			}
+
+			// Rechts im Header: Badges (falls vorhanden) und - in der "Tickets zu
+			// einer CRM"-Liste (hideRanking) - der Button "KI-Zusammenfassung"
+			// (rot/weiß). Der zugehoerige Inhalt (summaryHolder) wird unten angehaengt.
+			right := append([]fyne.CanvasObject{}, pills...)
+			var summaryHolder *fyne.Container
+			if hideRanking && isTicket {
+				if key := strings.TrimSpace(b.Key); key != "" {
+					btn, holder := ticketSummaryControls(key)
+					summaryHolder = holder
+					right = append(right, btn)
+				}
+			}
+
 			// titleWidget als Mitte (nicht als "left"!) des Border-Layouts: nur so
 			// bekommt es beim Layout die tatsaechlich verfuegbare Breite zugewiesen
 			// und kann seinen (vollstaendigen, s. jarvisTitleWidget) Text passend
 			// umbrechen. Als "left" wuerde Fyne dem Titel immer nur seine eigene
 			// Minimalbreite geben - das hatte zuvor entweder eine endlose Zeile
 			// (Fenstersteiler blockiert) oder eine Kuerzung mit "…" zur Folge.
-			headerRow := container.NewBorder(nil, nil, nil, badges, titleWidget)
+			// Ohne rechte Objekte steht der Titel allein.
+			var headerRow fyne.CanvasObject = titleWidget
+			if len(right) > 0 {
+				headerRow = container.NewBorder(nil, nil, nil, container.NewHBox(right...), titleWidget)
+			}
 			// Bewusst Label statt RichTextFromMarkdown: der Snippet-Text vom Server
 			// ist freier Fliesstext, kein verlaesslich sauberes Markdown - einzelne
 			// Zeichenfolgen wurden faelschlich als Ueberschrift interpretiert und
@@ -458,14 +743,26 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			snippet := widget.NewLabel(b.Summary)
 			snippet.Wrapping = fyne.TextWrapWord
 
-			// Quelle gesondert UNTERHALB des Blocks (inkl. klickbarem Link) - v.a.
-			// fuer WISSEN-Treffer, deren (oft relative) Quell-Links sonst gar nicht
-			// sichtbar waeren, s. jarvisSourceRow/resolveJarvisLink.
 			cardContent := container.NewVBox(headerRow, snippet)
-			if srcRow := jarvisSourceRow(b, win); srcRow != nil {
-				cardContent.Add(srcRow)
+			// Quelle-Zeile nur fuer Nicht-Tickets (v.a. WISSEN-Treffer, deren oft
+			// relative Quell-Links sonst gar nicht sichtbar waeren, s.
+			// jarvisSourceRow/resolveJarvisLink).
+			if !isTicket {
+				if srcRow := jarvisSourceRow(b, win); srcRow != nil {
+					cardContent.Add(srcRow)
+				}
 			}
-			resultsBox.Add(kiCard(cardContent))
+			// KI-Zusammenfassung erscheint unterhalb (ein-/ausklappbar via Header-Button).
+			if summaryHolder != nil {
+				cardContent.Add(summaryHolder)
+			}
+			card := kiCard(cardContent)
+			// Durchsuchbarer Text der Karte fuer den Volltext-Filter oben.
+			cards = append(cards, filterCard{
+				obj:  card,
+				text: strings.ToLower(strings.Join([]string{title, b.Summary, b.Key, b.Source, b.SourceLabel}, " ")),
+			})
+			resultsBox.Add(card)
 		}
 
 		if len(res.Blocks) == 0 && strings.TrimSpace(res.AISummary) == "" {
@@ -618,7 +915,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 						renderError(err)
 						return
 					}
-					renderResults(text, res, duration)
+					renderResults(text, res, duration, false)
 				})
 			}()
 		})
@@ -663,14 +960,22 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// (config.JarvisTicketSearchPrompt, "[Textfenster]" durch den erkannten Text
 	// ersetzt) wird im Feld prompt mitgeschickt (und ist im Debug-Fenster sichtbar).
 	// Der erkannte Text geht zusaetzlich als Suchtext (text) an die API.
-	searchMatchingTickets := func(recognizedText string, trigger *widget.Button, auto bool) {
-		text := strings.TrimSpace(recognizedText)
-		if text == "" {
+	// auto=true: automatischer Zyklus/Trigger (kein Debug-Popup, Ueberlappschutz).
+	// crmFallback=true: bei LEEREM erkannten Text nach allen OFFENEN Tickets zur
+	// gefundenen CRM suchen (Button + Webhook-Trigger), statt abzubrechen. Der
+	// zyklische Intervall-Scan (crmFallback=false) ueberspringt leeren Text still.
+	searchMatchingTickets := func(recognizedText string, trigger *widget.Button, auto bool, crmFallback bool) {
+		// Ticketsuche nur, wenn im CRM Feld eine gültige CRM steht
+		// (per Webhook gesetzt ODER manuell eingetippt, s. webhook.go/hasCRM).
+		// Ohne CRM: Automatik still überspringen, manuell mit Hinweis.
+		if !hasCRM() {
 			if !auto {
-				showErr(fmt.Errorf("Kein erkannter Text vorhanden, zu dem passende Tickets gesucht werden könnten."), win)
+				showErr(fmt.Errorf("Im CRM Feld steht keine gültige CRM-Nummer. Die Ticketsuche ist erst mit einer CRM möglich."), win)
 			}
-			return // Automatik-Zyklus bei leerem Text still ueberspringen
+			return
 		}
+		crm := getCurrentCRM()
+
 		jiraLimit := config.JarvisJiraLimit
 		if jiraLimit <= 0 {
 			jiraLimit = 10
@@ -683,23 +988,46 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		if lang == "" {
 			lang = "de"
 		}
-		promptTemplate := strings.TrimSpace(config.JarvisTicketSearchPrompt)
-		if promptTemplate == "" {
-			promptTemplate = defaultTicketSearchPrompt
-		}
-		prompt := strings.ReplaceAll(promptTemplate, ticketSearchPlaceholder, text)
 
-		req := jarvisQueryRequest{
-			Text:         text,
-			RAG:          false,
-			Jira:         true, // jira_all - einziger aktiver Quell-Key
-			Confluence:   false,
-			AI:           false,
-			OpenOnly:     false,
-			JiraLimit:    jiraLimit,
-			SummaryLines: summaryLines,
-			Lang:         lang,
-			Prompt:       prompt,
+		var req jarvisQueryRequest
+		text := strings.TrimSpace(recognizedText)
+		displayQuery := text
+		// hideRanking: bei "Tickets zu einer CRM" (alle offenen Tickets) ergibt eine
+		// Relevanz-Prozentzahl keinen Sinn -> Ranking-Badge ausblenden.
+		hideRanking := false
+		if text == "" {
+			// Kein erkannter Text: entweder still überspringen (zyklischer Scan)
+			// oder – bei Button/Webhook – alle OFFENEN Tickets zur CRM suchen.
+			if !crmFallback {
+				return
+			}
+			displayQuery = "offene Tickets zu " + crm
+			hideRanking = true
+			req = jarvisQueryRequest{
+				Text:         crm,
+				OpenOnly:     true, // jira_open (schließt jira_all aus)
+				JiraLimit:    jiraLimit,
+				SummaryLines: summaryLines,
+				Lang:         lang,
+			}
+		} else {
+			promptTemplate := strings.TrimSpace(config.JarvisTicketSearchPrompt)
+			if promptTemplate == "" {
+				promptTemplate = defaultTicketSearchPrompt
+			}
+			prompt := strings.ReplaceAll(promptTemplate, ticketSearchPlaceholder, text)
+			req = jarvisQueryRequest{
+				Text:         text,
+				RAG:          false,
+				Jira:         true, // jira_all - einziger aktiver Quell-Key
+				Confluence:   false,
+				AI:           false,
+				OpenOnly:     false,
+				JiraLimit:    jiraLimit,
+				SummaryLines: summaryLines,
+				Lang:         lang,
+				Prompt:       prompt,
+			}
 		}
 
 		run := func() {
@@ -724,7 +1052,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 						renderError(err)
 						return
 					}
-					renderResults(text, res, duration)
+					renderResults(displayQuery, res, duration, hideRanking)
 				})
 			}()
 		}
@@ -741,5 +1069,5 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		debugPreviewAndConfirm(win, "Anfrage: Passende Tickets (/api/support/query)", jarvisRequestPreview(req), run)
 	}
 
-	return panel, searchMatchingTickets
+	return panel, searchMatchingTickets, clearResults
 }

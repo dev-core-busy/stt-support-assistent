@@ -5,7 +5,7 @@ package main
 // Ein externer Trigger (z.B. eine Telefonanlage) ruft beim eingehenden Anruf
 // eine URL dieser App auf und übergibt die Rufnummer des Anrufers. Die App
 // sucht mit der Rufnummer in Jira (über die bestehende Jarvis-Jira-Suche) und
-// trägt den Issue-Key des Top-Treffers ins Feld "erkannter Kunde"
+// trägt den Issue-Key des Top-Treffers ins CRM Feld
 // (customerEntry) ein.
 //
 // Der Server lauscht auf 0.0.0.0:<Port><Pfad> (Port/Pfad in den Einstellungen,
@@ -14,23 +14,79 @@ package main
 // (JSON {"number":"..."} oder Formularfeld) akzeptiert.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image/color"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 )
 
 var (
 	webhookMu     sync.Mutex
 	webhookServer *http.Server
+
+	// currentCRM spiegelt die aktuell im CRM Feld stehende, gültige
+	// CRM-Nummer (Issue-Key). Wird über customerEntry.OnChanged gepflegt — egal ob
+	// der Wert per Webhook-Treffer oder manuell ins Feld kam. Leer, wenn im Feld
+	// keine gültige CRM steht (z.B. "nicht gefunden" oder leer). Die Ticketsuche
+	// (manuell + Auto-Scan) läuft nur, wenn hier eine CRM steht (s. hasCRM).
+	// Mutex-geschützt, da aus dem UI-Thread gesetzt und aus dem Auto-Scan gelesen.
+	crmMu      sync.Mutex
+	currentCRM string
+
+	// lastCallerNumber ist die zuletzt empfangene Rufnummer. Der Wiederhol-Button
+	// (STT-Tab) startet damit die CRM-Abfrage erneut. Mutex-geschützt, da aus dem
+	// Webhook-Goroutine gesetzt und aus dem UI-Thread gelesen.
+	callerNumMu      sync.Mutex
+	lastCallerNumber string
 )
+
+// crmKeyPattern erkennt einen Jira-Issue-Key / eine CRM-Nummer wie "CRM-10550"
+// oder "SUP-1234": Buchstabe, dann Buchstaben/Ziffern, "-", Ziffern.
+var crmKeyPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]*-\d+$`)
+
+// validCRM liefert die getrimmte CRM, wenn text wie eine CRM/Issue-Key aussieht,
+// sonst "" (z.B. für "nicht gefunden", leere Eingabe oder eine reine Rufnummer).
+func validCRM(text string) string {
+	t := strings.TrimSpace(text)
+	if crmKeyPattern.MatchString(t) {
+		return t
+	}
+	return ""
+}
+
+// setCurrentCRM / getCurrentCRM / hasCRM kapseln den CRM-Status thread-sicher.
+func setCurrentCRM(s string) {
+	crmMu.Lock()
+	currentCRM = strings.TrimSpace(s)
+	crmMu.Unlock()
+}
+
+func getCurrentCRM() string {
+	crmMu.Lock()
+	defer crmMu.Unlock()
+	return currentCRM
+}
+
+// hasCRM meldet, ob im CRM Feld aktuell eine gültige CRM steht.
+func hasCRM() bool {
+	return getCurrentCRM() != ""
+}
 
 // numberParamKeys sind die akzeptierten Parameter-/JSON-Feldnamen für die
 // Rufnummer (verschiedene Telefonanlagen benennen das Feld unterschiedlich).
@@ -56,6 +112,21 @@ func effectiveWebhookPath() string {
 		p = "/" + p
 	}
 	return p
+}
+
+// getLocalIPHint ermittelt die primäre LAN-IPv4 des Rechners (für kopierbare
+// Beispiel-URLs im Einstellungen-Hilfetext). Der UDP-"Dial" sendet keine Pakete,
+// sondern ermittelt nur die Quell-Adresse der Standard-Route. Ohne Route (kein
+// Netz) folgt der Platzhalter "<Rechner-IP>".
+func getLocalIPHint() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err == nil {
+		defer conn.Close()
+		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
+			return addr.IP.String()
+		}
+	}
+	return "<Rechner-IP>"
 }
 
 // startWebhookServer startet den Listener, sofern in den Einstellungen aktiviert
@@ -134,7 +205,29 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"ok":true,"number":%q}`, number)
 
-	go handleIncomingCaller(number)
+	// Bei eingehendem Anruf optional automatisch die Mitschrift starten. Bewusst
+	// hier (echter Webhook-Aufruf), nicht in handleIncomingCaller – der
+	// Wiederhol-Button nutzt handleIncomingCaller und soll keine Aufnahme starten.
+	maybeAutoStartRecording()
+
+	go handleIncomingCaller(number, true)
+}
+
+// maybeAutoStartRecording startet bei eingehendem Anruf automatisch die
+// Mitschrift, sofern in den Einstellungen aktiviert (config.AutoRecordOnCall)
+// und noch keine Aufnahme läuft. toggleRecording manipuliert UI-Elemente und
+// läuft daher im Fyne-Main-Loop; der isRecording-Check wird dort erneut
+// ausgeführt (Schutz gegen parallele Aufrufe).
+func maybeAutoStartRecording() {
+	if !config.AutoRecordOnCall || isRecording.Load() {
+		return
+	}
+	Log("Rufnummern-Webhook: Auto-Start der Mitschrift bei Anruf")
+	fyne.Do(func() {
+		if !isRecording.Load() {
+			toggleRecording()
+		}
+	})
 }
 
 // extractNumber liest die Rufnummer aus Query-Parametern (GET & POST), aus einem
@@ -204,61 +297,281 @@ func queryValuePreservingPlus(rawQuery, key string) string {
 	return ""
 }
 
-// handleIncomingCaller sucht mit der Rufnummer in Jira und trägt den Issue-Key
-// des Top-Treffers ins Feld "erkannter Kunde" ein. Läuft in einer Goroutine.
-func handleIncomingCaller(number string) {
-	// Sofort die Rohnummer anzeigen ("wird gesucht"-Zustand), damit der Agent
-	// den Anrufer sieht, während die Jira-Suche läuft.
-	setCustomerField(number)
+// handleIncomingCaller verarbeitet einen eingehenden Anruf: zeigt die Rufnummer
+// im Label an und ermittelt die CRM über den Jarvis-Endpoint. Läuft in einer
+// Goroutine. Im Debug-Modus wird die Anfrage vor dem Versand als Popup gezeigt
+// (debugPreviewAndConfirm).
+//
+// auto=true: automatischer Trigger (echter Webhook-Anruf) - die CRM-Suche läuft
+// nur, wenn "Anrufer automatisch suchen" aktiviert ist (config.AutoSearchCaller);
+// sonst wird ausschließlich die Rufnummer angezeigt. auto=false: manueller
+// Trigger (Wiederhol-Button) - sucht immer.
+func handleIncomingCaller(number string, auto bool) {
+	// Rufnummer im Label anzeigen. Der CRM-Status folgt dem Feldinhalt
+	// (customerEntry.OnChanged) und wird durch das Ergebnis unten aktualisiert.
+	setCallerNumber(number)
 
-	jiraLimit := config.JarvisJiraLimit
-	if jiraLimit <= 0 {
-		jiraLimit = 10
-	}
-	lang := config.JarvisLang
-	if lang == "" {
-		lang = "de"
+	if auto && !config.AutoSearchCaller {
+		Log(fmt.Sprintf("Rufnummern-Webhook: Rufnummer %q angezeigt, Auto-Suche deaktiviert", number))
+		return
 	}
 
-	// Reine Jira-Suche: keine RAG/Confluence, kein AI/LLM und bewusst KEIN
-	// Einstellungs-Prompt — die Rufnummer ist der alleinige Suchtext.
-	res, err := jarvisQuery(jarvisQueryRequest{
-		Text:      number,
-		Jira:      true,
-		JiraLimit: jiraLimit,
-		Lang:      lang,
+	// Im Debug-Modus die Anfrage als Popup zeigen (Senden/Abbrechen), sonst
+	// sofort ausführen. debugPreviewAndConfirm regelt beides selbst.
+	fyne.Do(func() {
+		debugPreviewAndConfirm(mainWin, "Rufnummern-Webhook: CRM-Abfrage", jarvisPhonePreview(number), func() {
+			go performCallerJiraLookup(number)
+		})
 	})
-	if err != nil {
-		Log("Rufnummern-Webhook: Jira-Suche fehlgeschlagen: " + err.Error())
-		return
-	}
-
-	key := topJiraKey(res)
-	if key == "" {
-		Log(fmt.Sprintf("Rufnummern-Webhook: kein passendes Jira-Ticket zu %q gefunden", number))
-		return
-	}
-	Log(fmt.Sprintf("Rufnummern-Webhook: Rufnummer %q -> Jira %s", number, key))
-	setCustomerField(key)
 }
 
-// topJiraKey liefert den Issue-Key des besten Jira-Treffers (die Blocks kommen
-// bereits nach Score sortiert vom Server).
-func topJiraKey(res *jarvisQueryResponse) string {
-	if res == nil {
-		return ""
-	}
-	for _, b := range res.Blocks {
-		if strings.EqualFold(b.Source, "jira") && strings.TrimSpace(b.Key) != "" {
-			return strings.TrimSpace(b.Key)
+// performCallerJiraLookup fragt über GET /api/jira/phonenumber die CRM zur
+// Rufnummer ab und trägt sie ins CRM Feld ein, sonst
+// "nicht gefunden". setCustomerField aktualisiert das Feld; dessen OnChanged
+// pflegt currentCRM (Freigabe der Ticketsuche).
+func performCallerJiraLookup(number string) {
+	res, raw, err := jarvisPhoneLookup(number)
+
+	// Bei aktivem Debug-Modus die Serverantwort (bzw. den Fehler) als Popup zeigen.
+	payload := prettyJSON(raw)
+	if err != nil {
+		if payload == "" {
+			payload = "Fehler: " + err.Error()
+		} else {
+			payload = "Fehler: " + err.Error() + "\n\nRohantwort:\n" + payload
 		}
 	}
-	for _, b := range res.Blocks {
-		if strings.TrimSpace(b.Key) != "" {
-			return strings.TrimSpace(b.Key)
+	fyne.Do(func() { showDebugResponse("Rufnummern-Webhook: Antwort", payload) })
+
+	if err != nil {
+		Log("Rufnummern-Webhook: CRM-Abfrage fehlgeschlagen: " + err.Error())
+		setCurrentCRM("")
+		setCustomerField("nicht gefunden")
+		return
+	}
+
+	matches := distinctCRMMatches(res)
+	// Kandidatenanzahl immer protokollieren (unabhängig vom Debug-Modus), damit
+	// im log.txt nachvollziehbar ist, wie viele CRM-Treffer der Server lieferte.
+	Log(fmt.Sprintf("Rufnummern-Webhook: Rufnummer %q -> %d CRM-Kandidat(en) (total=%d)", number, len(matches), res.Total))
+	if len(matches) == 0 {
+		Log(fmt.Sprintf("Rufnummern-Webhook: keine CRM zu %q gefunden (total=%d)", number, res.Total))
+		setCurrentCRM("")
+		setCustomerField("nicht gefunden")
+		return
+	}
+
+	crm := matches[0].Key
+	if len(matches) > 1 {
+		if config.CallerTakeFirstMatch {
+			// Einstellung "ersten Treffer nehmen": ohne Popup den ersten übernehmen.
+			Log(fmt.Sprintf("Rufnummern-Webhook: %d CRM-Kandidaten zu %q -> erster genommen (%s)", len(matches), number, crm))
+		} else {
+			// Mehrere CRM-Kunden zur Rufnummer: den richtigen per Popup auswählen
+			// lassen. askCRMSelection blockiert bis zur Auswahl (Ergebnis kommt per
+			// Kanal aus dem Fyne-Main-Loop zurück); "" bedeutet Abbruch. Bewusst hier
+			// in der Goroutine warten, damit applyCRM darunter wieder aus Goroutine-
+			// Kontext läuft und fyne.Do gefahrlos nutzen kann.
+			Log(fmt.Sprintf("Rufnummern-Webhook: %d CRM-Kandidaten zu %q -> Auswahl", len(matches), number))
+			crm = askCRMSelection(number, matches)
+			if crm == "" {
+				Log(fmt.Sprintf("Rufnummern-Webhook: CRM-Auswahl abgebrochen (Rufnummer %q)", number))
+				setCurrentCRM("")
+				setCustomerField("nicht gefunden")
+				return
+			}
 		}
 	}
-	return ""
+	applyCRM(number, crm)
+}
+
+// distinctCRMMatches liefert die eindeutigen, gültigen CRM-Treffer aus der
+// Server-Antwort in Reihenfolge ihres ersten Auftretens. Primärquelle ist
+// matches[] (die CRM-Nummer steht im Feld key, dazu name+type); ist matches
+// leer, dient das Top-Level-Feld crm als Rückfall (nur wenn found=true).
+func distinctCRMMatches(res *jiraPhoneResponse) []jiraPhoneMatch {
+	seen := map[string]bool{}
+	var out []jiraPhoneMatch
+	for _, m := range res.Matches {
+		c := validCRM(m.Key)
+		if c == "" || seen[c] {
+			continue
+		}
+		seen[c] = true
+		m.Key = c // getrimmt
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		if c := validCRM(res.CRM); c != "" && res.Found {
+			out = append(out, jiraPhoneMatch{Key: c})
+		}
+	}
+	return out
+}
+
+// crmMatchLabel baut den Anzeigetext eines CRM-Treffers: "CRM-xxxx — Name (Typ)".
+func crmMatchLabel(m jiraPhoneMatch) string {
+	label := m.Key
+	if name := strings.TrimSpace(m.Name); name != "" {
+		label = fmt.Sprintf("%s — %s", m.Key, name)
+	}
+	if typ := strings.TrimSpace(m.Type); typ != "" {
+		label = fmt.Sprintf("%s  (%s)", label, typ)
+	}
+	return label
+}
+
+// orgSymbolRes / personSymbolRes sind die fest eingebetteten Typ-Symbole des
+// CRM-Auswahl-Popups (s. assets.go). Einmal gebaut, im Popup wiederverwendet.
+var (
+	orgSymbolRes    = fyne.NewStaticResource("organisation.png", orgSymbolPNG)
+	personSymbolRes = fyne.NewStaticResource("person.png", personSymbolPNG)
+)
+
+// crmTypeIcon liefert das (eingebettete) Symbol zu einem Treffer-Typ:
+// Organisation bzw. Person; für alles andere ein neutraler Platzhalter
+// (theme.QuestionIcon).
+func crmTypeIcon(typ string) fyne.Resource {
+	t := strings.ToLower(strings.TrimSpace(typ))
+	switch {
+	case strings.Contains(t, "organisation"):
+		return orgSymbolRes
+	case strings.Contains(t, "person"):
+		return personSymbolRes
+	default:
+		return theme.QuestionIcon()
+	}
+}
+
+// crmRow ist eine anklickbare Zeile im CRM-Auswahl-Popup: Typ-Symbol + Text.
+// Einzelklick wählt die Zeile aus (Hervorhebung), Doppelklick übernimmt sie
+// direkt. Das Symbol sitzt in einer festen 28×28-Zelle (GridWrap) mit FillMode
+// Contain und wird dadurch NICHT verzerrt/gestreckt.
+type crmRow struct {
+	widget.BaseWidget
+	idx      int
+	bg       *canvas.Rectangle
+	content  fyne.CanvasObject
+	onSelect func(int)
+	onChoose func(int)
+}
+
+func newCRMRow(idx int, icon fyne.Resource, text string, onSelect, onChoose func(int)) *crmRow {
+	img := canvas.NewImageFromResource(icon)
+	img.FillMode = canvas.ImageFillContain // Seitenverhältnis wahren, nicht strecken
+	iconCell := container.NewGridWrap(fyne.NewSize(28, 28), img)
+	lbl := widget.NewLabel(text)
+	lbl.Wrapping = fyne.TextWrapWord
+
+	r := &crmRow{
+		idx:      idx,
+		bg:       canvas.NewRectangle(color.Transparent),
+		content:  container.NewBorder(nil, nil, iconCell, nil, lbl),
+		onSelect: onSelect,
+		onChoose: onChoose,
+	}
+	r.ExtendBaseWidget(r)
+	return r
+}
+
+func (r *crmRow) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(container.NewStack(r.bg, container.NewPadded(r.content)))
+}
+
+func (r *crmRow) Tapped(*fyne.PointEvent) {
+	if r.onSelect != nil {
+		r.onSelect(r.idx)
+	}
+}
+
+func (r *crmRow) DoubleTapped(*fyne.PointEvent) {
+	if r.onChoose != nil {
+		r.onChoose(r.idx)
+	}
+}
+
+func (r *crmRow) setSelected(sel bool) {
+	if sel {
+		r.bg.FillColor = kiAccentSoft
+	} else {
+		r.bg.FillColor = color.Transparent
+	}
+	r.bg.Refresh()
+}
+
+// askCRMSelection zeigt bei mehreren CRM-Kandidaten ein Auswahl-Popup und
+// liefert die gewählte CRM-Nummer (key) zurück (leer bei Abbruch). Wird aus
+// einer Goroutine aufgerufen und blockiert bis zur Auswahl: die UI läuft im
+// Fyne-Main-Loop (fyne.Do), das Ergebnis kommt über einen gepufferten Kanal
+// zurück. Je Eintrag: Typ-Symbol (Organisation/Person/neutral), CRM-Nummer,
+// Name und Typ. Einzelklick wählt aus, Doppelklick übernimmt sofort.
+func askCRMSelection(number string, matches []jiraPhoneMatch) string {
+	ch := make(chan string, 1)
+	var once sync.Once
+	send := func(s string) { once.Do(func() { ch <- s }) } // genau ein Ergebnis
+
+	fyne.Do(func() {
+		selected := 0
+		var rows []*crmRow
+		var dlg dialog.Dialog
+
+		selectRow := func(idx int) {
+			selected = idx
+			for i, r := range rows {
+				r.setSelected(i == idx)
+			}
+		}
+		choose := func(idx int) {
+			if idx < 0 || idx >= len(matches) {
+				return
+			}
+			send(matches[idx].Key) // erst Ergebnis liefern...
+			if dlg != nil {
+				dlg.Hide() // ...dann schließen (ein evtl. Cancel-Callback wird durch once ignoriert)
+			}
+		}
+
+		listBox := container.NewVBox()
+		for i, m := range matches {
+			row := newCRMRow(i, crmTypeIcon(m.Type), crmMatchLabel(m), selectRow, choose)
+			rows = append(rows, row)
+			listBox.Add(row)
+		}
+		selectRow(0) // Vorauswahl: erster Treffer
+
+		info := widget.NewLabel(fmt.Sprintf("Zu Rufnummer %s wurden %d CRM-Kunden gefunden.\nEinen Kunden anklicken und „Übernehmen“ – oder per Doppelklick direkt wählen:", number, len(matches)))
+		info.Wrapping = fyne.TextWrapWord
+
+		scroll := container.NewVScroll(listBox)
+		scroll.SetMinSize(fyne.NewSize(520, 300))
+		content := container.NewBorder(info, nil, nil, nil, scroll)
+
+		dlg = dialog.NewCustomConfirm("CRM-Kunde auswählen", "Übernehmen", "Abbrechen", content, func(ok bool) {
+			if !ok || selected < 0 || selected >= len(matches) {
+				send("")
+				return
+			}
+			send(matches[selected].Key)
+		}, mainWin)
+		dlg.Show()
+	})
+	return <-ch
+}
+
+// applyCRM übernimmt die (ggf. ausgewählte) CRM: setzt den CRM-Status explizit
+// (unabhängig von customerEntry.OnChanged), zeigt sie im CRM Feld
+// und stößt automatisch die Ticketsuche an – mit erkanntem Text, oder (bei
+// leerem Textfenster) alle offenen Tickets zur CRM. Aus Goroutine-Kontext
+// aufrufen (nutzt fyne.Do).
+func applyCRM(number, crm string) {
+	Log(fmt.Sprintf("Rufnummern-Webhook: Rufnummer %q -> CRM %s", number, crm))
+	setCurrentCRM(crm)
+	setCustomerField(crm)
+	fyne.Do(func() {
+		if searchMatchingTickets != nil && outputArea != nil {
+			searchMatchingTickets(outputArea.Text, nil, true, true)
+		}
+	})
 }
 
 // setCustomerField setzt den Text des Felds "erkannter Kunde" thread-sicher
@@ -268,4 +581,37 @@ func setCustomerField(text string) {
 		return
 	}
 	fyne.Do(func() { customerEntry.SetText(text) })
+}
+
+// prettyJSON gibt s eingerückt zurück, wenn es gültiges JSON ist, sonst s
+// unverändert (bzw. "" bleibt "").
+func prettyJSON(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return s
+	}
+	var buf bytes.Buffer
+	if json.Indent(&buf, []byte(s), "", "  ") == nil {
+		return buf.String()
+	}
+	return s
+}
+
+// setCallerNumber zeigt die empfangene Rufnummer im Label zwischen Feld und
+// Start-Button an (thread-sicher über den Fyne-Main-Loop).
+func setCallerNumber(number string) {
+	callerNumMu.Lock()
+	lastCallerNumber = number
+	callerNumMu.Unlock()
+	if callerNumberLabel == nil {
+		return
+	}
+	fyne.Do(func() { callerNumberLabel.SetText("Anruf von: " + number) })
+}
+
+// getLastCallerNumber liefert die zuletzt empfangene Rufnummer (für den
+// Wiederhol-Button); leer, wenn noch kein Anruf einging.
+func getLastCallerNumber() string {
+	callerNumMu.Lock()
+	defer callerNumMu.Unlock()
+	return lastCallerNumber
 }

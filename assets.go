@@ -14,3 +14,13 @@ var nexusLogoPNG []byte
 //
 //go:embed assets/app_icon.png
 var appIconPNG []byte
+
+// orgSymbolPNG / personSymbolPNG sind die Typ-Symbole des CRM-Auswahl-Popups
+// (Organisation bzw. Person), fest eingebettet - die App bleibt eigenstaendig,
+// kein externer "symbole"-Ordner noetig.
+//
+//go:embed assets/organisation.png
+var orgSymbolPNG []byte
+
+//go:embed assets/person.png
+var personSymbolPNG []byte

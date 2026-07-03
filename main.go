@@ -844,23 +844,29 @@ func applyTheme(a fyne.App, mode string) {
 // =========================================
 
 var (
-	outputArea    *widget.Entry
-	statusLabel   *widget.Label
-	engineInfo    *widget.Label
-	progressBar   *widget.ProgressBar
-	micBtn        *tooltipButton
-	customerEntry *MinSizeEntry // Feld "erkannter Kunde"; per Rufnummern-Webhook befuellbar
-	lastSoundTime atomic.Value // *time.Time, atomar für Zugriff aus Goroutines
-	isSilent      atomic.Bool
-	isRecording   atomic.Bool
+	outputArea        *widget.Entry
+	statusLabel       *widget.Label
+	engineInfo        *widget.Label
+	progressBar       *widget.ProgressBar
+	micBtn            *tooltipButton
+	customerEntry     *MinSizeEntry // CRM Feld; per Rufnummern-Webhook befuellt
+	callerNumberLabel *widget.Label // zeigt die per Webhook empfangene Rufnummer (zwischen Feld und Start-Button)
+	mainWin           fyne.Window   // Hauptfenster, u.a. fuer Dialoge aus webhook.go
+	lastSoundTime     atomic.Value  // *time.Time, atomar für Zugriff aus Goroutines
+	isSilent          atomic.Bool
+	isRecording       atomic.Bool
 
 	// Ticket-Suche ("Suche passende Tickets" + Auto-Scan). searchMatchingTickets
 	// wird in main() nach buildKISupportPanel zugewiesen (paketweit, damit auch
 	// toggleRecording/startAutoScan darauf zugreifen). autoScanCancel stoppt den
 	// laufenden Zyklus, autoScanBusy schuetzt vor ueberlappenden Auto-Suchen.
-	searchMatchingTickets func(recognizedText string, trigger *widget.Button, auto bool)
-	autoScanCancel        context.CancelFunc
-	autoScanBusy          atomic.Bool
+	searchMatchingTickets func(recognizedText string, trigger *widget.Button, auto bool, crmFallback bool)
+	// clearTicketResults leert die Ergebnis-/Ticketliste im KI-Support-Panel.
+	// Wird in main() nach buildKISupportPanel zugewiesen und u.a. aufgerufen, wenn
+	// der Inhalt des CRM-Felds geaendert wird.
+	clearTicketResults func()
+	autoScanCancel     context.CancelFunc
+	autoScanBusy       atomic.Bool
 	currentText           strings.Builder
 	lastSpeaker           string // zuletzt ins Transkript geschriebener Sprecher; nur in fyne.Do-Callbacks
 	// Whisper+LLM: aktueller, noch nicht korrigierter Rohblock (live angezeigt,
@@ -945,7 +951,7 @@ type AppConfig struct {
 	Ollama BackendCfg `json:"ollama"`
 	Vllm   BackendCfg `json:"vllm"`
 
-	// Jarvis-Support-API (Kundenverwaltung, siehe jarvis_api.md). ApiKey/Url
+	// Jarvis-Support-API (Kundenverwaltung, Doku siehe /support-api am Jarvis-Host). ApiKey/Url
 	// bewusst nur in config.json, nicht im Quellcode hinterlegt.
 	Jarvis     BackendCfg `json:"jarvis"`
 	JarvisLang string     `json:"jarvisLang"` // "de" oder "en"
@@ -979,10 +985,27 @@ type AppConfig struct {
 	AutoScanEnabled  bool `json:"autoScanEnabled"`
 	AutoScanInterval int  `json:"autoScanInterval"`
 
+	// AutoRecordOnCall: bei eingehendem Anruf (Rufnummern-Webhook) automatisch die
+	// Mitschrift starten (sofern nicht bereits eine läuft). Checkbox in
+	// "Einstellungen" unter "Suche nach passenden Tickets".
+	AutoRecordOnCall bool `json:"autoRecordOnCall"`
+
+	// AutoSearchCaller: bei eingehendem Anruf automatisch die CRM-Suche zur
+	// Rufnummer starten (Default true). Ist sie aus, wird nur die Rufnummer
+	// angezeigt; die Suche lässt sich dann per Wiederhol-Button manuell auslösen.
+	// Achtung: Default true wirkt nur, weil LoadConfig die Defaults VOR dem
+	// Unmarshal setzt (fehlender Key bleibt true).
+	AutoSearchCaller bool `json:"autoSearchCaller"`
+
+	// CallerTakeFirstMatch: liefert die Rufnummernsuche mehrere CRM-Treffer,
+	// wird bei true still der erste genommen; bei false (Default) erscheint das
+	// Auswahl-Popup.
+	CallerTakeFirstMatch bool `json:"callerTakeFirstMatch"`
+
 	// Rufnummern-Übergabe (Abschnitt "Rufnummern Übergabe" in Einstellungen):
 	// eingehender HTTP-Webhook, über den ein externer Trigger (z.B. Telefon-
 	// anlage) die Rufnummer eines Anrufers übergibt. Die App sucht damit in Jira
-	// und trägt den Issue-Key des Top-Treffers ins Feld "erkannter Kunde" ein.
+	// und trägt den Issue-Key des Top-Treffers ins CRM Feld ein.
 	// Server lauscht auf 0.0.0.0:<Port><Pfad>. Siehe webhook.go.
 	WebhookEnabled bool   `json:"webhookEnabled"`
 	WebhookPath    string `json:"webhookPath"` // URL-Pfad, Default "/rufnummer"
@@ -1061,6 +1084,8 @@ func LoadConfig(a fyne.App) {
 		JarvisTicketSearchPrompt: defaultTicketSearchPrompt,
 		AutoScanEnabled:          false,
 		AutoScanInterval:         10,
+		AutoRecordOnCall:         false,
+		AutoSearchCaller:         true,
 		WebhookEnabled:           false,
 		WebhookPath:              "/rufnummer",
 		WebhookPort:              5555,
@@ -1291,6 +1316,26 @@ func debugPreviewAndConfirm(win fyne.Window, title, payload string, proceed func
 	}, win)
 }
 
+// showDebugResponse zeigt – nur bei aktivem Debug-Modus (config.DebugMode) –
+// eine Serverantwort in einem scrollbaren, markier-/kopierbaren Popup. Gegen-
+// stück zu debugPreviewAndConfirm (das die Anfrage VOR dem Senden zeigt).
+func showDebugResponse(title, payload string) {
+	if !config.DebugMode {
+		return
+	}
+	body := widget.NewMultiLineEntry()
+	body.SetText(payload)
+	body.Wrapping = fyne.TextWrapWord
+	body.OnChanged = func(s string) {
+		if s != payload {
+			body.SetText(payload) // nur lesbar, aber markier-/kopierbar
+		}
+	}
+	scroll := container.NewScroll(body)
+	scroll.SetMinSize(fyne.NewSize(560, 320))
+	dialog.ShowCustom(title, "OK", scroll, mainWin)
+}
+
 // contains prüft, ob s in slice enthalten ist.
 func contains(slice []string, s string) bool {
 	for _, v := range slice {
@@ -1378,6 +1423,7 @@ func main() {
 	applyTheme(myApp, config.Theme)
 
 	win := myApp.NewWindow("")
+	mainWin = win // paketweiter Zugriff (z.B. Debug-Popup des Rufnummern-Webhooks)
 	win.SetMaster()
 	win.SetIcon(opaqueWindowIcon(appIcon)) // Fenster-Icon (oben links) deckend statt transparent
 	updateWindowTitle(win)
@@ -1453,8 +1499,8 @@ func main() {
 
 	// Pulse Animation - entfernt: nutzlos und erzeugt Data Race
 
-	micBtn = newTooltipButton(nil, toggleRecording, "Mitschnitt starten")
-	micBtn.SetText("Mitschnitt starten")
+	micBtn = newTooltipButton(nil, toggleRecording, "Mitschrift")
+	micBtn.SetText("Mitschrift")
 	micBtn.Importance = widget.HighImportance
 	micBtn.Disable()
 
@@ -1619,17 +1665,55 @@ func main() {
 		}
 	}
 
-	// Feld "erkannter Kunde" zwischen Statuszeile ("Bereit") und Start-Button.
-	// Wird per Rufnummern-Webhook (s. webhook.go) mit dem Jira-Issue-Key des zur
-	// eingehenden Rufnummer passenden Tickets befuellt. Default "CRM-10550".
+	// CRM Feld zwischen Statuszeile ("Bereit") und Start-Button.
+	// Wird per Rufnummern-Webhook (s. webhook.go) mit dem Jira-Issue-Key (CRM) des
+	// zur eingehenden Rufnummer passenden Tickets befuellt bzw. "nicht gefunden".
+	// Default "CRM-10550".
 	customerEntry = NewMinSizeEntry(160)
+	// currentCRM (webhook.go) spiegelt den validierten Feldinhalt: Die Ticketsuche
+	// ist freigeschaltet, sobald hier eine gültige CRM steht — egal ob per Webhook
+	// gesetzt oder manuell eingetippt. OnChanged VOR SetText, damit der Default
+	// "CRM-10550" den Status gleich mitsetzt (SetText löst OnChanged aus).
+	customerEntry.Entry.OnChanged = func(s string) {
+		setCurrentCRM(validCRM(s))
+		// Feldinhalt geändert -> die bisherige Ticketliste gehört zu einer anderen
+		// CRM und wird geleert. Beim Webhook-Treffer folgt unmittelbar eine neue
+		// Suche, die die Liste wieder füllt; bei manueller Änderung bleibt sie leer.
+		// (nil bis buildKISupportPanel gebaut ist, s.u. — Default-SetText ist dann
+		// noch ein No-op.)
+		if clearTicketResults != nil {
+			clearTicketResults()
+		}
+	}
 	customerEntry.SetText("CRM-10550")
-	customerRow := container.NewHBox(widget.NewLabel("erkannter Kunde"), customerEntry)
+	setCurrentCRM(validCRM(customerEntry.Text)) // Startwert sicher setzen (nicht nur via OnChanged)
+	customerRow := container.NewHBox(widget.NewLabel("CRM Feld"), customerEntry)
+
+	// Label zwischen Feld und Start-Button: zeigt die per Webhook empfangene
+	// Rufnummer des aktuellen Anrufers (leer, bis der erste Anruf eingeht).
+	callerNumberLabel = widget.NewLabel("")
+
+	// Wiederhol-Button: startet die CRM-Abfrage zur zuletzt empfangenen Rufnummer
+	// erneut (inkl. Auswahl-Popup bei mehreren Treffern). Nur Symbol + Mouseover-
+	// Tooltip. In einer Goroutine, da handleIncomingCaller fyne.Do nutzt und der
+	// Tap bereits im UI-Thread läuft.
+	repeatLookupBtn := newTooltipButton(theme.ViewRefreshIcon(), func() {
+		num := getLastCallerNumber()
+		if num == "" {
+			showInfo("Keine Rufnummer", "Es liegt noch keine Rufnummer eines Anrufs vor, die wiederholt werden könnte.", mainWin)
+			return
+		}
+		go handleIncomingCaller(num, false)
+	}, "CRM-Abfrage zur Rufnummer wiederholen")
+
+	// Mindestens 20 px Abstand zwischen Wiederhol-Button und Start-Button.
+	btnGap := canvas.NewRectangle(color.Transparent)
+	btnGap.SetMinSize(fyne.NewSize(20, 0))
 
 	statusAndStart := container.NewBorder(
 		nil, nil,
 		statusLabel,
-		micBtn, // reiner Text-Button (kein Symbol), rot wie "Suchen"
+		container.NewHBox(callerNumberLabel, repeatLookupBtn, btnGap, micBtn), // Rufnummer-Label, Wiederhol-Button, Abstand, Start-Button
 		customerRow,
 	)
 
@@ -1797,7 +1881,8 @@ func main() {
 	var ticketSearchBtn *widget.Button
 	ticketSearchBtn = widget.NewButtonWithIcon("Suche passende Tickets", theme.SearchIcon(), func() {
 		if searchMatchingTickets != nil {
-			searchMatchingTickets(outputArea.Text, ticketSearchBtn, false)
+			// crmFallback=true: bei leerem Textfenster offene Tickets zur CRM suchen.
+			searchMatchingTickets(outputArea.Text, ticketSearchBtn, false, true)
 		}
 	})
 
@@ -2207,8 +2292,9 @@ func main() {
 	// KI-Support: zweite Haelfte NUR des STT-Tabs, Anbindung an die Jarvis-Support-API.
 	// searchMatchingTickets (oben vorwaerts deklariert) wird hier zugewiesen und
 	// vom Button "Suche passende Tickets" im Diktat-Panel genutzt.
-	kiSupportTab, searchMatchingTicketsFn := buildKISupportPanel(win)
+	kiSupportTab, searchMatchingTicketsFn, clearTicketResultsFn := buildKISupportPanel(win)
 	searchMatchingTickets = searchMatchingTicketsFn
+	clearTicketResults = clearTicketResultsFn
 
 	// "Prompt für Suchen" (config.JarvisSearchQuery): LLM-Anweisung, die bei
 	// jeder Suche im "prompt"-Feld mitgeschickt wird - bewusst OHNE Verbindung
@@ -2272,6 +2358,44 @@ func main() {
 	autoScanCheckRow := container.New(&alignedFormLayout{}, widget.NewLabel("Automatische Ticketsuche"), autoScanCheck)
 	autoScanIntervalRow := container.New(&alignedFormLayout{}, autoScanIntervalLabel, autoScanSlider)
 
+	// "Anrufer automatisch suchen": bei eingehendem Anruf automatisch die CRM-
+	// Suche zur Rufnummer starten (Default an). Reiner Konfig-Schalter (Wirkung in
+	// handleIncomingCaller, webhook.go); kein Sofort-Effekt beim Umschalten.
+	autoSearchCheck := widget.NewCheck("aktiviert", func(b bool) {
+		config.AutoSearchCaller = b
+		saveConfigDebounced()
+	})
+	autoSearchCheck.SetChecked(config.AutoSearchCaller)
+	autoSearchCheckRow := container.New(&alignedFormLayout{}, widget.NewLabel("Anrufer automatisch suchen"), autoSearchCheck)
+
+	// "Mitschrift bei Anruf starten": startet bei eingehendem Anruf (Webhook)
+	// automatisch die Aufnahme. Reiner Konfig-Schalter (Wirkung in
+	// maybeAutoStartRecording, webhook.go); kein Sofort-Effekt beim Umschalten.
+	autoRecordCheck := widget.NewCheck("aktiviert", func(b bool) {
+		config.AutoRecordOnCall = b
+		saveConfigDebounced()
+	})
+	autoRecordCheck.SetChecked(config.AutoRecordOnCall)
+	autoRecordCheckRow := container.New(&alignedFormLayout{}, widget.NewLabel("Mitschrift bei Anruf starten"), autoRecordCheck)
+
+	// "Mehrere CRM-Treffer": Verhalten, wenn die Rufnummernsuche >1 Treffer
+	// liefert - Auswahl-Popup zeigen (Default) oder still den ersten nehmen.
+	// Wirkung in performCallerJiraLookup (webhook.go).
+	const (
+		crmChoiceShow  = "Auswahl anzeigen"
+		crmChoiceFirst = "ersten Treffer nehmen"
+	)
+	callerMatchSelect := widget.NewSelect([]string{crmChoiceShow, crmChoiceFirst}, func(s string) {
+		config.CallerTakeFirstMatch = s == crmChoiceFirst
+		saveConfigDebounced()
+	})
+	if config.CallerTakeFirstMatch {
+		callerMatchSelect.SetSelected(crmChoiceFirst)
+	} else {
+		callerMatchSelect.SetSelected(crmChoiceShow)
+	}
+	callerMatchRow := container.New(&alignedFormLayout{}, widget.NewLabel("Mehrere CRM-Treffer"), framedSelect(callerMatchSelect))
+
 	// --- Rufnummern Übergabe (eingehender Webhook, s. webhook.go) ---
 	// Aktiv-Checkbox startet/stoppt den Listener sofort; Port/Pfad werden beim
 	// manuellen Speichern (saveBtn) übernommen (restartWebhookServer).
@@ -2300,11 +2424,18 @@ func main() {
 
 	webhookHelpBtn := widget.NewButtonWithIcon("", theme.QuestionIcon(), func() {
 		showInfo("Rufnummern-Übergabe (Webhook)",
-			"Ein externer Trigger (z.B. die Telefonanlage) übergibt beim eingehenden Anruf die Rufnummer an diese App. Damit wird in Jira gesucht und der Issue-Key des besten Treffers ins Feld \"erkannter Kunde\" eingetragen.\n\n"+
+			"Ein externer Trigger (z.B. die Telefonanlage) übergibt beim eingehenden Anruf die Rufnummer an diese App. Damit wird in Jira gesucht und der Issue-Key des besten Treffers ins CRM Feld eingetragen.\n\n"+
 				fmt.Sprintf("Der Server lauscht auf ALLEN Netzwerk-Adressen:\n    http://<Rechner-IP>:%d%s\n\n", effectiveWebhookPort(), effectiveWebhookPath())+
 				"Rufnummer übergeben – zwei Wege:\n"+
-				"• GET:   ...?number=+491701234567\n"+
-				"• POST:  JSON {\"number\":\"+491701234567\"} (Content-Type application/json) oder Formularfeld 'number'.\n\n"+
+				"• GET:   Rufnummer als Query-Parameter anhängen.\n"+
+				"• POST:  JSON-Body {\"number\":\"...\"} (Content-Type application/json) oder als Formularfeld.\n\n"+
+				"Akzeptierte Parameter-/Feldnamen (Groß-/Kleinschreibung beachten):\n"+
+				"    number, num, nummer, phone, tel, telefon, caller, callerid, rufnummer\n\n"+
+				"Ein führendes \"+\" (z.B. +49...) bleibt erhalten.\n\n"+
+				"Beispiel (GET):\n"+
+				fmt.Sprintf("    http://%s:%d%s?nummer=+492056261551\n\n", getLocalIPHint(), effectiveWebhookPort(), effectiveWebhookPath())+
+				"Beispiel (POST):\n"+
+				fmt.Sprintf("    curl -X POST -H \"Content-Type: application/json\" \\\n         -d '{\"nummer\":\"+492056261551\"}' \\\n         http://%s:%d%s\n\n", getLocalIPHint(), effectiveWebhookPort(), effectiveWebhookPath())+
 				"Änderungen an Port/Pfad werden mit \"Einstellungen jetzt speichern\" übernommen.", win)
 	})
 	webhookHelpBtn.Importance = widget.LowImportance
@@ -2334,6 +2465,9 @@ func main() {
 		// Reihenfolge: Ueberschrift, Prompt, Checkbox-Zeile, Intervall-Slider.
 		widget.NewLabel(""), // Leerzeile vor der Ueberschrift
 		widget.NewLabelWithStyle("Suche nach passenden Tickets", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		autoSearchCheckRow,
+		autoRecordCheckRow,
+		callerMatchRow,
 		container.New(&alignedFormLayout{},
 			widget.NewLabel("Prompt für passende Tickets:"), jarvisTicketSearchPromptEntry,
 		),
@@ -2496,7 +2630,8 @@ func startAutoScan() {
 				}
 				fyne.Do(func() {
 					if searchMatchingTickets != nil {
-						searchMatchingTickets(outputArea.Text, nil, true)
+						// Zyklischer Scan: kein CRM-Fallback (leeren Text still überspringen).
+						searchMatchingTickets(outputArea.Text, nil, true, false)
 					}
 				})
 			}
@@ -2523,8 +2658,8 @@ func toggleRecording() {
 		pendingSpeaker = ""
 		inProgress = nil
 		isRecording.Store(true)
-		micBtn.SetText("Mitschnitt stoppen")
-		micBtn.tip = "Mitschnitt stoppen"
+		micBtn.SetText("Mitschrift stoppen")
+		micBtn.tip = "Mitschrift stoppen"
 		micBtn.Importance = widget.DangerImportance
 		statusLabel.SetText("Höre zu...")
 		startAutoScan() // zyklischen Ticket-Scan starten (No-op, wenn deaktiviert)
@@ -2536,8 +2671,8 @@ func toggleRecording() {
 		}
 		statusLabel.SetText("Bereit")
 		isRecording.Store(false)
-		micBtn.SetText("Mitschnitt starten")
-		micBtn.tip = "Mitschnitt starten"
+		micBtn.SetText("Mitschrift")
+		micBtn.tip = "Mitschrift"
 		micBtn.Importance = widget.HighImportance
 	}
 	micBtn.Refresh()

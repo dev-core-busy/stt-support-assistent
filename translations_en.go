@@ -110,6 +110,7 @@ var enOverrides = map[string]string{
 	"Kundenv.: %d Tickets zu %s": "Cust. mgmt: %d tickets for %s",
 	"Kundenv.: %d Tickets":       "Cust. mgmt: %d tickets",
 	"Kundenv.: Fehler":           "Cust. mgmt: error",
+	"Fasse das folgende Support-Ticket in höchstens %d Zeilen zusammen. Antworte nur mit der Zusammenfassung.": "Summarize the following support ticket in at most %d lines. Reply with the summary only.",
 	"IBS: Antwort ist kein gültiges JSON: %v":      "IBS: response is not valid JSON: %v",
 	"IBS-Server nicht erreichbar (%s): %v":         "IBS server unreachable (%s): %v",
 	"IBS-Server meldet HTTP %d":                    "IBS server returned HTTP %d",

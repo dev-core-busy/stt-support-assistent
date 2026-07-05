@@ -6,9 +6,11 @@ package main
 // kundenverwaltung.jar, Basis-URL + API-Key in den Einstellungen, Felder
 // "URL Kundenverwaltung API" / "API-Key Kundenverwaltung"):
 //
-//   POST /va/ad/getByNumber        {"from_number": "<nr>"}  -> address[] (name, full-address, ...)
+//   POST /va/ad/getByNumber        {"from_number": "<nr>"}  -> addresses[] (address_id, name, ...)
 //   POST /va/ev/getEvents          {"event":"getEvents","request":{"address_id":"<id>"}}
-//                                  -> event[] (id, creation_time, state, "dispatch user", text)
+//                                  -> event[] (id, creation_time, state, state_type,
+//                                     "dispatch user", text); state_type < 80 = offen,
+//                                     >= 80 = geschlossen (API-Update 2026-07-05)
 //
 // Optimierungen gegenueber der ersten (spezifikationslosen) Fassung:
 //   - Adresse kommt aus getByNumber (externalPhoneCall liefert keine Daten -
@@ -50,7 +52,9 @@ type ibsTicket struct {
 	Created string // event.creation_time
 	User    string // event."dispatch user" (zugewiesener Benutzer)
 	Text    string // event.text (Beschreibung)
-	Open    bool   // state != ENDED (Filter des Radios "offen"/"alle")
+	// Open steuert das Radio "offen"/"alle": state_type < 80 = offen,
+	// >= 80 = geschlossen; Rueckfall ohne state_type: state != ENDED.
+	Open bool
 }
 
 // ibsConfigured meldet, ob URL und API-Key der Kundenverwaltung hinterlegt
@@ -185,21 +189,18 @@ func ibsFieldString(m map[string]interface{}, keys ...string) string {
 // ibsAddressLookup sucht die Adresse zur Rufnummer via POST /va/ad/getByNumber
 // (Body laut Doku: {"from_number": "<nr>"}). Liefert die address_id fuer
 // getEvents sowie einen Anzeigenamen. Kein Treffer meldet der Server ohne
-// address[]-Array (Top-Level "name": "nothing found (unknown)") -> addrID "".
-//
-// ACHTUNG Doku-Luecke: das dokumentierte address[]-Schema (name, phone-normal,
-// phone-mobile, full-address) enthaelt KEIN ID-Feld, getEvents verlangt aber
-// eine address_id. Die ID wird daher tolerant gesucht (address_id/id/...);
-// fehlt sie tatsaechlich, gibt es eine klare Fehlermeldung + Rohantwort im Log.
+// Treffer-Array (Top-Level "name": "nothing found (unknown)") -> addrID "".
+// Seit dem API-Update heisst das Treffer-Array addresses[] und jeder Eintrag
+// traegt seine address_id direkt; aeltere Namen bleiben als Rueckfall.
 func ibsAddressLookup(number string) (addrID, addrLabel, raw string, err error) {
 	v, raw, err := ibsPostJSON("/va/ad/getByNumber", map[string]string{"from_number": number})
 	if err != nil {
 		return "", "", raw, err
 	}
 
-	// address[] ist das Treffer-Array; fehlt es (oder ist leer), gab es keinen
-	// Treffer. Mehrere Adressen zur Nummer: erste nehmen (geloggt).
-	addresses, _ := ibsFindValue(v, "address", "addresses", "adresse").([]interface{})
+	// addresses[] ist das Treffer-Array; fehlt es (oder ist leer), gab es
+	// keinen Treffer. Mehrere Adressen zur Nummer: erste nehmen (geloggt).
+	addresses, _ := ibsFindValue(v, "addresses", "address", "adresse").([]interface{})
 	if len(addresses) == 0 {
 		return "", "", raw, nil
 	}
@@ -283,7 +284,19 @@ func ibsEventTickets(events []interface{}) []ibsTicket {
 			User:    ibsFieldString(m, "dispatchuser", "user", "assignee"),
 			Text:    ibsFieldString(m, "text", "description", "beschreibung", "note", "message"),
 		}
-		t.Open = !strings.EqualFold(strings.TrimSpace(t.Status), "ENDED")
+		// Offen/geschlossen: massgeblich ist state_type (< 80 offen, >= 80
+		// geschlossen). Fehlt das Feld oder ist es nicht numerisch, entscheidet
+		// der Status-NAME (abgeschlossen/geschlossen/ENDED/... = zu) - der
+		// Server liefert inzwischen deutsche Namen wie "abgeschlossen
+		// (berechnet)", das alte "state != ENDED" reichte nicht mehr.
+		t.Open = !ibsClosedByName(t.Status)
+		if st := ibsFieldString(m, "statetype", "statetyp"); st != "" {
+			if n, ok := ibsLeadingNumber(st); ok {
+				t.Open = n < 80
+			} else {
+				Log("IBS: state_type nicht numerisch (" + st + ") - Status-Name entscheidet")
+			}
+		}
 		if t.Key == "" && t.Text == "" {
 			if j, err := json.Marshal(m); err == nil {
 				t.Text = string(j)
@@ -292,6 +305,36 @@ func ibsEventTickets(events []interface{}) []ibsTicket {
 		out = append(out, t)
 	}
 	return out
+}
+
+// ibsClosedByName meldet, ob ein Status-Name ein geschlossenes Event
+// beschreibt (Rueckfall, wenn state_type fehlt/unlesbar ist).
+func ibsClosedByName(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(status))
+	for _, m := range []string{"abgeschlossen", "geschlossen", "ended", "closed", "erledigt", "storniert", "abgebrochen"} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// ibsLeadingNumber liest eine Zahl aus s - komplett ("91") oder als fuehrende
+// Ziffernfolge ("91 (abgeschlossen)"), tolerant gegen angehaengten Text.
+func ibsLeadingNumber(s string) (float64, bool) {
+	s = strings.TrimSpace(s)
+	if n, err := strconv.ParseFloat(s, 64); err == nil {
+		return n, true
+	}
+	end := 0
+	for end < len(s) && (s[end] >= '0' && s[end] <= '9') {
+		end++
+	}
+	if end == 0 {
+		return 0, false
+	}
+	n, err := strconv.ParseFloat(s[:end], 64)
+	return n, err == nil
 }
 
 // ibsRequestPreview ist der Text des Debug-Popups vor dem Versand (analog

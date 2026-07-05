@@ -1,6 +1,6 @@
 # stt-support-assistent
 
-**Version 0.8.7**
+**Version 0.8.8**
 
 Portable Speech-to-Text-Anwendung (Windows) mit lokaler KI-gestützter
 Textkorrektur/-analyse und angebundenem KI-Support (Jarvis). Geschrieben in Go

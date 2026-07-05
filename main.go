@@ -964,14 +964,22 @@ type AppConfig struct {
 	IBS BackendCfg `json:"ibs"`
 
 	// Zuletzt genutzte Filter/Optionen im KI-Support-Panel (STT-Tab).
-	JarvisRAG              bool `json:"jarvisRAG"`
-	JarvisIBS              bool `json:"jarvisIBS"`
-	JarvisJira             bool `json:"jarvisJira"`
-	JarvisOpenOnly         bool `json:"jarvisOpenOnly"`
-	JarvisConfluence       bool `json:"jarvisConfluence"`
-	JarvisAISummary        bool `json:"jarvisAISummary"`
-	JarvisJiraLimit        int  `json:"jarvisJiraLimit"`
-	JarvisIBSLimit         int  `json:"jarvisIBSLimit"` // max. angezeigte Kundenverwaltungs-Tickets
+	JarvisRAG        bool `json:"jarvisRAG"`
+	JarvisIBS        bool `json:"jarvisIBS"`
+	JarvisJira       bool `json:"jarvisJira"`
+	JarvisOpenOnly   bool `json:"jarvisOpenOnly"`
+	JarvisConfluence bool `json:"jarvisConfluence"`
+	JarvisAISummary  bool `json:"jarvisAISummary"`
+	JarvisJiraLimit  int  `json:"jarvisJiraLimit"`
+	JarvisIBSLimit   int  `json:"jarvisIBSLimit"` // max. angezeigte Kundenverwaltungs-Tickets
+
+	// Zustand der Kopfzeile der Anruf-Ticketliste (Quellen-Haekchen "Jira"/
+	// "Kundenv.", Radio "offen"/"alle") - bleibt wie die Such-Checkboxen ueber
+	// Abfragen und Neustarts erhalten. Achtung: Default true wirkt nur, weil
+	// LoadConfig die Defaults VOR dem Unmarshal setzt (fehlender Key bleibt true).
+	JarvisCallShowJira     bool `json:"jarvisCallShowJira"`
+	JarvisCallShowIBS      bool `json:"jarvisCallShowIBS"`
+	JarvisCallOpenOnly     bool `json:"jarvisCallOpenOnly"`
 	JarvisSummaryLines     int  `json:"jarvisSummaryLines"`
 	JarvisAdvancedExpanded bool `json:"jarvisAdvancedExpanded"`
 
@@ -1089,6 +1097,9 @@ func LoadConfig(a fyne.App) {
 		JarvisAISummary:          true,
 		JarvisJiraLimit:          10,
 		JarvisIBSLimit:           10,
+		JarvisCallShowJira:       true,
+		JarvisCallShowIBS:        true,
+		JarvisCallOpenOnly:       true,
 		JarvisSummaryLines:       5,
 		JarvisAdvancedExpanded:   true,
 		JarvisTicketSearchPrompt: defaultTicketSearchPrompt,

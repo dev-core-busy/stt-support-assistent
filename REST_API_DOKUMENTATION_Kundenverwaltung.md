@@ -147,6 +147,7 @@ curl -X POST http://localhost:8080/va/ad/getByNumber \
 | `timestamp` | String | Server-Zeitstempel `DD.MM.YYYY HH:MM:SS (Wochentag)` |
 | `search_phone_number` | String | Die gesuchte Telefonnummer |
 | `address[]` | Array | Gefundene Adressdatensätze |
+| `address[].address_id` | String | Datenbank ID |
 | `address[].name` | String | Nachname |
 | `address[].phone-normal` | String | Festnetznummer |
 | `address[].phone-mobile` | String | Mobilnummer |
@@ -213,6 +214,7 @@ curl -X POST http://localhost:8080/va/ev/getOpenEvents \
     {
       "id": 1234,
       "creation_time": "03.07.2026 10:15:00",
+      "state_type": "0",
       "state": "NEU",
       "dispatch user": "r.meister",
       "text": "Rechnung für März nicht erhalten"
@@ -220,7 +222,8 @@ curl -X POST http://localhost:8080/va/ev/getOpenEvents \
     {
       "id": 1235,
       "creation_time": "04.07.2026 08:00:00",
-      "state": "IN_BEARBEITUNG",
+      "state_type": "60",
+      "state": "Befunde abwarten",
       "dispatch user": "",
       "text": "Software-Update angefragt"
     }
@@ -236,6 +239,7 @@ curl -X POST http://localhost:8080/va/ev/getOpenEvents \
 | `event[]` | Array | Liste der offenen Events |
 | `event[].id` | Integer | Lokale Event-ID (`localId`) |
 | `event[].creation_time` | String | Erstellungszeit |
+| `event[].state_type` | Integer | Status-Txpe aus `EVENT_STATE`-Enum |
 | `event[].state` | String | Status-Name aus `EVENT_STATE`-Enum |
 | `event[].dispatch user` | String | Zugewiesener Benutzer (Loginname) |
 | `event[].text` | String | Event-Beschreibungstext |

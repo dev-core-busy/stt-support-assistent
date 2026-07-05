@@ -573,6 +573,125 @@ func ticketSummaryControls(key string) (*widget.Button, *fyne.Container) {
 	return btn, holder
 }
 
+// ibsSummaryCache/ibsSummaryExpanded halten die KI-Zusammenfassungen der
+// IBS-Karten ueber Neu-Renderings der Anruf-Ticketliste hinweg. Die Liste
+// wird komplett neu aufgebaut, sobald das zweite Teil-Ergebnis (Jira/IBS)
+// eintrifft, das Anzeige-Limit wechselt oder der zyklische Ticket-Scan
+// rendert - OHNE Cache ersetzte das eine gerade geladene (oder eben
+// eingetroffene) Zusammenfassung durch eine frische, zugeklappte Karte:
+// "Antwort kommt, wird aber nicht angezeigt". Schluessel ist die Event-ID;
+// geleert wird beim naechsten Anruf bzw. beim Schliessen der Ansicht
+// (clearIBSTickets/closeCallView).
+var (
+	ibsSummaryCache    = map[string]string{}
+	ibsSummaryExpanded = map[string]bool{}
+)
+
+func clearIBSSummaryCache() {
+	ibsSummaryCache = map[string]string{}
+	ibsSummaryExpanded = map[string]bool{}
+}
+
+// ibsSummaryControls: das Pendant zu ticketSummaryControls fuer eine
+// Kundenverwaltungs-Karte (IBS) der Anruf-Ticketliste. Der Jarvis-Summarize-
+// Endpunkt arbeitet Jira-Key-basiert und kennt IBS-Events nicht - die
+// Zusammenfassung laeuft daher ueber das in den Einstellungen gewaehlte
+// Analyse-LLM (runAnalysisLogic: lokal e2b/12b oder remote) mit dem
+// Event-Text als Eingabe. Anders als bei Jira ERSETZT die Zusammenfassung
+// den Tickettext in der Karte (bodySlot zeigt entweder textBody oder die
+// Zusammenfassung); der zweite Klick stellt den Text wieder her.
+// Zeilenvorgabe aus config.JarvisSummaryLines. Eine bereits geladene,
+// aufgeklappte Zusammenfassung erscheint nach einem Neu-Rendern der Liste
+// sofort wieder (Cache s.o.).
+func ibsSummaryControls(tk ibsTicket, textBody fyne.CanvasObject, bodySlot *fyne.Container) *widget.Button {
+	cacheKey := tk.Key
+	if cacheKey == "" {
+		// Ohne Event-ID kein stabiler Schluessel: Text-Laenge+Erstellzeit als Behelf.
+		cacheKey = fmt.Sprintf("%s|%d", tk.Created, len(tk.Text))
+	}
+	showSummary := func(s string) {
+		if s == "" {
+			s = T("(keine Zusammenfassung erhalten)")
+		}
+		lbl := widget.NewLabel(s)
+		lbl.Wrapping = fyne.TextWrapWord
+		bodySlot.Objects = []fyne.CanvasObject{lbl}
+		bodySlot.Refresh()
+	}
+	restoreText := func() {
+		bodySlot.Objects = []fyne.CanvasObject{textBody}
+		bodySlot.Refresh()
+	}
+	// Beim (Neu-)Aufbau der Karte eine zuvor aufgeklappte Zusammenfassung
+	// direkt wieder anstelle des Textes zeigen.
+	if ibsSummaryExpanded[cacheKey] {
+		if sum, ok := ibsSummaryCache[cacheKey]; ok {
+			showSummary(sum)
+		} else {
+			ibsSummaryExpanded[cacheKey] = false // Laden wurde vom Neu-Rendern unterbrochen
+		}
+	}
+	var btn *widget.Button
+	btn = widget.NewButton(T("KI-Zusammenfassung"), func() {
+		if ibsSummaryExpanded[cacheKey] { // Zusammenfassung sichtbar -> Text zurueck
+			ibsSummaryExpanded[cacheKey] = false
+			restoreText()
+			return
+		}
+		ibsSummaryExpanded[cacheKey] = true
+		if sum, ok := ibsSummaryCache[cacheKey]; ok {
+			showSummary(sum)
+			return
+		}
+		loading := widget.NewLabel(T("KI-Zusammenfassung wird geladen …"))
+		bodySlot.Objects = []fyne.CanvasObject{loading}
+		bodySlot.Refresh()
+		btn.Disable()
+		lines := config.JarvisSummaryLines
+		if lines <= 0 {
+			lines = 5
+		}
+		prompt := fmt.Sprintf(T("Fasse das folgende Support-Ticket in höchstens %d Zeilen zusammen. Antworte nur mit der Zusammenfassung."), lines)
+		// Kontextzeile (ID/Datum/Bearbeiter/Status) + Beschreibungstext als
+		// Eingabe fuer die LLM.
+		var meta []string
+		if tk.Key != "" {
+			meta = append(meta, "#"+tk.Key)
+		}
+		if tk.Created != "" {
+			meta = append(meta, tk.Created)
+		}
+		if tk.User != "" {
+			meta = append(meta, tk.User)
+		}
+		if tk.Status != "" {
+			meta = append(meta, tk.Status)
+		}
+		text := strings.TrimSpace(strings.Join(meta, " · ") + "\n\n" + tk.Text)
+		Log(fmt.Sprintf("IBS KI-Zusammenfassung #%s: Anfrage an Analyse-LLM (%s, %d Zeichen Text)", tk.Key, config.AnalysisModel, len(text)))
+		go func() {
+			sum := strings.TrimSpace(runAnalysisLogic(text, prompt))
+			Log(fmt.Sprintf("IBS KI-Zusammenfassung #%s: %d Zeichen erhalten", tk.Key, len(sum)))
+			fyne.Do(func() {
+				btn.Enable()
+				// Fehlertexte ("Fehler: ...") bewusst NICHT cachen, damit ein
+				// erneuter Klick einen neuen Versuch startet.
+				if sum != "" && !strings.HasPrefix(sum, "Fehler") {
+					ibsSummaryCache[cacheKey] = sum
+				}
+				// runAnalysisLogic liefert Fehler als Text - direkt anzeigen.
+				// Wurde inzwischen zurueckgeschaltet, bleibt der Text stehen
+				// (der naechste Klick zeigt das gecachte Ergebnis sofort).
+				if ibsSummaryExpanded[cacheKey] {
+					showSummary(sum)
+				}
+			})
+		}()
+	})
+	btn.Importance = widget.HighImportance
+	return btn
+}
+
 // newFilterWrap gibt einem Filter-Entry eine feste Breite fuer die rechte
 // Seite eines Border-Layouts (dort bekaeme er sonst nur seine schmale
 // Minimalbreite). Eine Stelle fuer beide Filterfelder (Status-Zeile und
@@ -717,44 +836,57 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// das applyFilters des JEWEILS letzten Renderns zeigt. Zustand liegt
 	// sprachneutral in openOnlyTickets/showJiraSrc/showIBSSrc (Index/bool statt
 	// uebersetztem Anzeigetext).
+	// Radio- und Haekchen-Zustand kommt aus der Config und wird bei jeder
+	// Aenderung dort gespeichert - er bleibt damit (wie die Such-Checkboxen)
+	// ueber Abfragen und App-Neustarts erhalten.
 	var crmApplyFilters func()
-	openOnlyTickets := true
-	crmOpenRadio := trRadio([]string{"offen", "alle"}, 0, func(idx int) {
+	openOnlyTickets := config.JarvisCallOpenOnly
+	openIdx := 0
+	if !openOnlyTickets {
+		openIdx = 1
+	}
+	crmOpenRadio := trRadio([]string{"offen", "alle"}, openIdx, func(idx int) {
 		openOnlyTickets = idx == 0
+		if config.JarvisCallOpenOnly != openOnlyTickets {
+			config.JarvisCallOpenOnly = openOnlyTickets
+			saveConfigDebounced()
+		}
 		if crmApplyFilters != nil {
 			crmApplyFilters()
 		}
 	})
-	showJiraSrc, showIBSSrc := true, true
+	showJiraSrc, showIBSSrc := config.JarvisCallShowJira, config.JarvisCallShowIBS
 	crmJiraCheck := trCheck("Jira", func(b bool) {
 		showJiraSrc = b
+		if config.JarvisCallShowJira != b {
+			config.JarvisCallShowJira = b
+			saveConfigDebounced()
+		}
 		if crmApplyFilters != nil {
 			crmApplyFilters()
 		}
 	})
 	crmIBSCheck := trCheck("Kundenv.", func(b bool) {
 		showIBSSrc = b
+		if config.JarvisCallShowIBS != b {
+			config.JarvisCallShowIBS = b
+			saveConfigDebounced()
+		}
 		if crmApplyFilters != nil {
 			crmApplyFilters()
 		}
 	})
-	crmJiraCheck.SetChecked(true)
-	crmIBSCheck.SetChecked(true)
+	crmJiraCheck.SetChecked(showJiraSrc)
+	crmIBSCheck.SetChecked(showIBSSrc)
 	crmFilterEntry := widget.NewEntry()
 	trPlaceholder(crmFilterEntry, "Treffer filtern …")
-	// resetCallControls setzt die Kopfzeile auf die Defaults (Radio "offen",
-	// beide Quellen an, Filter leer). Laeuft beim Aufbau einer NEUEN
-	// Anruf-Ansicht - NICHT beim Nach-Rendern, wenn das jeweils zweite
-	// Ergebnis (Jira/Kundenverwaltung) eintrifft oder das Anzeige-Limit
-	// geaendert wird, sonst wuerde eine laufende Nutzer-Filterung verworfen
-	// (Steuerung ueber skipCallReset).
+	// resetCallControls setzt beim Aufbau einer NEUEN Anruf-Ansicht nur den
+	// Volltext-Filter zurueck; Radio und Quellen-Haekchen behalten ihren
+	// Zustand bewusst (s.o.). Nach-Renderings (zweites Ergebnis eingetroffen,
+	// Anzeige-Limit geaendert) ueberspringen auch das via skipCallReset,
+	// sonst wuerde eine laufende Nutzer-Filterung verworfen.
 	skipCallReset := false
 	resetCallControls := func() {
-		openOnlyTickets = true
-		crmOpenRadio.SetSelected(crmOpenRadio.Options[0])
-		showJiraSrc, showIBSSrc = true, true
-		crmJiraCheck.SetChecked(true)
-		crmIBSCheck.SetChecked(true)
 		crmFilterEntry.SetText("")
 	}
 
@@ -790,6 +922,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// ("alles sichtbar") wieder her.
 	closeCallView := func() {
 		ibsLast = nil
+		clearIBSSummaryCache()
 		clearResults()
 	}
 
@@ -895,7 +1028,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 					}
 				}
 				if srcVisible && (ql == "" || strings.Contains(c.text, ql)) && (!openOnly || c.open) {
-					if c.hlQuery != ql {
+					if c.snippet != nil && c.hlQuery != ql {
 						c.snippet.Segments = highlightedSegments(c.raw, ql)
 						c.snippet.Refresh()
 						c.hlQuery = ql
@@ -1096,33 +1229,30 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			statusBg := color.NRGBA{R: 0xEA, G: 0xEA, B: 0xEA, A: 255}
 			statusFg := color.NRGBA{R: 0x44, G: 0x44, B: 0x44, A: 255}
 			for _, tk := range ordered {
-				// Kopfzeile der Karte: #Event-ID · Erstellzeit · Bearbeiter
-				var parts []string
+				// Kopfzeile EINZEILIG: links nur die Event-Nummer "#nnnnnn"
+				// (Erstellzeit/Bearbeiter erscheinen bewusst nicht; die Nummer
+				// wird spaeter ein Link auf die API-Funktion "Event anzeigen" -
+				// Endpunkt folgt). Rechts IBS-/Status-Pill und
+				// "KI-Zusammenfassung". Darunter - wie bei den Jira-Karten -
+				// der Beschreibungstext (bodySlot); die KI-Zusammenfassung
+				// ERSETZT ihn beim Klick (zweiter Klick stellt ihn wieder her).
+				head := T("(ohne Titel)")
 				if tk.Key != "" {
-					parts = append(parts, "#"+tk.Key)
-				}
-				if tk.Created != "" {
-					parts = append(parts, tk.Created)
-				}
-				if tk.User != "" {
-					parts = append(parts, tk.User)
-				}
-				head := strings.Join(parts, " · ")
-				if head == "" {
-					head = T("(ohne Titel)")
+					head = "#" + tk.Key
 				}
 				titleLbl := widget.NewLabelWithStyle(head, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-				titleLbl.Wrapping = fyne.TextWrapWord
-				pills := []fyne.CanvasObject{kiPill("IBS", kiAccentSoft, kiAccent)}
+				right := []fyne.CanvasObject{kiPill("IBS", kiAccentSoft, kiAccent)}
 				if tk.Status != "" {
-					pills = append(pills, kiPill(tk.Status, statusBg, statusFg))
+					right = append(right, kiPill(tk.Status, statusBg, statusFg))
 				}
-				headerRow := container.NewBorder(nil, nil, nil, container.NewHBox(pills...), titleLbl)
-				// RichText wie bei den Jira-Karten: der Volltext-Filter markiert
-				// Fundstellen auch in Kundenverwaltungs-Karten.
 				snippet := widget.NewRichText(highlightedSegments(tk.Text, "")...)
 				snippet.Wrapping = fyne.TextWrapWord
-				card := kiCard(container.NewVBox(headerRow, snippet))
+				bodySlot := container.NewVBox(snippet)
+				if strings.TrimSpace(tk.Text) != "" {
+					right = append(right, ibsSummaryControls(tk, snippet, bodySlot))
+				}
+				headerRow := container.NewBorder(nil, nil, nil, container.NewHBox(right...), titleLbl)
+				card := kiCard(container.NewVBox(headerRow, bodySlot))
 				cards = append(cards, filterCard{
 					obj:     card,
 					text:    strings.ToLower(strings.Join([]string{tk.Key, tk.Created, tk.User, tk.Status, tk.Text}, " ")),
@@ -1148,6 +1278,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// noch eine Anruf-Ansicht des vorherigen Anrufs offen, verschwinden deren
 	// IBS-Karten (die Jira-Seite raeumt setCustomerField/clearResults ab).
 	clearIBSTickets = func() {
+		clearIBSSummaryCache()
 		if ibsLast == nil {
 			return
 		}

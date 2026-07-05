@@ -108,6 +108,48 @@ func trButtonIcon(de string, icon fyne.Resource, tapped func()) *widget.Button {
 	return b
 }
 
+// trRadio erzeugt eine horizontale RadioGroup mit übersetzten Optionen
+// (Pflichtauswahl, Start: defaultIdx) und hält die Beschriftung bei
+// Sprachwechsel aktuell. changed erhält den Options-INDEX - Logik hängt so
+// nie am (übersetzten) Anzeigetext.
+func trRadio(deOptions []string, defaultIdx int, changed func(idx int)) *widget.RadioGroup {
+	labels := func() []string {
+		out := make([]string, len(deOptions))
+		for i, o := range deOptions {
+			out[i] = T(o)
+		}
+		return out
+	}
+	var r *widget.RadioGroup
+	r = widget.NewRadioGroup(labels(), func(sel string) {
+		for i, o := range r.Options {
+			if o == sel {
+				if changed != nil {
+					changed(i)
+				}
+				return
+			}
+		}
+	})
+	r.Horizontal = true
+	r.Required = true // Abwählen (leere Auswahl) nicht möglich
+	r.SetSelected(r.Options[defaultIdx])
+	onLangChange(func() {
+		idx := -1
+		for i, o := range r.Options {
+			if o == r.Selected {
+				idx = i
+			}
+		}
+		r.Options = labels()
+		if idx >= 0 {
+			r.Selected = r.Options[idx]
+		}
+		r.Refresh()
+	})
+	return r
+}
+
 func trCheck(de string, changed func(bool)) *widget.Check {
 	c := widget.NewCheck(T(de), changed)
 	onLangChange(func() {

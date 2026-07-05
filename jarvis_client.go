@@ -40,6 +40,21 @@ import (
 var kiAccent = color.NRGBA{R: 0xB0, G: 0x1E, B: 0x2C, A: 255}
 var kiAccentSoft = color.NRGBA{R: 0xF6, G: 0xDF, B: 0xE1, A: 255}
 
+// refreshIBSCheck aktiviert/deaktiviert die Checkbox "IBS Tickets" im
+// KI-Support-Panel je nachdem, ob URL und API-Key der Kundenverwaltungs-API
+// (config.IBS) hinterlegt sind. Wird beim Bau des Panels gesetzt und von den
+// Einstellungs-Feldern in main.go bei jeder Änderung aufgerufen (nil-Guard dort).
+var refreshIBSCheck func()
+
+// showIBSTickets/clearIBSTickets bespielen den IBS-Ticketbereich oberhalb der
+// Ergebnisliste (Rufnummern-Webhook -> IBS-Kundenverwaltung, s. ibs_client.go).
+// Gesetzt beim Bau des Panels (buildKISupportPanel); Aufrufer laufen im
+// Fyne-Main-Thread (fyne.Do) und pruefen auf nil.
+var (
+	showIBSTickets  func(header string, tickets []ibsTicket, errMsg string)
+	clearIBSTickets func()
+)
+
 // jarvisHTTPClient: eigener Client mit deaktivierter TLS-Pruefung, da der
 // interne Jarvis-Server laut Doku (/support-api) ein selbstsigniertes Zertifikat
 // verwendet (curl-Beispiele dort nutzen "-k"). Timeout grosszuegig, da eine
@@ -659,6 +674,29 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// auch einem Sprachwechsel, ohne dass zuvor eine Suche laufen musste.
 	placeholderLbl := trLabel("Noch keine Suche durchgeführt.")
 	resultsBox := container.NewVBox(placeholderLbl)
+
+	// --- Gemeinsame Anruf-Ticketliste: Zustand Jira + Kundenverwaltung ---
+	// Jira-CRM-Suche und IBS-Abfrage laufen beim Anruf parallel; beide
+	// Ergebnisse landen in EINER Liste (renderResults, crmView). crmLast
+	// speichert die Jira-Seite des letzten CRM-Renderns, ibsLast die IBS-Seite
+	// - wer spaeter fertig wird, rendert die Liste komplett neu (skipCallReset
+	// laesst dabei die Kopfzeilen-Bedienelemente unangetastet).
+	// showIBSTickets/clearIBSTickets werden erst NACH renderResults zugewiesen
+	// (sie rendern darueber); der Zustand liegt hier, weil renderResults ihn liest.
+	type ibsState struct {
+		label   string // Anzeigename der gefundenen Adresse (bzw. Rufnummer)
+		tickets []ibsTicket
+		errMsg  string
+	}
+	type crmState struct {
+		query    string
+		res      *jarvisQueryResponse // nil: (noch) keine Jira-Daten, nur IBS
+		duration time.Duration
+		openKeys map[string]bool
+	}
+	var ibsLast *ibsState
+	var crmLast *crmState
+
 	resultsScroll := container.NewVScroll(resultsBox)
 	resultsBg := canvas.NewRectangle(color.White)
 	resultsArea := container.NewStack(resultsBg, resultsScroll)
@@ -670,21 +708,75 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// ueberall nil-geschuetzt aufrufen.
 	var setCRMListExpanded func(expanded bool)
 
-	// crmOpenCheck/crmFilterEntry: Checkbox "offene Tickets" und Volltext-Filter
-	// der CRM-Ticketliste. Sie leben DAUERHAFT in der Kopfzeile "Tickets zur CRM"
-	// (s.u. crmHeader) - renderResults verdrahtet sie bei jedem CRM-Rendern neu
-	// mit der dann aktuellen Kartenliste und setzt sie zurueck (Checkbox an,
-	// Filter leer). Dauerhafte Widgets -> trCheck/trPlaceholder sind hier ok
-	// (registrieren ihren Sprachwechsel-Callback nur einmal).
-	crmOpenCheck := trCheck("offene Tickets", nil)
+	// Kopfzeilen-Bedienelemente der Anruf-/CRM-Ticketliste (Kopfzeile "Tickets
+	// zur CRM", s.u. crmHeader): EIN Radio "offen"/"alle" fuer BEIDE Quellen
+	// (ersetzt die fruehere Checkbox "offene Tickets"), zwei Quellen-Haekchen
+	// "Jira"/"Kundenv." und der Volltext-Filter. Alles wirkt rein clientseitig
+	// auf die bereits geladenen Karten. renderResults verdrahtet den Filter bei
+	// jedem CRM-Rendern neu; Radio/Haekchen rufen crmApplyFilters auf, das auf
+	// das applyFilters des JEWEILS letzten Renderns zeigt. Zustand liegt
+	// sprachneutral in openOnlyTickets/showJiraSrc/showIBSSrc (Index/bool statt
+	// uebersetztem Anzeigetext).
+	var crmApplyFilters func()
+	openOnlyTickets := true
+	crmOpenRadio := trRadio([]string{"offen", "alle"}, 0, func(idx int) {
+		openOnlyTickets = idx == 0
+		if crmApplyFilters != nil {
+			crmApplyFilters()
+		}
+	})
+	showJiraSrc, showIBSSrc := true, true
+	crmJiraCheck := trCheck("Jira", func(b bool) {
+		showJiraSrc = b
+		if crmApplyFilters != nil {
+			crmApplyFilters()
+		}
+	})
+	crmIBSCheck := trCheck("Kundenv.", func(b bool) {
+		showIBSSrc = b
+		if crmApplyFilters != nil {
+			crmApplyFilters()
+		}
+	})
+	crmJiraCheck.SetChecked(true)
+	crmIBSCheck.SetChecked(true)
 	crmFilterEntry := widget.NewEntry()
 	trPlaceholder(crmFilterEntry, "Treffer filtern …")
+	// resetCallControls setzt die Kopfzeile auf die Defaults (Radio "offen",
+	// beide Quellen an, Filter leer). Laeuft beim Aufbau einer NEUEN
+	// Anruf-Ansicht - NICHT beim Nach-Rendern, wenn das jeweils zweite
+	// Ergebnis (Jira/Kundenverwaltung) eintrifft oder das Anzeige-Limit
+	// geaendert wird, sonst wuerde eine laufende Nutzer-Filterung verworfen
+	// (Steuerung ueber skipCallReset).
+	skipCallReset := false
+	resetCallControls := func() {
+		openOnlyTickets = true
+		crmOpenRadio.SetSelected(crmOpenRadio.Options[0])
+		showJiraSrc, showIBSSrc = true, true
+		crmJiraCheck.SetChecked(true)
+		crmIBSCheck.SetChecked(true)
+		crmFilterEntry.SetText("")
+	}
 
-	// clearResults leert die Ergebnis-/Ticketliste und zeigt wieder den
-	// Platzhalter. Wird u.a. aufgerufen, wenn der Inhalt des CRM-Felds manuell
-	// geaendert wird (die bisherige Ticketliste gehoert dann zu einer anderen
-	// CRM und ist ungueltig). Muss im Fyne-Main-Thread laufen.
+	// renderResults wird vorwaerts deklariert: clearResults (Jira-Seite
+	// verwerfen, IBS-Seite ggf. weiterzeigen) und die IBS-Hooks weiter unten
+	// rendern darueber.
+	var renderResults func(query string, res *jarvisQueryResponse, duration time.Duration, openKeys map[string]bool)
+
+	// clearResults verwirft die Jira-/Suchseite der Ergebnisliste. Wird u.a.
+	// aufgerufen, wenn der Inhalt des CRM-Felds wechselt (die bisherige
+	// Jira-Ticketliste gehoert dann zu einer anderen CRM und ist ungueltig).
+	// Die IBS-Seite gehoert dagegen zum AKTUELLEN Anruf (webhook.go leert sie
+	// bei jedem neuen Anruf ueber clearIBSTickets): liegen IBS-Tickets vor,
+	// bleibt die Anruf-Ansicht mit nur dieser Quelle offen - z.B. wenn zur
+	// Rufnummer zwar eine Kundenverwaltungs-Adresse, aber keine Jira-CRM
+	// gefunden wurde. Muss im Fyne-Main-Thread laufen.
 	clearResults := func() {
+		crmLast = nil
+		if ibsLast != nil {
+			renderResults(ibsLast.label, nil, 0, map[string]bool{})
+			return
+		}
 		if setCRMListExpanded != nil {
 			setCRMListExpanded(false)
 		}
@@ -693,21 +785,64 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		resultsBox.Refresh()
 	}
 
+	// closeCallView (✕-Button der Kopfzeile): schliesst die Anruf-Ansicht
+	// KOMPLETT - auch die IBS-Seite - und stellt die normale Suchansicht
+	// ("alles sichtbar") wieder her.
+	closeCallView := func() {
+		ibsLast = nil
+		clearResults()
+	}
+
 	// renderResults befuellt die Ergebnisliste. openKeys (nur CRM-Ticketliste,
 	// sonst nil) ist die Menge der Jira-Keys, die der Server als OFFEN gemeldet
 	// hat, und schaltet zugleich die CRM-Ansicht (crmView): Liste auf die
 	// komplette rechte Haelfte ausgedehnt, Score-/Ranking-Badge ausgeblendet
-	// (Relevanz-Prozent ergibt dort keinen Sinn), Checkbox "offene Tickets"
-	// (Start: an) blendet nicht-offene Tickets rein clientseitig aus/ein -
+	// (Relevanz-Prozent ergibt dort keinen Sinn), Radio "offen"/"alle"
+	// (Start: offen) blendet nicht-offene Tickets rein clientseitig aus/ein -
 	// KEINE neue Server-Anfrage beim Umschalten.
-	renderResults := func(query string, res *jarvisQueryResponse, duration time.Duration, openKeys map[string]bool) {
+	renderResults = func(query string, res *jarvisQueryResponse, duration time.Duration, openKeys map[string]bool) {
 		crmView := openKeys != nil
+		if crmView {
+			// Jira-Seite fuer Nach-Renderings merken (IBS-Ergebnis trifft ein,
+			// Anzeige-Limit geaendert, IBS-Seite geleert).
+			crmLast = &crmState{query: query, res: res, duration: duration, openKeys: openKeys}
+		} else {
+			crmLast = nil // normale Suche verlaesst die Anruf-Ansicht
+		}
+		// res == nil (nur Anruf-Ansicht): keine Jira-Daten - zur Rufnummer gab
+		// es (noch) keine CRM, angezeigt werden nur Kundenverwaltungs-Tickets.
+		noJira := res == nil
+		if noJira {
+			res = &jarvisQueryResponse{}
+		}
 		if setCRMListExpanded != nil {
 			setCRMListExpanded(crmView)
 		}
 		resultsBox.RemoveAll()
 
-		status := widget.NewLabel(fmt.Sprintf(T("Ergebnis für „%s“ (%d Treffer · %d ms)"), query, len(res.Blocks), duration.Milliseconds()))
+		// Status-Zeile: in der Anruf-Ansicht Treffer je Quelle (Jira /
+		// Kundenverwaltung samt gefundener Adresse), sonst wie gehabt.
+		var status *widget.Label
+		if crmView {
+			var segs []string
+			if !noJira {
+				segs = append(segs, fmt.Sprintf(T("Jira: %d Treffer"), len(res.Blocks)))
+			}
+			if ibsLast != nil {
+				switch {
+				case ibsLast.errMsg != "":
+					segs = append(segs, T("Kundenv.: Fehler"))
+				case ibsLast.label != "":
+					segs = append(segs, fmt.Sprintf(T("Kundenv.: %d Tickets zu %s"), len(ibsLast.tickets), ibsLast.label))
+				default:
+					segs = append(segs, fmt.Sprintf(T("Kundenv.: %d Tickets"), len(ibsLast.tickets)))
+				}
+			}
+			status = widget.NewLabel(strings.Join(segs, "  ·  "))
+			status.Wrapping = fyne.TextWrapWord
+		} else {
+			status = widget.NewLabel(fmt.Sprintf(T("Ergebnis für „%s“ (%d Treffer · %d ms)"), query, len(res.Blocks), duration.Milliseconds()))
+		}
 
 		// Volltext-Filter der bereits geladenen Treffer (rein clientseitig, KEINE
 		// neue Server-Anfrage und keine Verbindung zum Suchtext/Prompt). Jede
@@ -728,6 +863,9 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			snippet *widget.RichText
 			raw     string
 			hlQuery string
+			// src: "ibs" fuer Kundenverwaltungs-Karten, sonst Jira/Suche -
+			// Grundlage der Quellen-Haekchen "Jira"/"Kundenv." (nur Anruf-Ansicht).
+			src string
 		}
 		var cards []filterCard
 		// Volltext-Filter: in der CRM-Ansicht kommt der Filtertext aus dem
@@ -740,15 +878,23 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			filterEntry.SetPlaceHolder(T("Treffer filtern …"))
 			filterSrc = filterEntry
 		}
-		// applyFilters kombiniert Volltext-Filter und "offene Tickets"-Checkbox
-		// (Zustand direkt aus crmOpenCheck, nur CRM-Ansicht); beides rein
-		// clientseitig auf den bereits geladenen Karten.
+		// applyFilters kombiniert Volltext-Filter, Radio "offen"/"alle" und die
+		// Quellen-Haekchen "Jira"/"Kundenv." (Radio + Haekchen nur in der
+		// Anruf-Ansicht); alles rein clientseitig auf den geladenen Karten.
 		applyFilters := func() {
 			ql := strings.ToLower(strings.TrimSpace(filterSrc.Text))
-			openOnly := crmView && crmOpenCheck.Checked
+			openOnly := crmView && openOnlyTickets
 			for i := range cards {
 				c := &cards[i]
-				if (ql == "" || strings.Contains(c.text, ql)) && (!openOnly || c.open) {
+				srcVisible := !crmView
+				if !srcVisible {
+					if c.src == "ibs" {
+						srcVisible = showIBSSrc
+					} else {
+						srcVisible = showJiraSrc
+					}
+				}
+				if srcVisible && (ql == "" || strings.Contains(c.text, ql)) && (!openOnly || c.open) {
 					if c.hlQuery != ql {
 						c.snippet.Segments = highlightedSegments(c.raw, ql)
 						c.snippet.Refresh()
@@ -762,16 +908,21 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			resultsBox.Refresh()
 		}
 
-		// Filter-Widgets auf DIESE Kartenliste verdrahten. In der CRM-Ansicht
-		// sind das Checkbox + Filterfeld der Kopfzeile "Tickets zur CRM"; sie
-		// werden dabei zurueckgesetzt (Checkbox an, Filter leer). Die Zuweisung
-		// von OnChanged ersetzt die Closure des vorherigen Renderns; deren
-		// Karten sind bereits aus der Liste entfernt.
+		// Filter-Widgets auf DIESE Kartenliste verdrahten. In der Anruf-Ansicht
+		// sind das Radio/Quellen-Haekchen/Filterfeld der Kopfzeile "Tickets zur
+		// CRM" (via crmApplyFilters); die Zuweisung ersetzt die Closure des
+		// vorherigen Renderns, deren Karten bereits entfernt sind. Die
+		// Bedienelemente werden nur beim Aufbau einer NEUEN Anruf-Ansicht
+		// zurueckgesetzt - Nach-Renderings (zweites Ergebnis, Limit geaendert)
+		// setzen skipCallReset und lassen die Nutzer-Auswahl stehen.
+		// applyFilters laeuft am Ende dieses Renderns ohnehin einmal explizit.
 		if crmView {
-			crmOpenCheck.OnChanged = func(bool) { applyFilters() }
-			crmOpenCheck.SetChecked(true)
+			crmApplyFilters = applyFilters
 			crmFilterEntry.OnChanged = func(string) { applyFilters() }
-			crmFilterEntry.SetText("")
+			if !skipCallReset {
+				resetCallControls()
+			}
+			skipCallReset = false
 		} else {
 			filterEntry.OnChanged = func(string) { applyFilters() }
 		}
@@ -912,12 +1063,119 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			resultsBox.Add(card)
 		}
 
-		if len(res.Blocks) == 0 && strings.TrimSpace(res.AISummary) == "" {
+		// Kundenverwaltungs-Tickets (IBS) als Karten in DERSELBEN Liste (nur
+		// Anruf-Ansicht). Offene zuerst, dann beendete (innerhalb der Gruppen
+		// Server-Reihenfolge); das Anzeige-Limit config.JarvisIBSLimit
+		// ("Kundenverwaltung-Tickets" in den erweiterten Einstellungen) deckelt
+		// die Kartenzahl - die Status-Zeile oben nennt stets die Gesamtzahl.
+		if crmView && ibsLast != nil {
+			if ibsLast.errMsg != "" {
+				errText := canvas.NewText(T("Kundenverwaltung: ")+ibsLast.errMsg, kiAccent)
+				errText.TextStyle = fyne.TextStyle{Bold: true}
+				resultsBox.Add(errText)
+			}
+			ordered := make([]ibsTicket, 0, len(ibsLast.tickets))
+			for _, tk := range ibsLast.tickets {
+				if tk.Open {
+					ordered = append(ordered, tk)
+				}
+			}
+			for _, tk := range ibsLast.tickets {
+				if !tk.Open {
+					ordered = append(ordered, tk)
+				}
+			}
+			limit := config.JarvisIBSLimit
+			if limit <= 0 {
+				limit = 10
+			}
+			if len(ordered) > limit {
+				Log(fmt.Sprintf("IBS: Anzeige auf %d von %d Tickets begrenzt", limit, len(ordered)))
+				ordered = ordered[:limit]
+			}
+			statusBg := color.NRGBA{R: 0xEA, G: 0xEA, B: 0xEA, A: 255}
+			statusFg := color.NRGBA{R: 0x44, G: 0x44, B: 0x44, A: 255}
+			for _, tk := range ordered {
+				// Kopfzeile der Karte: #Event-ID · Erstellzeit · Bearbeiter
+				var parts []string
+				if tk.Key != "" {
+					parts = append(parts, "#"+tk.Key)
+				}
+				if tk.Created != "" {
+					parts = append(parts, tk.Created)
+				}
+				if tk.User != "" {
+					parts = append(parts, tk.User)
+				}
+				head := strings.Join(parts, " · ")
+				if head == "" {
+					head = T("(ohne Titel)")
+				}
+				titleLbl := widget.NewLabelWithStyle(head, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+				titleLbl.Wrapping = fyne.TextWrapWord
+				pills := []fyne.CanvasObject{kiPill("IBS", kiAccentSoft, kiAccent)}
+				if tk.Status != "" {
+					pills = append(pills, kiPill(tk.Status, statusBg, statusFg))
+				}
+				headerRow := container.NewBorder(nil, nil, nil, container.NewHBox(pills...), titleLbl)
+				// RichText wie bei den Jira-Karten: der Volltext-Filter markiert
+				// Fundstellen auch in Kundenverwaltungs-Karten.
+				snippet := widget.NewRichText(highlightedSegments(tk.Text, "")...)
+				snippet.Wrapping = fyne.TextWrapWord
+				card := kiCard(container.NewVBox(headerRow, snippet))
+				cards = append(cards, filterCard{
+					obj:     card,
+					text:    strings.ToLower(strings.Join([]string{tk.Key, tk.Created, tk.User, tk.Status, tk.Text}, " ")),
+					open:    tk.Open,
+					snippet: snippet,
+					raw:     tk.Text,
+					src:     "ibs",
+				})
+				resultsBox.Add(card)
+			}
+		}
+
+		if len(cards) == 0 && strings.TrimSpace(res.AISummary) == "" {
 			resultsBox.Add(widget.NewLabel(T("Keine Treffer.")))
 		}
 		// Anfangszustand der Filter anwenden (blendet in der CRM-Liste die
 		// nicht-offenen Tickets aus); ruft auch resultsBox.Refresh() auf.
 		applyFilters()
+	}
+
+	// Anzeige-Hooks der IBS-Abfrage (Aufruf aus ibs_client.go/webhook.go via
+	// fyne.Do). clearIBSTickets laeuft beim Start jedes NEUEN Anrufs: haengt
+	// noch eine Anruf-Ansicht des vorherigen Anrufs offen, verschwinden deren
+	// IBS-Karten (die Jira-Seite raeumt setCustomerField/clearResults ab).
+	clearIBSTickets = func() {
+		if ibsLast == nil {
+			return
+		}
+		ibsLast = nil
+		if crmLast == nil {
+			return
+		}
+		if crmLast.res == nil {
+			// Die Ansicht zeigte NUR IBS-Tickets: ohne sie bleibt nichts -
+			// komplett schliessen statt eine leere Liste zu zeigen.
+			clearResults()
+			return
+		}
+		skipCallReset = true
+		renderResults(crmLast.query, crmLast.res, crmLast.duration, crmLast.openKeys)
+	}
+	showIBSTickets = func(label string, tickets []ibsTicket, errMsg string) {
+		ibsLast = &ibsState{label: label, tickets: tickets, errMsg: errMsg}
+		if crmLast != nil {
+			// Jira-Seite steht schon: Anruf-Ansicht mit beiden Quellen neu
+			// rendern, Bedienelemente unangetastet lassen.
+			skipCallReset = true
+			renderResults(crmLast.query, crmLast.res, crmLast.duration, crmLast.openKeys)
+			return
+		}
+		// Noch keine Jira-Ticketliste (keine CRM gefunden oder Suche noch
+		// unterwegs): Anruf-Ansicht nur mit Kundenverwaltungs-Tickets oeffnen.
+		renderResults(label, nil, 0, map[string]bool{})
 	}
 
 	renderError := func(err error) {
@@ -969,6 +1227,26 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		saveConfigDebounced()
 	})
 	ragCheck.SetChecked(config.JarvisRAG)
+	// "IBS Tickets" (Kundenverwaltungs-API): nur klickbar, wenn in den
+	// Einstellungen URL und API-Key der Kundenverwaltung hinterlegt sind.
+	// Die eigentliche API-Abfrage wird später hinterlegt. refreshIBSCheck
+	// rufen die beiden Einstellungs-Felder (main.go) bei jeder Änderung auf.
+	ibsCheck := trCheck("IBS Tickets", func(b bool) {
+		config.JarvisIBS = b
+		saveConfigDebounced()
+	})
+	ibsCheck.SetChecked(config.JarvisIBS)
+	refreshIBSCheck = func() {
+		if strings.TrimSpace(config.IBS.Url) != "" && strings.TrimSpace(config.IBS.ApiKey) != "" {
+			ibsCheck.Enable()
+			return
+		}
+		if ibsCheck.Checked {
+			ibsCheck.SetChecked(false) // setzt via OnChanged auch config.JarvisIBS zurück
+		}
+		ibsCheck.Disable()
+	}
+	refreshIBSCheck()
 	aiCheck := trCheck("KI-Gesamtzusammenfassung", func(b bool) {
 		config.JarvisAISummary = b
 		saveConfigDebounced()
@@ -994,12 +1272,35 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		}
 	}
 
+	// Anzeige-Limit der Kundenverwaltungs-Tickets (IBS-Bereich). Eigene Zeile
+	// statt Eintrag im compactFormLayout oben: sie ist nur sichtbar, wenn die
+	// Kundenverwaltungs-API konfiguriert ist (s. refreshIBSCheck), und laesst
+	// sich als eigener Container sauber ein-/ausblenden.
+	ibsLimitEntry := widget.NewEntry()
+	ibsLimitEntry.SetText(strconv.Itoa(config.JarvisIBSLimit))
+	ibsLimitEntry.OnChanged = func(s string) {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+			config.JarvisIBSLimit = n
+			saveConfigDebounced()
+			// Limit wirkt sofort auf eine offene Anruf-Ansicht; die laufende
+			// Nutzer-Filterung bleibt stehen (skipCallReset).
+			if crmLast != nil {
+				skipCallReset = true
+				renderResults(crmLast.query, crmLast.res, crmLast.duration, crmLast.openKeys)
+			}
+		}
+	}
+	ibsLimitRow := container.New(&compactFormLayout{},
+		trLabel("Kundenverwaltung-Tickets:"), ibsLimitEntry,
+	)
+
 	advanced := container.NewVBox(
 		widget.NewSeparator(),
 		container.New(&compactFormLayout{},
 			trLabel("Jira-Limit:"), jiraLimitEntry,
 			trLabel("Summary-Zeilen:"), summaryLinesEntry,
 		),
+		ibsLimitRow,
 	)
 
 	// Hide()/Show() allein loest kein Neu-Layout des umgebenden VBox aus (Fyne
@@ -1088,7 +1389,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 
 	searchCardBox := container.NewVBox(
 		searchRow,
-		container.NewHBox(jiraCheck, openOnlyCheck, confluenceCheck, ragCheck),
+		container.NewHBox(jiraCheck, openOnlyCheck, confluenceCheck, ragCheck, ibsCheck),
 		aiCheck,
 		cardAdvSlot,
 		progress,
@@ -1106,15 +1407,40 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	)
 
 	// Kopfzeile der ausgedehnten CRM-Ticketliste: Titel links, rechts die
-	// Checkbox "offene Tickets", das Volltext-Filterfeld (beide dauerhaft, von
+	// Quellen-Haekchen/Radio "offen|alle", das Volltext-Filterfeld (dauerhaft, von
 	// renderResults pro Rendern neu verdrahtet, s.o.) und der ✕-Button. Der ✕
 	// schliesst die Liste komplett (clearResults klappt ueber setCRMListExpanded
 	// auch die Ansicht wieder ein, s.o.), wodurch der Suchbereich
 	// ("Portal Suche" + Such-Karte) wieder sichtbar wird.
-	crmCloseBtn := widget.NewButtonWithIcon("", theme.CancelIcon(), clearResults)
+	// ✕ schliesst die Anruf-Ansicht komplett (beide Quellen, s. closeCallView).
+	crmCloseBtn := widget.NewButtonWithIcon("", theme.CancelIcon(), closeCallView)
 	crmHeader := container.NewBorder(nil, nil, nil,
-		container.NewHBox(crmOpenCheck, newFilterWrap(crmFilterEntry), crmCloseBtn),
+		container.NewHBox(crmJiraCheck, crmIBSCheck, crmOpenRadio, newFilterWrap(crmFilterEntry), crmCloseBtn),
 		trLabelStyle("Tickets zur CRM", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}))
+
+	// Sichtbarkeit der Kundenverwaltungs-Bedienelemente (Quellen-Haekchen
+	// "Kundenv." in der Kopfzeile, Limit-Zeile in den erweiterten
+	// Einstellungen): nur wenn URL + API-Key hinterlegt sind. refreshIBSCheck
+	// (oben bereits fuer die Checkbox "IBS Tickets" zustaendig) wird darum
+	// erweitert - die Einstellungs-Felder in main.go rufen es bei jeder
+	// Aenderung auf. Hide()/Show() allein loest kein Neu-Layout der Umgebung
+	// aus (s.o.), daher Refresh der betroffenen Container.
+	baseRefreshIBSCheck := refreshIBSCheck
+	refreshIBSCheck = func() {
+		baseRefreshIBSCheck()
+		if ibsConfigured() {
+			crmIBSCheck.Show()
+			ibsLimitRow.Show()
+		} else {
+			crmIBSCheck.Hide()
+			ibsLimitRow.Hide()
+		}
+		if refreshSearchCard != nil {
+			refreshSearchCard()
+		}
+		crmHeader.Refresh()
+	}
+	refreshIBSCheck()
 
 	// crmAdvSlot nimmt in der ausgedehnten Ansicht die advancedSection auf
 	// ("Erweiterte Einstellungen" bleiben so sichtbar und bedienbar).
@@ -1179,7 +1505,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// auto=true: automatischer Zyklus/Trigger (kein Debug-Popup, Ueberlappschutz).
 	// crmFallback=true: bei LEEREM erkannten Text ALLE Tickets zur gefundenen CRM
 	// laden (Button + Webhook-Trigger), statt abzubrechen; nicht-offene Tickets
-	// sind anfangs per Checkbox "offene Tickets" ausgeblendet. Der zyklische
+	// sind anfangs per Radio "offen" ausgeblendet. Der zyklische
 	// Intervall-Scan (crmFallback=false) ueberspringt leeren Text still.
 	searchMatchingTickets := func(recognizedText string, trigger *widget.Button, auto bool, crmFallback bool) {
 		// Ticketsuche nur, wenn im CRM Feld eine gültige CRM steht
@@ -1213,7 +1539,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		// Die Liste laedt ALLE Tickets zur CRM: req (jira_open) liefert die
 		// offenen - sie bleiben die verlaessliche "offen"-Quelle, denn die
 		// Treffer-Blocks der API tragen KEIN Status-Feld -, reqAll ergaenzt die
-		// nicht-offenen. Letztere blendet die Checkbox "offene Tickets" im
+		// nicht-offenen. Letztere blendet das Radio "offen"/"alle" im
 		// Ergebnis clientseitig aus/ein (s. renderResults/openKeys).
 		var reqAll *jarvisQueryRequest
 		if text == "" {

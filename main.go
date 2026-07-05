@@ -957,13 +957,21 @@ type AppConfig struct {
 	Jarvis     BackendCfg `json:"jarvis"`
 	JarvisLang string     `json:"jarvisLang"` // "de" oder "en"
 
+	// Kundenverwaltungs-API (IBS): Verbindungsdaten für die Checkbox
+	// "IBS Tickets" im KI-Support-Panel. Die eigentliche API-Abfrage wird
+	// später hinterlegt; die Checkbox ist nur klickbar, wenn URL und
+	// API-Key gesetzt sind. Model bleibt ungenutzt.
+	IBS BackendCfg `json:"ibs"`
+
 	// Zuletzt genutzte Filter/Optionen im KI-Support-Panel (STT-Tab).
 	JarvisRAG              bool `json:"jarvisRAG"`
+	JarvisIBS              bool `json:"jarvisIBS"`
 	JarvisJira             bool `json:"jarvisJira"`
 	JarvisOpenOnly         bool `json:"jarvisOpenOnly"`
 	JarvisConfluence       bool `json:"jarvisConfluence"`
 	JarvisAISummary        bool `json:"jarvisAISummary"`
 	JarvisJiraLimit        int  `json:"jarvisJiraLimit"`
+	JarvisIBSLimit         int  `json:"jarvisIBSLimit"` // max. angezeigte Kundenverwaltungs-Tickets
 	JarvisSummaryLines     int  `json:"jarvisSummaryLines"`
 	JarvisAdvancedExpanded bool `json:"jarvisAdvancedExpanded"`
 
@@ -1080,6 +1088,7 @@ func LoadConfig(a fyne.App) {
 		JarvisJira:               true,
 		JarvisAISummary:          true,
 		JarvisJiraLimit:          10,
+		JarvisIBSLimit:           10,
 		JarvisSummaryLines:       5,
 		JarvisAdvancedExpanded:   true,
 		JarvisTicketSearchPrompt: defaultTicketSearchPrompt,
@@ -2139,6 +2148,29 @@ func main() {
 		saveConfigDebounced()
 	}
 
+	// Kundenverwaltungs-API (IBS): URL + API-Key schalten die Checkbox
+	// "IBS Tickets" im KI-Support-Panel frei (refreshIBSCheck, jarvis_client.go).
+	ibsUrlEntry := NewMinSizeEntry(200)
+	ibsUrlEntry.Entry.SetPlaceHolder("https://kundenverwaltung-host")
+	ibsUrlEntry.Entry.SetText(config.IBS.Url)
+	ibsUrlEntry.Entry.OnChanged = func(s string) {
+		config.IBS.Url = s
+		saveConfigDebounced()
+		if refreshIBSCheck != nil {
+			refreshIBSCheck()
+		}
+	}
+	ibsApiKeyEntry := widget.NewPasswordEntry()
+	trPlaceholder(ibsApiKeyEntry, "API-Key")
+	ibsApiKeyEntry.SetText(config.IBS.ApiKey)
+	ibsApiKeyEntry.OnChanged = func(s string) {
+		config.IBS.ApiKey = s
+		saveConfigDebounced()
+		if refreshIBSCheck != nil {
+			refreshIBSCheck()
+		}
+	}
+
 	// DE/EN-Umschalter (Segment-Pill, siehe design.png "de_en.png"). Klick
 	// wechselt live die App-Sprache (currentLang / config.JarvisLang) über
 	// setLanguage; alle übersetzbaren Widgets folgen via onLangChange. Die Pille
@@ -2632,6 +2664,8 @@ func main() {
 		container.New(&alignedFormLayout{},
 			trLabel("Server-URL:"), jarvisServerEntry,
 			trLabel("API-Key:"), jarvisApiKeyEntry,
+			trLabel("URL Kundenverwaltung API:"), ibsUrlEntry,
+			trLabel("API-Key Kundenverwaltung:"), ibsApiKeyEntry,
 			trLabel("Prompt für Suchen:"), jarvisSearchPromptEntry,
 		),
 

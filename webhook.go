@@ -312,6 +312,16 @@ func handleIncomingCaller(number string, auto bool) {
 	// (setCustomerField) und wird durch das Ergebnis unten aktualisiert.
 	setCallerNumber(number)
 
+	// IBS-Ticketbereich sofort leeren: sein Inhalt gehoert zum VORHERIGEN
+	// Anrufer. Bewusst unabhaengig davon, ob die IBS-Abfrage unten laeuft -
+	// sonst bliebe bei inzwischen deaktivierter Checkbox ein veralteter
+	// Bereich stehen.
+	fyne.Do(func() {
+		if clearIBSTickets != nil {
+			clearIBSTickets()
+		}
+	})
+
 	if auto && !config.AutoSearchCaller {
 		Log(fmt.Sprintf("Rufnummern-Webhook: Rufnummer %q angezeigt, Auto-Suche deaktiviert", number))
 		return
@@ -324,6 +334,18 @@ func handleIncomingCaller(number string, auto bool) {
 			go performCallerJiraLookup(number)
 		})
 	})
+
+	// IBS-Kundenverwaltung: laeuft ZUSAETZLICH zur Jira-CRM-Suche, wenn die
+	// Checkbox "IBS Tickets" aktiv ist (nur aktivierbar, wenn URL + API-Key
+	// hinterlegt sind). Flow: Rufnummer -> Adresse -> alle Events; Anzeige im
+	// IBS-Bereich oberhalb der Ergebnisliste (s. ibs_client.go).
+	if config.JarvisIBS && ibsConfigured() {
+		fyne.Do(func() {
+			debugPreviewAndConfirm(mainWin, "Rufnummern-Webhook: IBS-Abfrage", ibsRequestPreview(number), func() {
+				go performIBSLookup(number)
+			})
+		})
+	}
 }
 
 // performCallerJiraLookup fragt über GET /api/jira/phonenumber die CRM zur

@@ -210,7 +210,7 @@ func downloadFile(url, dest string, progress func(float64)) error {
 	// Progress Tracking
 	size := resp.ContentLength
 	var downloaded int64
-	
+
 	buffer := make([]byte, 32*1024)
 	for {
 		n, err := resp.Body.Read(buffer)
@@ -243,27 +243,27 @@ func extractFromZip(zipFile string) error {
 		// Wir extrahieren alle .exe und .dll Dateien
 		isExe := strings.HasSuffix(strings.ToLower(f.Name), ".exe")
 		isDll := strings.HasSuffix(strings.ToLower(f.Name), ".dll")
-		
+
 		if isExe || isDll {
 			rc, err := f.Open()
 			if err != nil {
 				return err
 			}
-			
+
 			// Wir flachen die Struktur ab (alles direkt nach libs/)
 			baseName := filepath.Base(f.Name)
 			destPath := filepath.Join(exeDir, "libs", baseName)
-			
+
 			out, err := os.Create(destPath)
 			if err != nil {
 				rc.Close()
 				return err
 			}
-			
+
 			_, err = io.Copy(out, rc)
 			out.Close()
 			rc.Close()
-			
+
 			if err != nil {
 				return err
 			}

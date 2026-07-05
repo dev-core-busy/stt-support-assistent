@@ -1,4 +1,5 @@
 //go:build windows
+
 package main
 
 import (
@@ -12,10 +13,10 @@ import (
 )
 
 var (
-	user32               = syscall.NewLazyDLL("user32.dll")
+	user32                 = syscall.NewLazyDLL("user32.dll")
 	procSetWindowPlacement = user32.NewProc("SetWindowPlacement")
 	procGetWindowPlacement = user32.NewProc("GetWindowPlacement")
-	procFindWindowW       = user32.NewProc("FindWindowW")
+	procFindWindowW        = user32.NewProc("FindWindowW")
 
 	dwmapi                    = syscall.NewLazyDLL("dwmapi.dll")
 	procDwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute")
@@ -54,12 +55,12 @@ type rect struct {
 }
 
 type windowPlacement struct {
-	Length           uint32
-	Flags            uint32
-	ShowCmd          uint32
-	MinPosition      point
-	MaxPosition      point
-	NormalPosition   rect
+	Length         uint32
+	Flags          uint32
+	ShowCmd        uint32
+	MinPosition    point
+	MaxPosition    point
+	NormalPosition rect
 }
 
 func getHWND(title string) uintptr {
@@ -92,17 +93,17 @@ func restoreWindowPosition(w fyne.Window) {
 		if hwnd != 0 {
 			var wp windowPlacement
 			wp.Length = uint32(unsafe.Sizeof(wp))
-			
+
 			// Aktuellen Zustand holen
 			procGetWindowPlacement.Call(hwnd, uintptr(unsafe.Pointer(&wp)))
-			
+
 			// Physikalische Bildschirmpixel direkt anwenden
 			wp.ShowCmd = uint32(config.WinShowCmd)
 			wp.NormalPosition.Left = config.PhysX
 			wp.NormalPosition.Top = config.PhysY
 			wp.NormalPosition.Right = config.PhysX + config.PhysWidth
 			wp.NormalPosition.Bottom = config.PhysY + config.PhysHeight
-			
+
 			procSetWindowPlacement.Call(hwnd, uintptr(unsafe.Pointer(&wp)))
 		}
 	})
@@ -116,19 +117,19 @@ func moveWindowNear(child fyne.Window, parent fyne.Window) {
 			var wpMain windowPlacement
 			wpMain.Length = uint32(unsafe.Sizeof(wpMain))
 			procGetWindowPlacement.Call(mainHwnd, uintptr(unsafe.Pointer(&wpMain)))
-			
+
 			var wpChild windowPlacement
 			wpChild.Length = uint32(unsafe.Sizeof(wpChild))
 			procGetWindowPlacement.Call(childHwnd, uintptr(unsafe.Pointer(&wpChild)))
-			
+
 			width := wpChild.NormalPosition.Right - wpChild.NormalPosition.Left
 			height := wpChild.NormalPosition.Bottom - wpChild.NormalPosition.Top
-			
+
 			wpChild.NormalPosition.Left = wpMain.NormalPosition.Left + 80
 			wpChild.NormalPosition.Top = wpMain.NormalPosition.Top + 80
 			wpChild.NormalPosition.Right = wpChild.NormalPosition.Left + width
 			wpChild.NormalPosition.Bottom = wpChild.NormalPosition.Top + height
-			
+
 			procSetWindowPlacement.Call(childHwnd, uintptr(unsafe.Pointer(&wpChild)))
 		}
 	})
@@ -212,4 +213,3 @@ func copyToClipboardRich(plainText, markdown string) {
 		}
 	}
 }
-

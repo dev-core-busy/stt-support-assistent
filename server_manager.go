@@ -36,7 +36,9 @@ func instanceFor(symbol string) *llamaInstance { return localServers[symbol] }
 
 func (inst *llamaInstance) baseURL() string { return "http://127.0.0.1:" + inst.port }
 
-func (inst *llamaInstance) running() bool { return inst != nil && inst.cmd != nil && inst.cmd.Process != nil }
+func (inst *llamaInstance) running() bool {
+	return inst != nil && inst.cmd != nil && inst.cmd.Process != nil
+}
 
 // instHealth fragt /health der Instanz ab.
 func instHealth(inst *llamaInstance) bool {

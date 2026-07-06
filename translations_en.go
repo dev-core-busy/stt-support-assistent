@@ -71,11 +71,13 @@ var enOverrides = map[string]string{
 	"Port:":       "Port:",
 
 	// --- Einstellungen: System / Pfade ---
-	"System-Logging aktivieren": "Enable system logging",
-	"System-Logging aktiviert":  "System logging enabled",
-	"Speicherpfade":             "Storage paths",
-	"Modelle: ./models/":        "Models: ./models/",
-	"Binaries: ./libs/":         "Binaries: ./libs/",
+	"System-Logging aktivieren":                   "Enable system logging",
+	"System-Logging aktiviert":                    "System logging enabled",
+	"Automatisch bei Windows-Anmeldung starten":   "Start automatically at Windows sign-in",
+	"Autostart konnte nicht geändert werden:\n%v": "Could not change autostart:\n%v",
+	"Speicherpfade":                               "Storage paths",
+	"Modelle: ./models/":                          "Models: ./models/",
+	"Binaries: ./libs/":                           "Binaries: ./libs/",
 
 	// --- Modell-Auswahl / Server ---
 	"Suche Modelle...":      "Searching models...",

@@ -2116,6 +2116,34 @@ func main() {
 	})
 	debugCheck.SetChecked(config.DebugMode)
 
+	// Autostart bei der Windows-Anmeldung ("als Dienst starten"). Zustand kommt
+	// direkt aus der Registry (autostart_windows.go), nicht aus config.json —
+	// so bleibt die Checkbox auch mit extern gesetzten/geloeschten Eintraegen
+	// synchron. autostartReverting verhindert, dass das Zuruecksetzen der
+	// Checkbox im Fehlerfall den OnChanged-Callback erneut ausloest.
+	var autostartCheck *widget.Check
+	var autostartReverting bool
+	autostartCheck = trCheck("Automatisch bei Windows-Anmeldung starten", func(b bool) {
+		if autostartReverting {
+			return
+		}
+		if err := setAutostart(b); err != nil {
+			showErr(fmt.Errorf(T("Autostart konnte nicht geändert werden:\n%v"), err), win)
+			autostartReverting = true
+			autostartCheck.SetChecked(!b)
+			autostartReverting = false
+		}
+	})
+	if autostartEnabled() {
+		// SetChecked(true) loest den Callback aus und schreibt den Eintrag mit
+		// dem aktuellen exe-Pfad neu — haelt den Autostart nach einem
+		// Verschieben der Datei aktuell.
+		autostartCheck.SetChecked(true)
+	}
+	if !autostartSupported() {
+		autostartCheck.Hide()
+	}
+
 	updateAnalysisUI := func() {} // Forward declaration
 
 	// --- 'remote LLM': Auswahl des Remote-Backends (Flash/Ollama/vLLM) ---
@@ -2726,6 +2754,7 @@ func main() {
 		),
 		logCheck,
 		debugCheck,
+		autostartCheck,
 
 		widget.NewSeparator(),
 		trLabelStyle("Design", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),

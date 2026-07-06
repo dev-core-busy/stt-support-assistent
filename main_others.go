@@ -24,3 +24,11 @@ func setWindowSquare(w fyne.Window, square bool) {
 func ensureSingleInstance() bool { return true }
 
 func notifyAlreadyRunning() {}
+
+// Autostart (Windows-Run-Key, autostart_windows.go) existiert nur unter
+// Windows; auf anderen Plattformen wird die Checkbox gar nicht angezeigt.
+func autostartSupported() bool { return false }
+
+func autostartEnabled() bool { return false }
+
+func setAutostart(enable bool) error { return nil }

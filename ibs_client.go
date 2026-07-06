@@ -285,17 +285,30 @@ func ibsEventTickets(events []interface{}) []ibsTicket {
 			Text:    ibsFieldString(m, "text", "description", "beschreibung", "note", "message"),
 		}
 		// Offen/geschlossen: massgeblich ist state_type (< 80 offen, >= 80
-		// geschlossen). Fehlt das Feld oder ist es nicht numerisch, entscheidet
-		// der Status-NAME (abgeschlossen/geschlossen/ENDED/... = zu) - der
-		// Server liefert inzwischen deutsche Namen wie "abgeschlossen
-		// (berechnet)", das alte "state != ENDED" reichte nicht mehr.
-		t.Open = !ibsClosedByName(t.Status)
+		// geschlossen; Zuordnung s. ibsStateNames/event_states.txt). Fehlt das
+		// Feld oder ist es nicht numerisch, entscheidet der Status-NAME.
+		// Geloeschte Events (state_type 99 bzw. "gelöscht") werden komplett
+		// uebersprungen und tauchen nirgends auf.
+		stateType, hasStateType := 0, false
 		if st := ibsFieldString(m, "statetype", "statetyp"); st != "" {
 			if n, ok := ibsLeadingNumber(st); ok {
-				t.Open = n < 80
+				stateType, hasStateType = int(n), true
 			} else {
 				Log("IBS: state_type nicht numerisch (" + st + ") - Status-Name entscheidet")
 			}
+		}
+		if (hasStateType && stateType == ibsStateDeleted) || ibsDeletedByName(t.Status) {
+			continue
+		}
+		if hasStateType {
+			t.Open = stateType < 80
+			// Status-Pill: einheitlicher Anzeige-Name laut Enum-Tabelle;
+			// unbekannte Typen behalten den Server-Text.
+			if name, ok := ibsStateNames[stateType]; ok {
+				t.Status = name
+			}
+		} else {
+			t.Open = !ibsClosedByName(t.Status)
 		}
 		if t.Key == "" && t.Text == "" {
 			if j, err := json.Marshal(m); err == nil {
@@ -305,6 +318,40 @@ func ibsEventTickets(events []interface{}) []ibsTicket {
 		out = append(out, t)
 	}
 	return out
+}
+
+// ibsStateNames: Anzeige-Name je state_type laut EVENT_STATE-Enum der
+// Kundenverwaltung (Quelle: event_states.txt im Projekt-Root). Die Status-
+// Pill zeigt bevorzugt diesen Namen; unbekannte Typen behalten den vom
+// Server gelieferten state-Text. state_type 99 ("gelöscht") wird NIE
+// angezeigt - solche Events fliegen komplett aus der Liste (Nutzer-Vorgabe).
+var ibsStateNames = map[int]string{
+	0:  "offen",
+	5:  "Angebot erstellen",
+	10: "Angebot erstellt",
+	21: "DFÜ Fragen telefonisch klären",
+	22: "DFÜ Fragen telefonisch geklärt",
+	30: "account erstellen",
+	34: "Installationstermin vereinbaren",
+	35: "installieren",
+	36: "installiert",
+	45: "Benutzeranmeldung abwarten",
+	60: "Befunde abwarten",
+	65: "Erstsupport durchführen",
+	80: "Info",
+	81: "Sprechzeiten",
+	90: "abgeschlossen",
+	91: "abgeschlossen (berechnet)",
+	99: "gelöscht",
+}
+
+const ibsStateDeleted = 99
+
+// ibsDeletedByName erkennt geloeschte Events am Status-Namen (Rueckfall,
+// wenn state_type fehlt/unlesbar ist).
+func ibsDeletedByName(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(status))
+	return strings.Contains(s, "gelöscht") || strings.Contains(s, "geloescht") || strings.Contains(s, "deleted")
 }
 
 // ibsClosedByName meldet, ob ein Status-Name ein geschlossenes Event
@@ -360,6 +407,20 @@ func ibsDebugPayload(raw string, err error) string {
 	return "Fehler: " + err.Error() + "\n\nRohantwort:\n" + payload
 }
 
+// setIBSAddressField zeigt die gefundene address_id im STT-Tab neben dem
+// CRM-Wert ("Kundenv. ID"); "-" wenn (noch) keine gefunden. Thread-sicher via
+// fyne.Do. Der zugehoerige Block (ibsIDBox, main.go) ist nur sichtbar, wenn
+// URL + API-Key der Kundenverwaltung hinterlegt sind (refreshIBSCheck).
+func setIBSAddressField(id string) {
+	if ibsAddressField == nil {
+		return
+	}
+	if strings.TrimSpace(id) == "" {
+		id = "-"
+	}
+	fyne.Do(func() { ibsAddressField.SetText(id) })
+}
+
 // performIBSLookup ist der komplette IBS-Flow zu einem eingehenden Anruf:
 // Rufnummer -> getByNumber (Adresse) -> getEvents (alle Tickets) -> Anzeige in
 // der Anruf-Ticketliste. Laeuft in einer Goroutine (Aufruf s.
@@ -377,6 +438,7 @@ func performIBSLookup(number string) {
 
 	addrID, addrLabel, raw, err := ibsAddressLookup(number)
 	fyne.Do(func() { showDebugResponse("IBS: Antwort getByNumber", ibsDebugPayload(raw, err)) })
+	setIBSAddressField(addrID) // "Kundenv. ID" im STT-Tab ("-" wenn leer)
 	if err != nil {
 		render(number, nil, err.Error())
 		return

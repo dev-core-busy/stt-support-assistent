@@ -58,9 +58,9 @@ First launch requires internet to download ~2GB of models and binaries. Subseque
 ## Key Design Points
 
 - **Config**: `AppConfig` struct (line 277 of main.go) persisted as JSON in the exe directory. Migration from Fyne preferences exists (`LoadConfig`). Window position/gain/pipeline settings all configurable via UI.
-- **Audio**: 16kHz mono S16 capture via malgo. Two audio paths: mic capture (agent) and Windows loopback (caller/teams audio). Per-channel digital gain with clipping protection.
-- **Silence detection** (`detectSilence` in main.go): amplitude-based threshold triggers paragraph breaks at configurable pause intervals.
-- **Audio processing**: 4-second sliding buffer → WAV file → whisper.cpp CLI or llama-server HTTP API.
+- **Audio**: 16kHz mono S16 capture via malgo. Two audio paths: mic capture (agent) and Windows loopback (caller/teams audio). Per-channel digital gain with soft-clip limiter (`applyGainSoftClip` in vad.go).
+- **Silence detection** (`detectSilence` in main.go): amplitude-based threshold (gain-normalized) triggers paragraph breaks / LLM correction flush at configurable pause intervals.
+- **Audio processing**: energy-based VAD segmentation (`vad.go`): segments are cut at speech pauses (450ms silence; min 300ms speech, max 15s, leading/trailing silence trimmed) → WAV → whisper.cpp CLI (with `--prompt` context priming) or remote WebSocket. Remaining buffer is flushed when recording stops. Open follow-ups documented in TODO.md.
 - **Gemma Native pipeline**: Uses llama-server's OpenAI-compatible `/v1/chat/completions` endpoint with multimodal audio input (base64 WAV + text). Expects Gemma 4 E2B model with mmproj.
 - **Llama server**: Runs on 127.0.0.1:8080, started as background process on app init, health-checked with 60s timeout, killed on app close.
 - **Analysis**: Triggered manually; routes to local Gemma, Gemini Flash, or Ollama based on `config.AnalysisMode`. Output shown in a separate Fyne window with markdown formatting.

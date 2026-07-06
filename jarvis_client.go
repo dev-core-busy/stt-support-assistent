@@ -53,6 +53,19 @@ var refreshIBSCheck func()
 var (
 	showIBSTickets  func(header string, tickets []ibsTicket, errMsg string)
 	clearIBSTickets func()
+	// resetCallView leert die komplette Anruf-Ansicht SOFORT (Status-Zeile
+	// "Jira: n Treffer ...", Ticket-Karten beider Quellen, KI-Caches).
+	// Aufruf beim Eingang eines NEUEN Anrufs (webhook.go): die alte Liste
+	// gehoert zum vorherigen Anrufer und stuende sonst noch bis zum Eintreffen
+	// der neuen Ergebnisse (bis zu 120 s) in der Ansicht.
+	resetCallView func()
+	// showCallWorking zeigt in der (geleerten) Ergebnisliste einen
+	// "Ich arbeite"-Indikator (Text + Endlos-Balken), bis die naechsten
+	// Ergebnisse ihn ersetzen (renderResults/renderError). Aufruf beim
+	// tatsaechlichen Start der Anruf-Abfragen (webhook.go) und nach der
+	// CRM-Auswahl. Bewusst OHNE den Anruf-Zustand anzutasten: bereits
+	// eingetroffene IBS-Ergebnisse des AKTUELLEN Anrufs bleiben erhalten.
+	showCallWorking func()
 )
 
 // jarvisHTTPClient: eigener Client mit deaktivierter TLS-Pruefung, da der
@@ -79,7 +92,7 @@ type jarvisQueryRequest struct {
 	SummaryLines int    `json:"summary_lines,omitempty"`
 	Lang         string `json:"lang,omitempty"`
 	// Prompt ist die in "Einstellungen" hinterlegte Anweisung an die LLM
-	// (config.JarvisSearchQuery, Feld "Prompt für Suchen"). Wird der KI-
+	// (config.JarvisSearchQuery, Feld "Prompt für KI-Zusammenfassung"). Wird der KI-
 	// Gesamtzusammenfassung vorangestellt. Getrennt vom Suchtext (Text) - beides
 	// sind bewusst unabhaengige Dinge. omitempty: ohne hinterlegten Prompt wird
 	// das Feld gar nicht erst gesendet.
@@ -531,6 +544,49 @@ func collapseText(s string, maxLines, maxChars int) (string, bool) {
 	return out, truncated
 }
 
+// Einheitliche Kuerzungsgrenze fuer ALLE Karteninhalte (Jira-/Wissen-/IBS-
+// Karten, KI-Zusammenfassungen): laengere Texte starten eingeklappt und
+// werden per "mehr"/"weniger" umgeschaltet.
+const (
+	cardCollapseLines = 6
+	cardCollapseChars = 500
+)
+
+// collapsibleLabel liefert einen umbruchfaehigen Label-Text, der ab
+// cardCollapseLines/Chars eingeklappt startet und einen "mehr"/"weniger"-
+// Umschalter darunter bekommt; kurze Texte bleiben ein schlichtes Label.
+// Fuer Inhalte OHNE Filter-Markierung (KI-Zusammenfassungen) - die Treffer-
+// Karten selbst brauchen die RichText-/Highlight-Variante in renderResults.
+// Bewusst Label statt RichTextFromMarkdown: LLM-Text ist kein verlaesslich
+// sauberes Markdown (s. Kommentar bei der KI-Gesamtzusammenfassung).
+func collapsibleLabel(s string) fyne.CanvasObject {
+	lbl := widget.NewLabel("")
+	lbl.Wrapping = fyne.TextWrapWord
+	short, truncated := collapseText(s, cardCollapseLines, cardCollapseChars)
+	if !truncated {
+		lbl.SetText(s)
+		return lbl
+	}
+	expanded := false
+	toggle := widget.NewButton(T("mehr"), nil)
+	toggle.Importance = widget.LowImportance
+	apply := func() {
+		if expanded {
+			lbl.SetText(s)
+			toggle.SetText(T("weniger"))
+		} else {
+			lbl.SetText(short + " …")
+			toggle.SetText(T("mehr"))
+		}
+	}
+	toggle.OnTapped = func() {
+		expanded = !expanded
+		apply()
+	}
+	apply()
+	return container.NewVBox(lbl, container.NewHBox(toggle)) // Toggle linksbuendig
+}
+
 // ticketSummaryControls baut die Bedienelemente der "KI-Zusammenfassung" eines
 // Ticket-Eintrags (nur in der "Tickets zu einer CRM"-Liste): einen Button (oben
 // rechts im Eintrag zu platzieren, rot mit weißer Schrift) und einen darunter
@@ -554,17 +610,15 @@ func ticketSummaryControls(key string) (*widget.Button, *fyne.Container) {
 			fyne.Do(func() {
 				btn.Enable()
 				holder.RemoveAll()
-				var lbl *widget.Label
+				text := sum
 				switch {
 				case err != nil:
-					lbl = widget.NewLabel(T("Fehler: ") + err.Error())
+					text = T("Fehler: ") + err.Error()
 				case sum == "":
-					lbl = widget.NewLabel(T("(keine Zusammenfassung erhalten)"))
-				default:
-					lbl = widget.NewLabel(sum)
+					text = T("(keine Zusammenfassung erhalten)")
 				}
-				lbl.Wrapping = fyne.TextWrapWord
-				holder.Add(lbl)
+				// Lange Zusammenfassungen eingeklappt mit "mehr"/"weniger".
+				holder.Add(collapsibleLabel(text))
 				holder.Refresh()
 			})
 		}()
@@ -613,9 +667,8 @@ func ibsSummaryControls(tk ibsTicket, textBody fyne.CanvasObject, bodySlot *fyne
 		if s == "" {
 			s = T("(keine Zusammenfassung erhalten)")
 		}
-		lbl := widget.NewLabel(s)
-		lbl.Wrapping = fyne.TextWrapWord
-		bodySlot.Objects = []fyne.CanvasObject{lbl}
+		// Lange Zusammenfassungen eingeklappt mit "mehr"/"weniger".
+		bodySlot.Objects = []fyne.CanvasObject{collapsibleLabel(s)}
 		bodySlot.Refresh()
 	}
 	restoreText := func() {
@@ -845,15 +898,22 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	if !openOnlyTickets {
 		openIdx = 1
 	}
+	// applyAndScrollTop: Umschalten von Radio/Quellen-Haekchen zeigt eine
+	// inhaltlich andere Liste - danach immer an den Listenanfang springen
+	// (sonst bliebe die Scroll-Position mitten im vorherigen Ergebnis stehen).
+	applyAndScrollTop := func() {
+		if crmApplyFilters != nil {
+			crmApplyFilters()
+			resultsScroll.ScrollToTop()
+		}
+	}
 	crmOpenRadio := trRadio([]string{"offen", "alle"}, openIdx, func(idx int) {
 		openOnlyTickets = idx == 0
 		if config.JarvisCallOpenOnly != openOnlyTickets {
 			config.JarvisCallOpenOnly = openOnlyTickets
 			saveConfigDebounced()
 		}
-		if crmApplyFilters != nil {
-			crmApplyFilters()
-		}
+		applyAndScrollTop()
 	})
 	showJiraSrc, showIBSSrc := config.JarvisCallShowJira, config.JarvisCallShowIBS
 	crmJiraCheck := trCheck("Jira", func(b bool) {
@@ -862,9 +922,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			config.JarvisCallShowJira = b
 			saveConfigDebounced()
 		}
-		if crmApplyFilters != nil {
-			crmApplyFilters()
-		}
+		applyAndScrollTop()
 	})
 	crmIBSCheck := trCheck("Kundenv.", func(b bool) {
 		showIBSSrc = b
@@ -872,9 +930,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			config.JarvisCallShowIBS = b
 			saveConfigDebounced()
 		}
-		if crmApplyFilters != nil {
-			crmApplyFilters()
-		}
+		applyAndScrollTop()
 	})
 	crmJiraCheck.SetChecked(showJiraSrc)
 	crmIBSCheck.SetChecked(showIBSSrc)
@@ -890,6 +946,15 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		crmFilterEntry.SetText("")
 	}
 
+	// progress: DER Endlos-Balken der Such-Karte - die einzige
+	// "Ich arbeite"-Anzeige des Panels. Suchen (runSearch/searchMatchingTickets)
+	// zeigen/verbergen ihn selbst; die Anruf-Abfragen zeigen ihn ueber
+	// showCallWorking, und das erste eintreffende Ergebnis
+	// (renderResults/renderError) bzw. clearResults verbirgt ihn wieder.
+	// Bewusst VOR clearResults/showCallWorking deklariert (Referenz).
+	progress := widget.NewProgressBarInfinite()
+	progress.Hide()
+
 	// renderResults wird vorwaerts deklariert: clearResults (Jira-Seite
 	// verwerfen, IBS-Seite ggf. weiterzeigen) und die IBS-Hooks weiter unten
 	// rendern darueber.
@@ -904,6 +969,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// Rufnummer zwar eine Kundenverwaltungs-Adresse, aber keine Jira-CRM
 	// gefunden wurde. Muss im Fyne-Main-Thread laufen.
 	clearResults := func() {
+		progress.Hide() // Sackgassen (CRM nicht gefunden/Auswahl abgebrochen) beenden die Arbeits-Anzeige
 		crmLast = nil
 		if ibsLast != nil {
 			renderResults(ibsLast.label, nil, 0, map[string]bool{})
@@ -925,6 +991,19 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		clearIBSSummaryCache()
 		clearResults()
 	}
+	// Neuer Anruf leert die Ansicht auf demselben Weg wie der ✕-Button.
+	resetCallView = closeCallView
+	// Kein eigener Balken in der Ergebnisliste (es gaebe sonst ZWEI Anzeigen):
+	// die Liste wird geleert und der vorhandene Balken der Such-Karte laeuft,
+	// bis das erste Ergebnis eintrifft.
+	showCallWorking = func() {
+		if setCRMListExpanded != nil {
+			setCRMListExpanded(false)
+		}
+		resultsBox.RemoveAll()
+		resultsBox.Refresh()
+		progress.Show()
+	}
 
 	// renderResults befuellt die Ergebnisliste. openKeys (nur CRM-Ticketliste,
 	// sonst nil) ist die Menge der Jira-Keys, die der Server als OFFEN gemeldet
@@ -934,6 +1013,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// (Start: offen) blendet nicht-offene Tickets rein clientseitig aus/ein -
 	// KEINE neue Server-Anfrage beim Umschalten.
 	renderResults = func(query string, res *jarvisQueryResponse, duration time.Duration, openKeys map[string]bool) {
+		progress.Hide() // eintreffendes Ergebnis beendet die Arbeits-Anzeige
 		crmView := openKeys != nil
 		if crmView {
 			// Jira-Seite fuer Nach-Renderings merken (IBS-Ergebnis trifft ein,
@@ -1080,35 +1160,9 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			// winzige Text-Segmente zerlegt, die dann einzeln umgebrochen wurden
 			// (sichtbar als Spalte aus Einzelbuchstaben-Zeilen). Gleiches Problem
 			// wie beim Snippet-Text unten, dort bereits mit Label geloest.
-			body := widget.NewLabel("")
-			body.Wrapping = fyne.TextWrapWord
-
-			cardBox := container.NewVBox(header, body)
-			// Standardmaessig auf 10 Zeilen kuerzen; laengerer Text wird per
-			// "mehr"/"weniger" ein-/ausgeklappt.
-			short, truncated := collapseText(summary, 10, 700)
-			if truncated {
-				expanded := false
-				toggle := widget.NewButton(T("mehr"), nil)
-				toggle.Importance = widget.LowImportance
-				apply := func() {
-					if expanded {
-						body.SetText(summary)
-						toggle.SetText(T("weniger"))
-					} else {
-						body.SetText(short + " …")
-						toggle.SetText(T("mehr"))
-					}
-				}
-				toggle.OnTapped = func() {
-					expanded = !expanded
-					apply()
-				}
-				apply()
-				cardBox.Add(container.NewHBox(toggle)) // Toggle linksbuendig
-			} else {
-				body.SetText(summary)
-			}
+			// Einheitliches Einklappen ab cardCollapseLines Zeilen mit
+			// "mehr"/"weniger" (s. collapsibleLabel).
+			cardBox := container.NewVBox(header, collapsibleLabel(summary))
 			resultsBox.Add(kiCard(cardBox))
 		}
 
@@ -1166,10 +1220,44 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			// dadurch riesig dargestellt. RichText mit direkt gebauten Text-
 			// Segmenten (ohne Markdown-Parser) ist genauso sicher wie das fruehere
 			// Label und erlaubt zusaetzlich die Markierung der Filter-Treffer.
-			snippet := widget.NewRichText(highlightedSegments(b.Summary, "")...)
+			//
+			// Lange Inhalte starten (wie bei den IBS-Karten) auf
+			// cardCollapseLines Zeilen eingeklappt, "mehr"/"weniger" schaltet
+			// um; der Volltext-Filter durchsucht immer den KOMPLETTEN Text,
+			// markiert aber im jeweils angezeigten Zustand (raw wird beim
+			// Umschalten nachgezogen).
+			full := b.Summary
+			short, truncated := collapseText(full, cardCollapseLines, cardCollapseChars)
+			display := full
+			if truncated {
+				display = short + " …"
+			}
+			snippet := widget.NewRichText(highlightedSegments(display, "")...)
 			snippet.Wrapping = fyne.TextWrapWord
 
 			cardContent := container.NewVBox(headerRow, snippet)
+			if truncated {
+				idx := len(cards) // Index des unten angehaengten filterCard-Eintrags
+				expanded := false
+				toggle := widget.NewButton(T("mehr"), nil)
+				toggle.Importance = widget.LowImportance
+				toggle.OnTapped = func() {
+					expanded = !expanded
+					disp := short + " …"
+					if expanded {
+						disp = full
+						toggle.SetText(T("weniger"))
+					} else {
+						toggle.SetText(T("mehr"))
+					}
+					ql := strings.ToLower(strings.TrimSpace(filterSrc.Text))
+					snippet.Segments = highlightedSegments(disp, ql)
+					snippet.Refresh()
+					cards[idx].raw = disp
+					cards[idx].hlQuery = ql
+				}
+				cardContent.Add(container.NewHBox(toggle)) // Toggle linksbuendig unter dem Text
+			}
 			// Quelle-Zeile nur fuer Nicht-Tickets (v.a. WISSEN-Treffer, deren oft
 			// relative Quell-Links sonst gar nicht sichtbar waeren, s.
 			// jarvisSourceRow/resolveJarvisLink).
@@ -1191,7 +1279,7 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 				text:    strings.ToLower(strings.Join([]string{title, b.Summary, b.Key, b.Source, b.SourceLabel}, " ")),
 				open:    !crmView || !isTicket || openKeys[b.Key],
 				snippet: snippet,
-				raw:     b.Summary,
+				raw:     display,
 			})
 			resultsBox.Add(card)
 		}
@@ -1245,11 +1333,25 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 				if tk.Status != "" {
 					right = append(right, kiPill(tk.Status, statusBg, statusFg))
 				}
-				snippet := widget.NewRichText(highlightedSegments(tk.Text, "")...)
+				// Beschreibungstext: lange Inhalte standardmaessig auf 6 Zeilen
+				// gekuerzt und per "mehr"/"weniger" auf-/zuklappbar (gleiches
+				// Muster wie die KI-Gesamtzusammenfassung). Der Volltext-Filter
+				// durchsucht immer den KOMPLETTEN Text, markiert aber im jeweils
+				// angezeigten Zustand (raw wird beim Umschalten nachgezogen).
+				full := tk.Text
+				short, truncated := collapseText(full, cardCollapseLines, cardCollapseChars)
+				display := full
+				if truncated {
+					display = short + " …"
+				}
+				snippet := widget.NewRichText(highlightedSegments(display, "")...)
 				snippet.Wrapping = fyne.TextWrapWord
-				bodySlot := container.NewVBox(snippet)
+				// textBody buendelt Text + Toggle: die KI-Zusammenfassung ersetzt
+				// beides (bodySlot) und stellt beides wieder her.
+				textBody := container.NewVBox(snippet)
+				bodySlot := container.NewVBox(textBody)
 				if strings.TrimSpace(tk.Text) != "" {
-					right = append(right, ibsSummaryControls(tk, snippet, bodySlot))
+					right = append(right, ibsSummaryControls(tk, textBody, bodySlot))
 				}
 				headerRow := container.NewBorder(nil, nil, nil, container.NewHBox(right...), titleLbl)
 				card := kiCard(container.NewVBox(headerRow, bodySlot))
@@ -1258,9 +1360,34 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 					text:    strings.ToLower(strings.Join([]string{tk.Key, tk.Created, tk.User, tk.Status, tk.Text}, " ")),
 					open:    tk.Open,
 					snippet: snippet,
-					raw:     tk.Text,
+					raw:     display,
 					src:     "ibs",
 				})
+				if truncated {
+					idx := len(cards) - 1
+					expanded := false
+					toggle := widget.NewButton(T("mehr"), nil)
+					toggle.Importance = widget.LowImportance
+					toggle.OnTapped = func() {
+						expanded = !expanded
+						disp := short + " …"
+						if expanded {
+							disp = full
+							toggle.SetText(T("weniger"))
+						} else {
+							toggle.SetText(T("mehr"))
+						}
+						// Anzeige sofort mit dem aktuellen Filtertext markieren und
+						// den Karten-Zustand nachziehen, damit die naechste
+						// Filter-Eingabe (applyFilters) den Klappzustand behaelt.
+						ql := strings.ToLower(strings.TrimSpace(filterSrc.Text))
+						snippet.Segments = highlightedSegments(disp, ql)
+						snippet.Refresh()
+						cards[idx].raw = disp
+						cards[idx].hlQuery = ql
+					}
+					textBody.Add(container.NewHBox(toggle)) // Toggle linksbuendig unter dem Text
+				}
 				resultsBox.Add(card)
 			}
 		}
@@ -1310,15 +1437,13 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	}
 
 	renderError := func(err error) {
+		progress.Hide()
 		resultsBox.RemoveAll()
 		errText := canvas.NewText(T("Fehler: ")+err.Error(), kiAccent)
 		errText.TextStyle = fyne.TextStyle{Bold: true}
 		resultsBox.Add(errText)
 		resultsBox.Refresh()
 	}
-
-	progress := widget.NewProgressBarInfinite()
-	progress.Hide()
 
 	// --- Such-Karte: Eingabe + Button ---
 	// queryEntry ist der Suchtext fuer die Jarvis-Anfrage - eine reine
@@ -1562,14 +1687,23 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		if ibsConfigured() {
 			crmIBSCheck.Show()
 			ibsLimitRow.Show()
+			if ibsIDBox != nil {
+				ibsIDBox.Show()
+			}
 		} else {
 			crmIBSCheck.Hide()
 			ibsLimitRow.Hide()
+			if ibsIDBox != nil {
+				ibsIDBox.Hide()
+			}
 		}
 		if refreshSearchCard != nil {
 			refreshSearchCard()
 		}
 		crmHeader.Refresh()
+		if ibsIDBox != nil {
+			ibsIDBox.Refresh()
+		}
 	}
 	refreshIBSCheck()
 

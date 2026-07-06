@@ -143,6 +143,8 @@ var (
 	procRegisterClipboardFormatW = user32.NewProc("RegisterClipboardFormatW")
 
 	kernel32         = syscall.NewLazyDLL("kernel32.dll")
+	procCreateMutexW = kernel32.NewProc("CreateMutexW")
+	procMessageBoxW  = user32.NewProc("MessageBoxW")
 	procGlobalAlloc  = kernel32.NewProc("GlobalAlloc")
 	procGlobalFree   = kernel32.NewProc("GlobalFree")
 	procGlobalLock   = kernel32.NewProc("GlobalLock")

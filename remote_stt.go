@@ -88,21 +88,28 @@ func (s *remoteSession) readLoop() {
 		switch m.Type {
 		case "final":
 			if text := strings.TrimSpace(m.Text); text != "" {
+				updateSTTTail(text) // Kontext-Puffer (nutzt derzeit nur der lokale Whisper)
 				if atHasPostProc.Load() {
 					appendPendingRaw(s.speaker, text)
 				} else {
 					appendSpeakerSegment(s.speaker, "", text)
 				}
 			}
+		case "partial":
+			// Laut Spec vorgesehen (kumulativer Zwischenstand der laufenden
+			// Äußerung), vom Server aktuell kaum genutzt. Eine Live-Anzeige
+			// bräuchte Replace-Semantik im Transkript (das pendingRaw-Modell
+			// kann nur anhängen) - bewusst ignoriert, s. TODO.md.
 		case "error":
 			Log("Remote-STT-Fehler: " + m.Message)
 		}
 	}
 }
 
-// sendAudio überträgt ein Audio-Segment (PCM16 mono 16k) als Base64; jedes Segment
-// wird als Äußerungsende markiert, sodass der Server es transkribiert.
-func (s *remoteSession) sendAudio(audio []byte) error {
+// send überträgt Audio (PCM16 mono 16k) als Base64-Chunk; eou markiert das
+// Äußerungsende - erst dann transkribiert der Server seinen Utterance-Puffer
+// (s. DP-SwyxAgent_STT_WebSocket_Protocol.md).
+func (s *remoteSession) send(audio []byte, eou bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.seq++
@@ -111,22 +118,149 @@ func (s *remoteSession) sendAudio(audio []byte) error {
 		SessionId:      s.sessionId,
 		Sequence:       s.seq,
 		PcmBase64:      base64.StdEncoding.EncodeToString(audio),
-		EndOfUtterance: true,
+		EndOfUtterance: eou,
 	})
 }
 
-// remoteTranscribe sendet ein Segment an den Remote-Whisper-Server (Ergebnis kommt
-// asynchron über readLoop). Wird aus den Audio-Buffer-Goroutinen aufgerufen.
+// remoteSendChunk sendet Audio (ggf. mit Äußerungsende-Markierung) an den
+// Remote-Whisper-Server; Ergebnisse kommen asynchron über readLoop. Schlägt
+// das Senden fehl (typisch: die stehende Verbindung wurde nach einer
+// Gesprächspause vom serverseitigen Idle-Cleanup oder NAT/Proxy gekappt),
+// wird EINMAL neu verbunden und DERSELBE Chunk erneut gesendet - vorher ging
+// er verloren und erst der nächste baute die Verbindung wieder auf.
+func remoteSendChunk(audio []byte, speaker string, eou bool) {
+	for attempt := 1; attempt <= 2; attempt++ {
+		s, err := getRemoteSession(speaker)
+		if err != nil {
+			Log("Remote-STT: " + err.Error())
+			return
+		}
+		if err := s.send(audio, eou); err == nil {
+			return
+		} else {
+			Log(fmt.Sprintf("Remote-STT senden fehlgeschlagen (Versuch %d/2): %v", attempt, err))
+			closeRemoteSession(speaker)
+		}
+	}
+}
+
+// remoteTranscribe sendet ein KOMPLETTES Segment als eigene Äußerung.
+// Rückfall-Pfad: der Normalbetrieb streamt kontinuierlich über remoteStreamer
+// (s.u.); hierher kommt nur noch ein Segment des lokalen VAD-Segmentierers,
+// wenn während laufender Aufnahme von lokal auf remote umgeschaltet wird.
 func remoteTranscribe(audio []byte, speaker string) {
-	s, err := getRemoteSession(speaker)
-	if err != nil {
-		Log("Remote-STT: " + err.Error())
+	remoteSendChunk(audio, speaker, true)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming-Modus: kontinuierliche Chunks, endOfUtterance an der Sprechpause
+// ---------------------------------------------------------------------------
+
+// remoteStreamer streamt den Audiostrom eines Kanals fortlaufend zum
+// GPU-Whisper - so, wie es die Protokoll-Spec vorsieht ("audio chunks senden,
+// bei Sprachende endOfUtterance=true"). Anders als der frühere Segment-Versand
+// (ganzes 4-s-Fenster als EIN Paket, jedes mit endOfUtterance=true) sammelt
+// der Server die Äußerung selbst und transkribiert sie mit vollem Kontext,
+// sobald die Pause gemeldet wird: bessere Erkennung, und kurze Sätze
+// erscheinen sofort statt nach der Fenster-Füllung.
+//
+// Stille wird NICHT gestreamt (nur der Vorlauf vadPreRoll vor dem
+// Sprachbeginn): das hält den Utterance-Puffer des Servers klein und
+// verhindert Halluzinationen auf stillen Kanälen. Gesendet wird gebündelt
+// (~250 ms je audio-Nachricht) statt je ~10-ms-Callback-Chunk (weniger
+// JSON-/Base64-Overhead). Läuft komplett in der Buffer-Goroutine des Kanals.
+type remoteStreamer struct {
+	speaker string
+	gain    func() float64
+
+	pre       []byte // Vorlauf: letzte Stille vor dem nächsten Sprachbeginn
+	sendBuf   []byte // Sprach-Audio, das noch nicht gesendet wurde
+	inSpeech  bool
+	silentRun int // zusammenhängende Stille seit dem letzten Sprach-Chunk
+	utterLen  int // bereits gesendete Bytes der laufenden Äußerung
+}
+
+// remoteChunkBytes: Bündelgröße je audio-Nachricht (~250 ms PCM ≈ 8 KB).
+const remoteChunkBytes = vadBytesPerSecond / 4
+
+// feed verarbeitet einen Audio-Chunk (~10 ms) aus dem Capture-Callback.
+// Schwellen/Zeitkonstanten identisch zum lokalen vadSegmenter (vad.go).
+func (r *remoteStreamer) feed(chunk []byte) {
+	g := r.gain()
+	if g < 1 {
+		g = 1
+	}
+	speech := chunkPeak(chunk)/g > vadChunkSpeechThresh
+
+	if !r.inSpeech {
+		if !speech {
+			r.pre = append(r.pre, chunk...)
+			if len(r.pre) > vadPreRoll {
+				r.pre = r.pre[len(r.pre)-vadPreRoll:]
+			}
+			return
+		}
+		// Sprachbeginn: Vorlauf + aktuellen Chunk in die Äußerung übernehmen.
+		r.inSpeech = true
+		r.silentRun = 0
+		r.utterLen = 0
+		r.sendBuf = append(r.sendBuf, r.pre...)
+		r.pre = nil
+	} else if speech {
+		r.silentRun = 0
+	} else {
+		r.silentRun += len(chunk)
+	}
+	r.sendBuf = append(r.sendBuf, chunk...)
+
+	if r.silentRun >= vadPauseCut {
+		// Sprechpause: überzählige Stille am Ende nicht mitsenden (bis auf
+		// vadTrailKeep), dann Äußerungsende melden -> Server transkribiert.
+		drop := r.silentRun - vadTrailKeep
+		if drop > len(r.sendBuf) {
+			drop = len(r.sendBuf)
+		}
+		if drop > 0 {
+			r.sendBuf = r.sendBuf[:len(r.sendBuf)-drop]
+		}
+		r.endUtterance()
 		return
 	}
-	if err := s.sendAudio(audio); err != nil {
-		Log("Remote-STT senden fehlgeschlagen: " + err.Error())
-		closeRemoteSession(speaker)
+	if r.utterLen+len(r.sendBuf) >= vadMaxSeg {
+		// Dauersprechen ohne Pause: Notschnitt, sonst puffert der Server
+		// unbegrenzt und der Text erschiene erst am Gesprächsende.
+		r.endUtterance()
+		return
 	}
+	if len(r.sendBuf) >= remoteChunkBytes {
+		r.push(false)
+	}
+}
+
+// push sendet den gepufferten Abschnitt (eou = Äußerungsende).
+func (r *remoteStreamer) push(eou bool) {
+	if len(r.sendBuf) == 0 && !eou {
+		return
+	}
+	remoteSendChunk(r.sendBuf, r.speaker, eou)
+	r.utterLen += len(r.sendBuf)
+	r.sendBuf = nil
+}
+
+func (r *remoteStreamer) endUtterance() {
+	r.push(true)
+	r.inSpeech = false
+	r.silentRun = 0
+	r.utterLen = 0
+}
+
+// flush schließt eine laufende Äußerung ab (Aufnahme-Stopp): ohne das fehlte
+// der letzte Satz, weil kein weiterer Chunk mehr die Pause melden würde.
+func (r *remoteStreamer) flush() {
+	if r.inSpeech {
+		r.endUtterance()
+	}
+	r.pre = nil
 }
 
 func closeRemoteSession(speaker string) {

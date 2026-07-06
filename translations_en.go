@@ -46,17 +46,17 @@ var enOverrides = map[string]string{
 	"remote LLM konfigurieren":                "Configure remote LLM",
 
 	// --- Einstellungen: Ticketsuche / Webhook / CRM ---
-	"Automatische Ticketsuche":     "Automatic ticket search",
-	"aktiviert":                    "enabled",
-	"Anrufer automatisch suchen":   "Search caller automatically",
-	"Mitschrift bei Anruf starten": "Start transcript on call",
-	"Prompt für passende Tickets:": "Prompt for matching tickets:",
-	"Prompt für Suchen:":           "Prompt for searches:",
-	"Rufnummern Übergabe":          "Phone number handover",
-	"Webhook aktiv:":               "Webhook active:",
-	"Webhook-URL (Pfad):":          "Webhook URL (path):",
-	"CRM Feld":                     "CRM field",
-	"Mehrere CRM-Treffer":          "Multiple CRM matches",
+	"Automatische Ticketsuche":       "Automatic ticket search",
+	"aktiviert":                      "enabled",
+	"Anrufer automatisch suchen":     "Search caller automatically",
+	"Mitschrift bei Anruf starten":   "Start transcript on call",
+	"Prompt für passende Tickets:":   "Prompt for matching tickets:",
+	"Prompt für KI-Zusammenfassung:": "Prompt for AI summary:",
+	"Rufnummern Übergabe":            "Phone number handover",
+	"Webhook aktiv:":                 "Webhook active:",
+	"Webhook-URL (Pfad):":            "Webhook URL (path):",
+
+	"Mehrere CRM-Treffer": "Multiple CRM matches",
 	"Debug-Modus (Anfrage vor Versand anzeigen: Suchen/Analysieren)": "Debug mode (show request before sending: search/analyze)",
 
 	// --- Einstellungen: Remote-Backends ---
@@ -104,6 +104,7 @@ var enOverrides = map[string]string{
 	"offen":                      "open",
 	"alle":                       "all",
 	"Kundenv.":                   "Cust. mgmt",
+	"Kundenv. ID":                "Cust. mgmt ID",
 	"Kundenverwaltung-Tickets:":  "Customer mgmt tickets:",
 	"Kundenverwaltung: ":         "Customer management: ",
 	"Jira: %d Treffer":           "Jira: %d hits",

@@ -850,10 +850,12 @@ var (
 	engineInfo        *widget.Label
 	progressBar       *widget.ProgressBar
 	micBtn            *tooltipButton
-	customerField     *widget.Label // CRM Feld (reines Anzeige-Label); per Rufnummern-Webhook befuellt
-	callerNumberLabel *widget.Label // zeigt die per Webhook empfangene Rufnummer (zwischen Feld und Start-Button)
-	mainWin           fyne.Window   // Hauptfenster, u.a. fuer Dialoge aus webhook.go
-	lastSoundTime     atomic.Value  // *time.Time, atomar für Zugriff aus Goroutines
+	customerField     *widget.Label   // CRM-Wert (reines Anzeige-Label); per Rufnummern-Webhook befuellt
+	ibsAddressField   *widget.Label   // "Kundenv. ID": address_id der Kundenverwaltung zum Anrufer ("-" wenn keine)
+	ibsIDBox          *fyne.Container // Label+Wert+Copy der Kundenv. ID; nur sichtbar bei konfigurierter IBS-API (refreshIBSCheck)
+	callerNumberLabel *widget.Label   // zeigt die per Webhook empfangene Rufnummer (zwischen Feld und Start-Button)
+	mainWin           fyne.Window     // Hauptfenster, u.a. fuer Dialoge aus webhook.go
+	lastSoundTime     atomic.Value    // *time.Time, atomar für Zugriff aus Goroutines
 	isSilent          atomic.Bool
 	isRecording       atomic.Bool
 
@@ -983,7 +985,7 @@ type AppConfig struct {
 	JarvisSummaryLines     int  `json:"jarvisSummaryLines"`
 	JarvisAdvancedExpanded bool `json:"jarvisAdvancedExpanded"`
 
-	// "Prompt für Suchen" in "Einstellungen" (KI-Support (Jarvis)): Anweisung an
+	// "Prompt für KI-Zusammenfassung" in "Einstellungen" (KI-Support (Jarvis)): Anweisung an
 	// die LLM, die bei jeder Suche im Feld "prompt" der Anfrage mitgeschickt wird
 	// (s. jarvisQueryRequest.Prompt). Bewusst UNABHÄNGIG vom Suchtext im STT-Tab
 	// (queryEntry): der Suchtext ist die Frage, dieser Prompt die Instruktion -
@@ -1454,6 +1456,14 @@ func main() {
 	p, _ := os.Executable()
 	exeDir = filepath.Dir(p)
 
+	// Mehrfachstart verhindern: laeuft bereits eine Instanz, kurzer nativer
+	// Hinweis und Ende (sonst kollidieren u.a. Webhook-Port, llama-Server-
+	// Ports und die Audio-Geraete der beiden Instanzen).
+	if !ensureSingleInstance() {
+		notifyAlreadyRunning()
+		return
+	}
+
 	// 1. App & Theme (zuerst init für Migration)
 	myApp := app.NewWithID("com.sst.gemma.hybrid")
 	appIcon := fyne.NewStaticResource("app_icon.png", appIconPNG)
@@ -1499,7 +1509,7 @@ func main() {
 	statusLabel.TextStyle = fyne.TextStyle{Bold: true}
 
 	engineInfo = widget.NewLabel(T("Engine: Wartet..."))
-	engineInfo.Alignment = fyne.TextAlignCenter
+	engineInfo.Alignment = fyne.TextAlignTrailing // rechts in der Statuszeile (statusBar)
 
 	progressBar = widget.NewProgressBar()
 	progressBar.Hide()
@@ -1727,15 +1737,32 @@ func main() {
 		}
 	}
 
-	// CRM Feld zwischen Statuszeile ("Bereit") und Start-Button.
-	// Wird per Rufnummern-Webhook (s. webhook.go) mit dem Jira-Issue-Key (CRM) des
-	// zur eingehenden Rufnummer passenden Tickets befuellt bzw. "nicht gefunden".
-	// Default "CRM-10550". Reines Anzeige-Label (kein Textfeld mehr): einzige
-	// Schreibquelle ist setCustomerField (webhook.go), das auch den CRM-Status
-	// (currentCRM) pflegt und die Ticketliste leert; manuelles Eintippen entfaellt.
+	// CRM-Zeile zwischen Statuszeile ("Bereit") und Start-Button:
+	// "CRM <wert> [copy]  Kundenv. ID <address_id> [copy]".
+	// CRM wird per Rufnummern-Webhook (s. webhook.go) mit dem Jira-Issue-Key des
+	// zur eingehenden Rufnummer passenden Tickets befuellt bzw. "-" (nicht
+	// gefunden). Default "CRM-10550". Reines Anzeige-Label (kein Textfeld mehr):
+	// einzige Schreibquelle ist setCustomerField (webhook.go), das auch den
+	// CRM-Status (currentCRM) pflegt und die Ticketliste leert.
 	customerField = widget.NewLabel("CRM-10550")
 	setCurrentCRM(validCRM(customerField.Text)) // Startwert setzen
-	customerRow := container.NewHBox(trLabel("CRM Feld"), customerField)
+	crmCopyBtn := newTooltipButton(theme.ContentCopyIcon(), func() {
+		if v := strings.TrimSpace(customerField.Text); v != "" && v != "-" {
+			mainWin.Clipboard().SetContent(v)
+		}
+	}, "CRM in die Zwischenablage kopieren")
+	// "Kundenv. ID": address_id der Kundenverwaltung zum Anrufer (gesetzt von
+	// performIBSLookup via setIBSAddressField, s. ibs_client.go). Der ganze
+	// Block ist nur sichtbar, wenn URL + API-Key der Kundenverwaltung
+	// hinterlegt sind (Sichtbarkeit schaltet refreshIBSCheck, jarvis_client.go).
+	ibsAddressField = widget.NewLabel("-")
+	ibsCopyBtn := newTooltipButton(theme.ContentCopyIcon(), func() {
+		if v := strings.TrimSpace(ibsAddressField.Text); v != "" && v != "-" {
+			mainWin.Clipboard().SetContent(v)
+		}
+	}, "Kundenverwaltungs-ID in die Zwischenablage kopieren")
+	ibsIDBox = container.NewHBox(trLabel("Kundenv. ID"), ibsAddressField, ibsCopyBtn)
+	customerRow := container.NewHBox(trLabel("CRM"), customerField, crmCopyBtn, ibsIDBox)
 
 	// Label zwischen Feld und Start-Button: zeigt die per Webhook empfangene
 	// Rufnummer des aktuellen Anrufers (leer, bis der erste Anruf eingeht).
@@ -1932,7 +1959,8 @@ func main() {
 	diktatTab := container.NewBorder(
 		topControls,
 		container.NewVBox(
-			engineInfo,
+			// engineInfo lebt jetzt in der Statuszeile ganz unten (statusBar),
+			// nicht mehr mitten im STT-Tab.
 			analysisProgress,
 			container.NewBorder(
 				trLabelStyle("LLM Prompt zur Analyse:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -2484,12 +2512,15 @@ func main() {
 	searchMatchingTickets = searchMatchingTicketsFn
 	clearTicketResults = clearTicketResultsFn
 
-	// "Prompt für Suchen" (config.JarvisSearchQuery): LLM-Anweisung, die bei
-	// jeder Suche im "prompt"-Feld mitgeschickt wird - bewusst OHNE Verbindung
-	// zur Sucheingabe (queryEntry) im KI-Support-Panel.
-	jarvisSearchPromptEntry := NewMinSizeEntry(alignedFormValueW)
-	jarvisSearchPromptEntry.Entry.SetText(config.JarvisSearchQuery)
-	jarvisSearchPromptEntry.Entry.OnChanged = func(s string) {
+	// "Prompt für KI-Zusammenfassung" (config.JarvisSearchQuery): LLM-Anweisung,
+	// die bei jeder Suche im "prompt"-Feld mitgeschickt wird - bewusst OHNE
+	// Verbindung zur Sucheingabe (queryEntry) im KI-Support-Panel. Mehrzeilig
+	// (mind. 6 sichtbare Zeilen), da hier laengere Instruktionen stehen.
+	jarvisSearchPromptEntry := widget.NewMultiLineEntry()
+	jarvisSearchPromptEntry.Wrapping = fyne.TextWrapWord
+	jarvisSearchPromptEntry.SetMinRowsVisible(6)
+	jarvisSearchPromptEntry.SetText(config.JarvisSearchQuery)
+	jarvisSearchPromptEntry.OnChanged = func(s string) {
 		config.JarvisSearchQuery = s
 		saveConfigDebounced()
 	}
@@ -2677,7 +2708,7 @@ func main() {
 			trLabel("API-Key:"), jarvisApiKeyEntry,
 			trLabel("URL Kundenverwaltung API:"), ibsUrlEntry,
 			trLabel("API-Key Kundenverwaltung:"), ibsApiKeyEntry,
-			trLabel("Prompt für Suchen:"), jarvisSearchPromptEntry,
+			trLabel("Prompt für KI-Zusammenfassung:"), jarvisSearchPromptEntry,
 		),
 
 		widget.NewSeparator(),
@@ -2800,10 +2831,14 @@ func main() {
 
 	// Statuszeile ganz unten am Fenster (wie bei anderen Windows-Anwendungen) -
 	// tabuebergreifend sichtbar, unabhaengig davon ob STT oder Einstellungen
-	// aktiv ist.
+	// aktiv ist. Links die drei Pipeline-Pills, rechts der Engine-Status
+	// ("Engine: Wartet..."/"GPU beschleunigt" - frueher mitten im STT-Tab).
 	statusBar := container.NewVBox(
 		widget.NewSeparator(),
-		container.NewPadded(container.NewHBox(recPill.box, postPill.box, anaPill.box)),
+		container.NewPadded(container.NewBorder(nil, nil,
+			container.NewHBox(recPill.box, postPill.box, anaPill.box),
+			engineInfo,
+		)),
 	)
 
 	win.SetContent(container.NewBorder(nil, statusBar, nil, nil, container.NewStack(tabs, logoOverlay)))
@@ -2886,6 +2921,7 @@ func toggleRecording() {
 		pendingRaw.Reset()
 		pendingSpeaker = ""
 		inProgress = nil
+		resetSTTTail() // Kontext-Priming gehoert zur vorherigen Aufnahme
 		isRecording.Store(true)
 		micBtn.SetText(T("Mitschrift stoppen"))
 		micBtn.tip = "Mitschrift stoppen"
@@ -2950,45 +2986,21 @@ func prepareAudio() {
 		configMic.Capture.DeviceID = selectedMicID.Pointer()
 	}
 
-	sampleChanAgent := make(chan []byte, 100)
+	// Kanalpuffer 600 Chunks (~6 s): Rueckstau der (synchronen) Transkription
+	// fuehrte mit dem frueheren 1-s-Puffer schnell zu verworfenen Chunks.
+	sampleChanAgent := make(chan []byte, 600)
 	onDataMic := func(pOutput, pInput []byte, frameCount uint32) {
 		if len(pInput) > 0 {
-			// Digitale Verstärkung (Gain) anwenden — Gain einmal lokal lesen für Race-Free
-			gain := loadF64(&atMicGain)
-			if gain > 1.0 {
-				for i := 0; i < len(pInput); i += 2 {
-					val := int16(binary.LittleEndian.Uint16(pInput[i : i+2]))
-					boosted := float64(val) * gain
+			// Digitale Verstärkung mit weichem Limiter (s. applyGainSoftClip);
+			// Gain einmal lokal lesen für Race-Free.
+			applyGainSoftClip(pInput, loadF64(&atMicGain))
 
-					// Clipping-Schutz
-					if boosted > 32767 {
-						boosted = 32767
-					}
-					if boosted < -32768 {
-						boosted = -32768
-					}
-
-					binary.LittleEndian.PutUint16(pInput[i:i+2], uint16(int16(boosted)))
-				}
-			}
-
-			// Pegel berechnen (immer aktiv)
-			var peak float64
-			for i := 0; i < len(pInput); i += 2 {
-				val := int16(binary.LittleEndian.Uint16(pInput[i : i+2]))
-				fval := float64(val)
-				if fval < 0 {
-					fval = -fval
-				}
-				if fval > peak {
-					peak = fval
-				}
-			}
-			level := peak / 20000.0
-			fyne.Do(func() {
-				agentLevel.SetValue(level)
-				if level > agentMarkerVal { // Peak-Hold: höchsten Ausschlag als Richtwert merken
-					agentMarkerVal = level
+			// Pegelanzeige (immer aktiv), gedrosselt auf ~15 Updates/s.
+			level := chunkPeak(pInput) / 20000.0
+			updateMeterThrottled(&agentMeterLastNs, &agentMeterPeak, level, func(lv float64) {
+				agentLevel.SetValue(lv)
+				if lv > agentMarkerVal { // Peak-Hold: höchsten Ausschlag als Richtwert merken
+					agentMarkerVal = lv
 					if agentMeter != nil {
 						agentMeter.Refresh()
 					}
@@ -3020,7 +3032,7 @@ func prepareAudio() {
 		callerDevice.Uninit()
 	}
 
-	sampleChanCaller := make(chan []byte, 100)
+	sampleChanCaller := make(chan []byte, 600)
 	if runtime.GOOS == "windows" {
 		configLoop := malgo.DefaultDeviceConfig(malgo.Loopback)
 		configLoop.Capture.Format = malgo.FormatS16
@@ -3032,42 +3044,15 @@ func prepareAudio() {
 
 		onDataLoop := func(pOutput, pInput []byte, frameCount uint32) {
 			if len(pInput) > 0 {
-				// Digitale Verstärkung (Gain) anwenden — Gain einmal lokal lesen für Race-Free
-				gainSpk := loadF64(&atSpkGain)
-				if gainSpk > 1.0 {
-					for i := 0; i < len(pInput); i += 2 {
-						val := int16(binary.LittleEndian.Uint16(pInput[i : i+2]))
-						boosted := float64(val) * gainSpk
+				// Digitale Verstärkung mit weichem Limiter (s. applyGainSoftClip).
+				applyGainSoftClip(pInput, loadF64(&atSpkGain))
 
-						// Clipping-Schutz
-						if boosted > 32767 {
-							boosted = 32767
-						}
-						if boosted < -32768 {
-							boosted = -32768
-						}
-
-						binary.LittleEndian.PutUint16(pInput[i:i+2], uint16(int16(boosted)))
-					}
-				}
-
-				// Pegel berechnen (immer aktiv im Modus)
-				var peak float64
-				for i := 0; i < len(pInput); i += 2 {
-					val := int16(binary.LittleEndian.Uint16(pInput[i : i+2]))
-					fval := float64(val)
-					if fval < 0 {
-						fval = -fval
-					}
-					if fval > peak {
-						peak = fval
-					}
-				}
-				level := peak / 20000.0
-				fyne.Do(func() {
-					callerLevel.SetValue(level)
-					if level > callerMarkerVal { // Peak-Hold als Richtwert
-						callerMarkerVal = level
+				// Pegelanzeige (immer aktiv im Modus), gedrosselt auf ~15 Updates/s.
+				level := chunkPeak(pInput) / 20000.0
+				updateMeterThrottled(&callerMeterLastNs, &callerMeterPeak, level, func(lv float64) {
+					callerLevel.SetValue(lv)
+					if lv > callerMarkerVal { // Peak-Hold als Richtwert
+						callerMarkerVal = lv
 						if callerMeter != nil {
 							callerMeter.Refresh()
 						}
@@ -3093,54 +3078,46 @@ func prepareAudio() {
 		}
 	}
 
-	// Agent Buffer Loop
-	agentCtx, agentCancel := context.WithCancel(context.Background())
-	go func() {
-		var audioBuffer []byte
-		const secondsToBuffer = 4
-		const bytesPerSecond = 16000 * 2
+	// Buffer-Loops: schneiden den Audiostrom per VAD an Sprechpausen (statt
+	// des frueheren starren 4-s-Fensters, das Woerter an der Byte-Grenze
+	// zerteilte - Details s. vad.go). Der Ticker flusht beim Aufnahme-Stopp
+	// den Restpuffer: der Callback liefert dann keine Chunks mehr, ohne Flush
+	// fehlten die letzten Worte des Gespraechs im Transkript.
+	runVADLoop := func(ctx context.Context, ch <-chan []byte, speaker string, gain func() float64) {
+		seg := &vadSegmenter{speaker: speaker, gain: gain, emit: processSegment}
+		stream := &remoteStreamer{speaker: speaker, gain: gain}
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
-			case <-agentCtx.Done():
+			case <-ctx.Done():
 				return
-			case samples, ok := <-sampleChanAgent:
+			case samples, ok := <-ch:
 				if !ok {
 					return
 				}
-				audioBuffer = append(audioBuffer, samples...)
-				if len(audioBuffer) >= bytesPerSecond*secondsToBuffer {
-					processSegment(audioBuffer, "Agent")
-					// Nicht-überlappendes Fenster: vorher wurden 3 von 4 s erneut
-					// transkribiert und doppelt angehängt. Buffer komplett leeren.
-					audioBuffer = nil
+				if atWhisperLocal.Load() {
+					seg.feed(samples)
+				} else {
+					// Remote-GPU: kontinuierlich streamen; die Äußerungs-
+					// Segmentierung meldet der Streamer dem Server per
+					// endOfUtterance (s. remoteStreamer in remote_stt.go).
+					stream.feed(samples)
+				}
+			case <-ticker.C:
+				if !isRecording.Load() {
+					seg.flush()
+					stream.flush()
 				}
 			}
 		}
-	}()
+	}
 
-	// Caller Buffer Loop
+	agentCtx, agentCancel := context.WithCancel(context.Background())
+	go runVADLoop(agentCtx, sampleChanAgent, "Agent", func() float64 { return loadF64(&atMicGain) })
+
 	callerCtx, callerCancel := context.WithCancel(context.Background())
-	go func() {
-		var audioBuffer []byte
-		const secondsToBuffer = 4
-		const bytesPerSecond = 16000 * 2
-		for {
-			select {
-			case <-callerCtx.Done():
-				return
-			case samples, ok := <-sampleChanCaller:
-				if !ok {
-					return
-				}
-				audioBuffer = append(audioBuffer, samples...)
-				if len(audioBuffer) >= bytesPerSecond*secondsToBuffer {
-					processSegment(audioBuffer, "Anrufer")
-					// Nicht-überlappendes Fenster (siehe Agent-Loop)
-					audioBuffer = nil
-				}
-			}
-		}
-	}()
+	go runVADLoop(callerCtx, sampleChanCaller, "Anrufer", func() float64 { return loadF64(&atSpkGain) })
 
 	// Cancel-Funktionen der NEUEN Goroutinen global merken, damit der nächste
 	// prepareAudio-Aufruf genau diese (und nicht sich selbst) beenden kann.
@@ -3182,8 +3159,14 @@ func detectSilence(samples []byte) {
 		}
 	}
 
-	// Threshold für Stille (ca. 2% Amplitude)
-	if max > 600 {
+	// Threshold für Stille (ca. 2% Amplitude). Aufs ROH-Signal normalisieren:
+	// die Samples sind bereits um den Mikro-Gain verstärkt - ohne die Division
+	// hinge die Pausenerkennung (Satzende -> LLM-Korrektur) am Gain-Regler.
+	g := loadF64(&atMicGain)
+	if g < 1 {
+		g = 1
+	}
+	if float64(max)/g > 600 {
 		now := time.Now()
 		lastSoundTime.Store(&now)
 		isSilent.Store(false)
@@ -3370,23 +3353,16 @@ func correctWithLLM(raw string) string {
 
 // hasSpeech schätzt per Energie (RMS), ob ein Segment überhaupt Sprache enthält.
 // Stille/Rauschen wird NICHT transkribiert – das verhindert Whisper-Halluzinationen
-// ("Vielen Dank", "Untertitelung …" u.ä.) auf einem stillen Kanal. Die RMS wird
-// gegen den Kanal-Gain normalisiert, da das Audio bereits verstärkt vorliegt.
+// ("Vielen Dank", "Untertitelung …" u.ä.) auf einem stillen Kanal. Geprüft wird
+// in 250-ms-SUBFENSTERN: die frühere RMS über das gesamte Segment verdünnte
+// kurze Äußerungen (ein "Ja." in einem sonst stillen Fenster fiel unter die
+// Schwelle und wurde komplett verworfen) – jetzt genügt EIN energiereiches
+// Subfenster. Die RMS wird gegen den Kanal-Gain normalisiert, da das Audio
+// bereits verstärkt vorliegt.
 func hasSpeech(audio []byte, speaker string) bool {
 	if len(audio) < 2 {
 		return false
 	}
-	var sumSq float64
-	n := 0
-	for i := 0; i+1 < len(audio); i += 2 {
-		v := float64(int16(binary.LittleEndian.Uint16(audio[i : i+2])))
-		sumSq += v * v
-		n++
-	}
-	if n == 0 {
-		return false
-	}
-	rms := math.Sqrt(sumSq / float64(n))
 	gain := loadF64(&atMicGain)
 	if speaker == "Anrufer" {
 		gain = loadF64(&atSpkGain)
@@ -3394,7 +3370,24 @@ func hasSpeech(audio []byte, speaker string) bool {
 	if gain < 1 {
 		gain = 1
 	}
-	return rms/gain > 200 // Schwelle auf das Roh-Audio (vor Verstärkung)
+	const win = vadBytesPerSecond / 4 // 250 ms
+	for start := 0; start < len(audio); start += win {
+		end := start + win
+		if end > len(audio) {
+			end = len(audio)
+		}
+		var sumSq float64
+		n := 0
+		for i := start; i+1 < end; i += 2 {
+			v := float64(int16(binary.LittleEndian.Uint16(audio[i : i+2])))
+			sumSq += v * v
+			n++
+		}
+		if n > 0 && math.Sqrt(sumSq/float64(n))/gain > 200 {
+			return true // Schwelle auf das Roh-Audio (vor Verstärkung)
+		}
+	}
+	return false
 }
 
 func processSegment(audio []byte, speaker string) {
@@ -3419,7 +3412,14 @@ func processSegment(audio []byte, speaker string) {
 	}
 
 	modelPath := filepath.Join(exeDir, "models", "whisper-base.bin")
-	cmd := exec.Command(whisperBin, "-m", modelPath, "-f", tmpFile, "-l", "de", "-nt")
+	args := []string{"-m", modelPath, "-f", tmpFile, "-l", "de", "-nt"}
+	// Kontext-Priming: die letzten ~200 Zeichen erkannten Textes als initial
+	// prompt mitgeben - konsistente Schreibweisen/Eigennamen ueber
+	// Segmentgrenzen hinweg, weniger Fehler am Segmentanfang (s. vad.go).
+	if tail := getSTTTail(); tail != "" {
+		args = append(args, "--prompt", tail)
+	}
+	cmd := exec.Command(whisperBin, args...)
 
 	// Setzt den Silent-Mode (plattformspezifisch)
 	setSilent(cmd)
@@ -3453,6 +3453,7 @@ func processSegment(audio []byte, speaker string) {
 
 	if len(cleanLines) > 0 {
 		text := strings.Join(cleanLines, " ")
+		updateSTTTail(text) // Kontext fuer das initial prompt des naechsten Segments
 		if atHasPostProc.Load() {
 			// Rohtext live anzeigen; Korrektur erfolgt am Satzende (siehe detectSilence).
 			appendPendingRaw(speaker, text)

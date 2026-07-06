@@ -312,15 +312,20 @@ func handleIncomingCaller(number string, auto bool) {
 	// (setCustomerField) und wird durch das Ergebnis unten aktualisiert.
 	setCallerNumber(number)
 
-	// IBS-Ticketbereich sofort leeren: sein Inhalt gehoert zum VORHERIGEN
-	// Anrufer. Bewusst unabhaengig davon, ob die IBS-Abfrage unten laeuft -
-	// sonst bliebe bei inzwischen deaktivierter Checkbox ein veralteter
-	// Bereich stehen.
+	// Die komplette Anruf-Ansicht SOFORT leeren (Status-Zeile "Jira: n
+	// Treffer ...", Ticket-Karten beider Quellen): ihr Inhalt gehoert zum
+	// VORHERIGEN Anrufer und stuende sonst bis zum Eintreffen der neuen
+	// Ergebnisse (bis zu 120 s) in der Liste. Bewusst unabhaengig davon, ob
+	// die Abfragen unten laufen - sonst bliebe bei deaktivierter Auto-Suche/
+	// Checkbox ein veralteter Stand stehen.
 	fyne.Do(func() {
-		if clearIBSTickets != nil {
-			clearIBSTickets()
+		if resetCallView != nil {
+			resetCallView()
 		}
 	})
+	// Kundenv.-ID des vorherigen Anrufers zuruecksetzen (performIBSLookup
+	// setzt gleich die neue, sofern die IBS-Abfrage unten laeuft).
+	setIBSAddressField("-")
 
 	if auto && !config.AutoSearchCaller {
 		Log(fmt.Sprintf("Rufnummern-Webhook: Rufnummer %q angezeigt, Auto-Suche deaktiviert", number))
@@ -328,20 +333,28 @@ func handleIncomingCaller(number string, auto bool) {
 	}
 
 	// Im Debug-Modus die Anfrage als Popup zeigen (Senden/Abbrechen), sonst
-	// sofort ausführen. debugPreviewAndConfirm regelt beides selbst.
+	// sofort ausführen. debugPreviewAndConfirm regelt beides selbst. Sobald
+	// die Abfrage TATSAECHLICH startet (nicht bei Abbruch im Debug-Popup),
+	// zeigt die Ergebnisliste den "Ich arbeite"-Indikator.
 	fyne.Do(func() {
 		debugPreviewAndConfirm(mainWin, "Rufnummern-Webhook: CRM-Abfrage", jarvisPhonePreview(number), func() {
+			if showCallWorking != nil {
+				showCallWorking()
+			}
 			go performCallerJiraLookup(number)
 		})
 	})
 
 	// IBS-Kundenverwaltung: laeuft ZUSAETZLICH zur Jira-CRM-Suche, wenn die
 	// Checkbox "IBS Tickets" aktiv ist (nur aktivierbar, wenn URL + API-Key
-	// hinterlegt sind). Flow: Rufnummer -> Adresse -> alle Events; Anzeige im
-	// IBS-Bereich oberhalb der Ergebnisliste (s. ibs_client.go).
+	// hinterlegt sind). Flow: Rufnummer -> Adresse -> alle Events; Anzeige in
+	// der gemeinsamen Anruf-Ticketliste (s. ibs_client.go).
 	if config.JarvisIBS && ibsConfigured() {
 		fyne.Do(func() {
 			debugPreviewAndConfirm(mainWin, "Rufnummern-Webhook: IBS-Abfrage", ibsRequestPreview(number), func() {
+				if showCallWorking != nil {
+					showCallWorking()
+				}
 				go performIBSLookup(number)
 			})
 		})
@@ -369,7 +382,7 @@ func performCallerJiraLookup(number string) {
 	if err != nil {
 		Log("Rufnummern-Webhook: CRM-Abfrage fehlgeschlagen: " + err.Error())
 		setCurrentCRM("")
-		setCustomerField("nicht gefunden")
+		setCustomerField("-")
 		return
 	}
 
@@ -380,7 +393,7 @@ func performCallerJiraLookup(number string) {
 	if len(matches) == 0 {
 		Log(fmt.Sprintf("Rufnummern-Webhook: keine CRM zu %q gefunden (total=%d)", number, res.Total))
 		setCurrentCRM("")
-		setCustomerField("nicht gefunden")
+		setCustomerField("-")
 		return
 	}
 
@@ -400,7 +413,7 @@ func performCallerJiraLookup(number string) {
 			if crm == "" {
 				Log(fmt.Sprintf("Rufnummern-Webhook: CRM-Auswahl abgebrochen (Rufnummer %q)", number))
 				setCurrentCRM("")
-				setCustomerField("nicht gefunden")
+				setCustomerField("-")
 				return
 			}
 		}
@@ -592,6 +605,12 @@ func applyCRM(number, crm string) {
 	Log(fmt.Sprintf("Rufnummern-Webhook: Rufnummer %q -> CRM %s", number, crm))
 	setCustomerField(crm)
 	fyne.Do(func() {
+		// Nach der CRM-Auswahl kann die Ticketsuche dauern: Liste sofort
+		// durch den "Ich arbeite"-Indikator ersetzen (die Ergebnisse bzw.
+		// eine Fehlermeldung loesen ihn ab).
+		if showCallWorking != nil {
+			showCallWorking()
+		}
 		if searchMatchingTickets != nil && outputArea != nil {
 			searchMatchingTickets(outputArea.Text, nil, true, true)
 		}

@@ -214,6 +214,7 @@ curl -X POST http://localhost:8080/va/ev/getOpenEvents \
     {
       "id": 1234,
       "creation_time": "03.07.2026 10:15:00",
+      "modification_time": "04.07.2026 12:44:43",
       "state_type": "0",
       "state": "NEU",
       "dispatch user": "r.meister",
@@ -222,6 +223,7 @@ curl -X POST http://localhost:8080/va/ev/getOpenEvents \
     {
       "id": 1235,
       "creation_time": "04.07.2026 08:00:00",
+      "modification_time": "04.07.2026 15:01:02",
       "state_type": "60",
       "state": "Befunde abwarten",
       "dispatch user": "",
@@ -239,6 +241,7 @@ curl -X POST http://localhost:8080/va/ev/getOpenEvents \
 | `event[]` | Array | Liste der offenen Events |
 | `event[].id` | Integer | Lokale Event-ID (`localId`) |
 | `event[].creation_time` | String | Erstellungszeit |
+| `event[].modification_time` | String | Zeit der letzten Änderung |
 | `event[].state_type` | Integer | Status-Txpe aus `EVENT_STATE`-Enum |
 | `event[].state` | String | Status-Name aus `EVENT_STATE`-Enum |
 | `event[].dispatch user` | String | Zugewiesener Benutzer (Loginname) |

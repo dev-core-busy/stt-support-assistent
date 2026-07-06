@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -114,6 +115,35 @@ type jarvisBlock struct {
 	// muessen gegen die Jarvis-Basis-URL aufgeloest werden (s. resolveJarvisLink).
 	Doc     string `json:"doc"`
 	DocName string `json:"doc_name"`
+	// Erstellt / letzter Zugriff des Tickets (nur JIRA-Blocks). Der Server
+	// liefert beide seit dem Jarvis-Update vom 2026-07-06 direkt in den
+	// query-Blocks (ISO mit Zone ohne Doppelpunkt, s. ticketTimeLayouts);
+	// abweichende Feldnamen werden tolerant mitgesucht (UnmarshalJSON unten).
+	Created string `json:"created"`
+	Updated string `json:"updated"`
+}
+
+// UnmarshalJSON dekodiert einen Block normal und sucht Erstellt-/Zugriffszeit
+// zusaetzlich unter toleranten Schluesselvarianten (gleiches Prinzip wie die
+// IBS-Parser, s. ibsFieldString) - die Jarvis-Doku war schon bei den
+// WISSEN-Links unvollstaendig, Feldnamen koennten abweichen.
+func (b *jarvisBlock) UnmarshalJSON(data []byte) error {
+	type plain jarvisBlock // Alias ohne Methoden (verhindert Rekursion)
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	*b = jarvisBlock(p)
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err == nil {
+		if b.Created == "" {
+			b.Created = ibsFieldString(m, "created", "createdat", "creationtime", "creationdate", "erstellt")
+		}
+		if b.Updated == "" {
+			b.Updated = ibsFieldString(m, "updated", "updatedat", "modificationtime", "modified", "lastaccess", "lastaccesstime", "letzterzugriff")
+		}
+	}
+	return nil
 }
 
 type jarvisQueryResponse struct {
@@ -306,6 +336,66 @@ func jarvisPhoneLookup(phone string) (*jiraPhoneResponse, string, error) {
 func jarvisPhonePreview(phone string) string {
 	baseURL := strings.TrimRight(strings.TrimSpace(config.Jarvis.Url), "/")
 	return fmt.Sprintf("GET %s/api/jira/phonenumber?phone=%s", baseURL, url.QueryEscape(phone))
+}
+
+// ticketTimeLayouts: bekannte Zeitformate der beiden Quellen - Jira liefert
+// ISO mit Zone ohne Doppelpunkt ("2026-07-06T08:00:09.000+0200"), die
+// Kundenverwaltung REAL ein Kompaktformat ohne Trenner ("20220801135904" =
+// yyyyMMddHHmmss; das deutsche Format "03.07.2026 10:15:00" aus der Doku
+// bleibt als Rueckfall - die Doku wich hier wieder vom Server ab).
+var ticketTimeLayouts = []string{
+	"2006-01-02T15:04:05.000-0700",
+	"2006-01-02T15:04:05-0700",
+	time.RFC3339Nano,
+	time.RFC3339,
+	"20060102150405",
+	"02.01.2006 15:04:05",
+	"02.01.2006 15:04",
+	"2006-01-02 15:04:05",
+	"2006-01-02",
+	"20060102",
+}
+
+// parseTicketTime parst eine Ticket-Zeit tolerant (s. ticketTimeLayouts).
+func parseTicketTime(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range ticketTimeLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// fmtTicketTime formatiert eine Ticket-Zeit einheitlich fuer die Karten
+// ("02.01.2006 15:04"); unparsbare Werte erscheinen unveraendert.
+func fmtTicketTime(s string) string {
+	if t, ok := parseTicketTime(s); ok {
+		return t.Format("02.01.2006 15:04")
+	}
+	return strings.TrimSpace(s)
+}
+
+// ticketMetaRow baut die graue Meta-Zeile "Erstellt: ... · Letzter Zugriff:
+// ..." unter der Kopfzeile einer Ticket-Karte (Jira und IBS). nil, wenn keine
+// der beiden Zeiten vorliegt (dann entfaellt die Zeile komplett).
+func ticketMetaRow(created, modified string) fyne.CanvasObject {
+	var parts []string
+	if strings.TrimSpace(created) != "" {
+		parts = append(parts, T("Erstellt: ")+fmtTicketTime(created))
+	}
+	if strings.TrimSpace(modified) != "" {
+		parts = append(parts, T("Letzter Zugriff: ")+fmtTicketTime(modified))
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	t := canvas.NewText(strings.Join(parts, "  ·  "), color.NRGBA{R: 0x66, G: 0x66, B: 0x66, A: 255})
+	t.TextSize = 11
+	return t
 }
 
 // kiCard umrahmt content mit einem duennen, abgerundeten Rand auf weissem/
@@ -898,6 +988,69 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	if !openOnlyTickets {
 		openIdx = 1
 	}
+	// Sortierung der Anruf-Ticketliste (Zeile "Sortierung:" unterhalb der
+	// Kopfzeile, s.u. crmSortRow): sortMode "" = unsortiert (Server-
+	// Reihenfolge, IBS offen zuerst), "created"/"modified" = nach Erstellt/
+	// letztem Zugriff ueber BEIDE Quellen gemischt. sortAsc false = neueste
+	// zuerst. Erneuter Klick auf den aktiven Modus dreht die Richtung um
+	// (▼/▲). Zustand kommt aus der Config (bleibt wie Radio/Haekchen ueber
+	// Neustarts erhalten); renderResults liest ihn beim Anhaengen der Karten.
+	sortMode := config.JarvisCallSortMode
+	if sortMode != "created" && sortMode != "modified" {
+		sortMode = ""
+	}
+	sortAsc := config.JarvisCallSortAsc
+	// crmSortRow (die Leiste "Sortierung: unsortiert|erstellt|geändert") wird
+	// weiter unten gebaut (nach renderResults, braucht rerenderCallList) und
+	// von renderResults DIREKT OBERHALB der ersten Ticket-Karte in die
+	// Ergebnisliste eingehaengt - also unterhalb von Status-Zeile/KI-
+	// Zusammenfassung, nicht in der Kopfzeile (Nutzer-Vorgabe). RemoveAll
+	// beim Neu-Rendern loest die Instanz wieder, sie wird dann neu angehaengt.
+	var crmSortRow fyne.CanvasObject
+	// sortCard: eine fertig gebaute Ticket-Karte samt ihrer Sortier-Zeiten.
+	type sortCard struct {
+		obj               fyne.CanvasObject
+		created, modified string
+	}
+	// lastTicketCards haelt die Ticket-Karten des letzten Anruf-Renderns in
+	// ORIGINAL-Reihenfolge (Jira zuerst, dann IBS offen/beendet) - Grundlage
+	// des Schnellpfads beim Umsortieren (rerenderCallList): die vorhandenen
+	// Karten-Widgets werden nur UMGEHAENGT, nichts wird neu gebaut.
+	var lastTicketCards []sortCard
+	// orderedTicketCards liefert die Karten in der aktuell gewaehlten
+	// Sortierung (sortMode "" = Original-Reihenfolge, sonst Kopie, Eingabe
+	// bleibt unveraendert). Chronologisch ueber beide Quellen gemischt;
+	// Karten ohne (parsbare) Zeit landen unabhaengig von der Richtung ans
+	// Ende, stabil sortiert (relative Reihenfolge bleibt erhalten).
+	orderedTicketCards := func(cards []sortCard) []sortCard {
+		if sortMode == "" {
+			return cards
+		}
+		out := make([]sortCard, len(cards))
+		copy(out, cards)
+		key := func(c sortCard) (time.Time, bool) {
+			s := c.created
+			if sortMode == "modified" {
+				s = c.modified
+			}
+			return parseTicketTime(s)
+		}
+		sort.SliceStable(out, func(i, j int) bool {
+			ti, oki := key(out[i])
+			tj, okj := key(out[j])
+			if oki != okj {
+				return oki // Karten mit Zeit vor Karten ohne
+			}
+			if !oki {
+				return false
+			}
+			if sortAsc {
+				return ti.Before(tj)
+			}
+			return tj.Before(ti)
+		})
+		return out
+	}
 	// applyAndScrollTop: Umschalten von Radio/Quellen-Haekchen zeigt eine
 	// inhaltlich andere Liste - danach immer an den Listenanfang springen
 	// (sonst bliebe die Scroll-Position mitten im vorherigen Ergebnis stehen).
@@ -1166,6 +1319,20 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			resultsBox.Add(kiCard(cardBox))
 		}
 
+		// Ticket-Karten der Anruf-Ansicht werden erst GESAMMELT und nach der
+		// gewaehlten Sortierung ("Sortierung: unsortiert|erstellt|geändert",
+		// s. crmSortRow) angehaengt - so mischen sich Jira- und IBS-Karten
+		// chronologisch. Ausserhalb der Anruf-Ansicht (normale Suche) gibt es
+		// keine Sortier-Leiste: Karten landen direkt in der Liste.
+		var ticketCards []sortCard
+		addTicketCard := func(obj fyne.CanvasObject, created, modified string) {
+			if crmView {
+				ticketCards = append(ticketCards, sortCard{obj: obj, created: created, modified: modified})
+				return
+			}
+			resultsBox.Add(obj)
+		}
+
 		for i, b := range res.Blocks {
 			title := b.Title
 			if title == "" {
@@ -1235,7 +1402,13 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			snippet := widget.NewRichText(highlightedSegments(display, "")...)
 			snippet.Wrapping = fyne.TextWrapWord
 
-			cardContent := container.NewVBox(headerRow, snippet)
+			cardContent := container.NewVBox(headerRow)
+			// Meta-Zeile "Erstellt/Letzter Zugriff" (falls Zeiten vorliegen -
+			// WISSEN-/Confluence-Blocks haben keine, dort entfaellt die Zeile).
+			if meta := ticketMetaRow(b.Created, b.Updated); meta != nil {
+				cardContent.Add(meta)
+			}
+			cardContent.Add(snippet)
 			if truncated {
 				idx := len(cards) // Index des unten angehaengten filterCard-Eintrags
 				expanded := false
@@ -1276,12 +1449,12 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			// damit die Checkbox sie nie ausblendet; Tickets nach Server-Meldung.
 			cards = append(cards, filterCard{
 				obj:     card,
-				text:    strings.ToLower(strings.Join([]string{title, b.Summary, b.Key, b.Source, b.SourceLabel}, " ")),
+				text:    strings.ToLower(strings.Join([]string{title, b.Summary, b.Key, b.Source, b.SourceLabel, fmtTicketTime(b.Created), fmtTicketTime(b.Updated)}, " ")),
 				open:    !crmView || !isTicket || openKeys[b.Key],
 				snippet: snippet,
 				raw:     display,
 			})
-			resultsBox.Add(card)
+			addTicketCard(card, b.Created, b.Updated)
 		}
 
 		// Kundenverwaltungs-Tickets (IBS) als Karten in DERSELBEN Liste (nur
@@ -1318,9 +1491,11 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			statusFg := color.NRGBA{R: 0x44, G: 0x44, B: 0x44, A: 255}
 			for _, tk := range ordered {
 				// Kopfzeile EINZEILIG: links nur die Event-Nummer "#nnnnnn"
-				// (Erstellzeit/Bearbeiter erscheinen bewusst nicht; die Nummer
+				// (der Bearbeiter erscheint bewusst nicht; die Nummer
 				// wird spaeter ein Link auf die API-Funktion "Event anzeigen" -
-				// Endpunkt folgt). Rechts IBS-/Status-Pill und
+				// Endpunkt folgt). Erstellzeit/letzter Zugriff stehen in der
+				// grauen Meta-Zeile darunter (ticketMetaRow, wie bei den
+				// Jira-Karten). Rechts IBS-/Status-Pill und
 				// "KI-Zusammenfassung". Darunter - wie bei den Jira-Karten -
 				// der Beschreibungstext (bodySlot); die KI-Zusammenfassung
 				// ERSETZT ihn beim Klick (zweiter Klick stellt ihn wieder her).
@@ -1354,10 +1529,15 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 					right = append(right, ibsSummaryControls(tk, textBody, bodySlot))
 				}
 				headerRow := container.NewBorder(nil, nil, nil, container.NewHBox(right...), titleLbl)
-				card := kiCard(container.NewVBox(headerRow, bodySlot))
+				cardBox := container.NewVBox(headerRow)
+				if meta := ticketMetaRow(tk.Created, tk.Modified); meta != nil {
+					cardBox.Add(meta)
+				}
+				cardBox.Add(bodySlot)
+				card := kiCard(cardBox)
 				cards = append(cards, filterCard{
 					obj:     card,
-					text:    strings.ToLower(strings.Join([]string{tk.Key, tk.Created, tk.User, tk.Status, tk.Text}, " ")),
+					text:    strings.ToLower(strings.Join([]string{tk.Key, fmtTicketTime(tk.Created), fmtTicketTime(tk.Modified), tk.User, tk.Status, tk.Text}, " ")),
 					open:    tk.Open,
 					snippet: snippet,
 					raw:     display,
@@ -1388,8 +1568,24 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 					}
 					textBody.Add(container.NewHBox(toggle)) // Toggle linksbuendig unter dem Text
 				}
-				resultsBox.Add(card)
+				addTicketCard(card, tk.Created, tk.Modified)
 			}
+		}
+
+		// Gesammelte Ticket-Karten der Anruf-Ansicht anhaengen (Sortierung s.
+		// orderedTicketCards); die Sortier-Leiste sitzt direkt oberhalb der
+		// ersten Karte. lastTicketCards merkt sich die Original-Reihenfolge
+		// fuer den Umsortier-Schnellpfad (rerenderCallList).
+		if crmView {
+			lastTicketCards = ticketCards
+			if len(ticketCards) > 0 && crmSortRow != nil {
+				resultsBox.Add(crmSortRow)
+			}
+			for _, c := range orderedTicketCards(ticketCards) {
+				resultsBox.Add(c.obj)
+			}
+		} else {
+			lastTicketCards = nil
 		}
 
 		if len(cards) == 0 && strings.TrimSpace(res.AISummary) == "" {
@@ -1673,6 +1869,115 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	crmHeader := container.NewBorder(nil, nil, nil,
 		container.NewHBox(crmJiraCheck, crmIBSCheck, crmOpenRadio, newFilterWrap(crmFilterEntry), crmCloseBtn),
 		trLabelStyle("Tickets zur CRM", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}))
+
+	// Sortier-Leiste der Anruf-Ticketliste ("Sortierung: unsortiert | erstellt |
+	// geändert"): sitzt IN der Ergebnisliste direkt oberhalb der ersten
+	// Ticket-Karte (renderResults haengt crmSortRow dort ein - unterhalb von
+	// Status-Zeile/KI-Zusammenfassung, Nutzer-Vorgabe). Drei Buttons als
+	// Radio-Ersatz: der aktive ist rot hervorgehoben; ein erneuter Klick auf
+	// "erstellt"/"geändert" dreht die Richtung um (▼ neueste zuerst, ▲ aelteste
+	// zuerst) - das kann eine echte RadioGroup nicht (Klick auf die aktive
+	// Option loest kein OnChanged aus). Umschalten rendert die offene
+	// Anruf-Ansicht neu (rerenderCallList) und springt an den Listenanfang;
+	// Zustand wird in der Config gemerkt.
+	var sortUnsortedBtn, sortCreatedBtn, sortModifiedBtn *widget.Button
+	rerenderCallList := func() {
+		if crmLast == nil {
+			return
+		}
+		// Schnellpfad: die Ticket-Karten sind IMMER die letzten Objekte der
+		// Ergebnisliste (renderResults haengt sie als Block ans Ende) - zum
+		// Umsortieren werden die vorhandenen Karten-Widgets nur UMGEHAENGT
+		// (Objects-Tail neu geordnet), NICHTS wird neu gebaut. Das frueher
+		// sekundenlange Voll-Rendern (alle Karten-Widgets neu) entfaellt.
+		if n := len(resultsBox.Objects) - len(lastTicketCards); len(lastTicketCards) > 0 && n >= 0 {
+			head := append([]fyne.CanvasObject{}, resultsBox.Objects[:n]...)
+			for _, c := range orderedTicketCards(lastTicketCards) {
+				head = append(head, c.obj)
+			}
+			resultsBox.Objects = head
+			resultsBox.Refresh()
+			resultsScroll.ScrollToTop()
+			return
+		}
+		// Rueckfall (sollte nicht vorkommen): komplettes Neu-Rendern. Das
+		// laeuft auf dem Fyne-Main-Thread und dauert bei vielen Tickets -
+		// darum SOFORT einen Geduld-Hinweis zeigen, Buttons sperren und das
+		// Rendern per Goroutine + fyne.Do in den naechsten Frame verschieben
+		// (die kurze Pause laesst den Hinweis-Frame zeichnen).
+		sortUnsortedBtn.Disable()
+		sortCreatedBtn.Disable()
+		sortModifiedBtn.Disable()
+		resultsBox.RemoveAll()
+		resultsBox.Add(widget.NewLabel(T("Einen Moment – die Tickets werden neu sortiert …")))
+		resultsBox.Refresh()
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			fyne.Do(func() {
+				defer func() {
+					sortUnsortedBtn.Enable()
+					sortCreatedBtn.Enable()
+					sortModifiedBtn.Enable()
+				}()
+				if crmLast == nil { // Ansicht wurde inzwischen geschlossen
+					return
+				}
+				skipCallReset = true
+				renderResults(crmLast.query, crmLast.res, crmLast.duration, crmLast.openKeys)
+				resultsScroll.ScrollToTop()
+			})
+		}()
+	}
+	updateSortButtons := func() {
+		arrow := func(mode string) string {
+			if sortMode != mode {
+				return ""
+			}
+			if sortAsc {
+				return " ▲"
+			}
+			return " ▼"
+		}
+		importance := func(active bool) widget.Importance {
+			if active {
+				return widget.HighImportance
+			}
+			return widget.MediumImportance
+		}
+		sortUnsortedBtn.SetText(T("unsortiert"))
+		sortUnsortedBtn.Importance = importance(sortMode == "")
+		sortCreatedBtn.SetText(T("erstellt") + arrow("created"))
+		sortCreatedBtn.Importance = importance(sortMode == "created")
+		sortModifiedBtn.SetText(T("geändert") + arrow("modified"))
+		sortModifiedBtn.Importance = importance(sortMode == "modified")
+		sortUnsortedBtn.Refresh()
+		sortCreatedBtn.Refresh()
+		sortModifiedBtn.Refresh()
+	}
+	selectSort := func(mode string) {
+		if sortMode == mode && mode != "" {
+			sortAsc = !sortAsc // aktiver Modus erneut geklickt: Richtung umdrehen
+		} else if sortMode == mode {
+			return // "unsortiert" war schon aktiv - nichts zu tun
+		} else {
+			sortMode = mode
+			sortAsc = false // neu gewaehlt: neueste zuerst
+		}
+		config.JarvisCallSortMode = sortMode
+		config.JarvisCallSortAsc = sortAsc
+		saveConfigDebounced()
+		updateSortButtons()
+		rerenderCallList()
+	}
+	sortUnsortedBtn = widget.NewButton("", func() { selectSort("") })
+	sortCreatedBtn = widget.NewButton("", func() { selectSort("created") })
+	sortModifiedBtn = widget.NewButton("", func() { selectSort("modified") })
+	updateSortButtons()
+	onLangChange(updateSortButtons)
+	crmSortRow = container.NewHBox(
+		trLabel("Sortierung:"),
+		sortUnsortedBtn, sortCreatedBtn, sortModifiedBtn,
+	)
 
 	// Sichtbarkeit der Kundenverwaltungs-Bedienelemente (Quellen-Haekchen
 	// "Kundenv." in der Kopfzeile, Limit-Zeile in den erweiterten

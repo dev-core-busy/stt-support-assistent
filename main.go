@@ -984,6 +984,12 @@ type AppConfig struct {
 	JarvisCallOpenOnly     bool `json:"jarvisCallOpenOnly"`
 	JarvisSummaryLines     int  `json:"jarvisSummaryLines"`
 	JarvisAdvancedExpanded bool `json:"jarvisAdvancedExpanded"`
+	// Sortierung der Anruf-Ticketliste ("Sortierung: unsortiert|erstellt|
+	// geändert" oberhalb der Liste): Mode "" = unsortiert (Server-Reihenfolge),
+	// "created" = nach Erstellt, "modified" = nach letztem Zugriff; SortAsc
+	// false = neueste zuerst (Default beim Aktivieren).
+	JarvisCallSortMode string `json:"jarvisCallSortMode"`
+	JarvisCallSortAsc  bool   `json:"jarvisCallSortAsc"`
 
 	// "Prompt für KI-Zusammenfassung" in "Einstellungen" (KI-Support (Jarvis)): Anweisung an
 	// die LLM, die bei jeder Suche im Feld "prompt" der Anfrage mitgeschickt wird

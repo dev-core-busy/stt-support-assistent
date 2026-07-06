@@ -8,9 +8,10 @@ package main
 //
 //   POST /va/ad/getByNumber        {"from_number": "<nr>"}  -> addresses[] (address_id, name, ...)
 //   POST /va/ev/getEvents          {"event":"getEvents","request":{"address_id":"<id>"}}
-//                                  -> event[] (id, creation_time, state, state_type,
-//                                     "dispatch user", text); state_type < 80 = offen,
-//                                     >= 80 = geschlossen (API-Update 2026-07-05)
+//                                  -> event[] (id, creation_time, modification_time,
+//                                     state, state_type, "dispatch user", text);
+//                                     state_type < 80 = offen, >= 80 = geschlossen
+//                                     (API-Update 2026-07-05)
 //
 // Optimierungen gegenueber der ersten (spezifikationslosen) Fassung:
 //   - Adresse kommt aus getByNumber (externalPhoneCall liefert keine Daten -
@@ -47,11 +48,12 @@ import (
 // ibsTicket ist die anzeigefertige Form eines IBS-Events fuer den IBS-Bereich
 // der Ergebnisliste (Felder gemaess event[]-Schema der Doku).
 type ibsTicket struct {
-	Key     string // event.id (lokale Event-ID)
-	Status  string // event.state (EVENT_STATE-Enum, z.B. NEU, IN_BEARBEITUNG, ENDED)
-	Created string // event.creation_time
-	User    string // event."dispatch user" (zugewiesener Benutzer)
-	Text    string // event.text (Beschreibung)
+	Key      string // event.id (lokale Event-ID)
+	Status   string // event.state (EVENT_STATE-Enum, z.B. NEU, IN_BEARBEITUNG, ENDED)
+	Created  string // event.creation_time
+	Modified string // event.modification_time (letzter Zugriff)
+	User     string // event."dispatch user" (zugewiesener Benutzer)
+	Text     string // event.text (Beschreibung)
 	// Open steuert das Radio "offen"/"alle": state_type < 80 = offen,
 	// >= 80 = geschlossen; Rueckfall ohne state_type: state != ENDED.
 	Open bool
@@ -278,11 +280,12 @@ func ibsEventTickets(events []interface{}) []ibsTicket {
 			continue
 		}
 		t := ibsTicket{
-			Key:     ibsFieldString(m, "id", "eventid", "localid", "nr", "number"),
-			Status:  ibsFieldString(m, "state", "status"),
-			Created: ibsFieldString(m, "creationtime", "created", "createdat", "date"),
-			User:    ibsFieldString(m, "dispatchuser", "user", "assignee"),
-			Text:    ibsFieldString(m, "text", "description", "beschreibung", "note", "message"),
+			Key:      ibsFieldString(m, "id", "eventid", "localid", "nr", "number"),
+			Status:   ibsFieldString(m, "state", "status"),
+			Created:  ibsFieldString(m, "creationtime", "created", "createdat", "date"),
+			Modified: ibsFieldString(m, "modificationtime", "modified", "modifiedat", "lastaccess", "lastaccesstime", "updated", "updatedat"),
+			User:     ibsFieldString(m, "dispatchuser", "user", "assignee"),
+			Text:     ibsFieldString(m, "text", "description", "beschreibung", "note", "message"),
 		}
 		// Offen/geschlossen: massgeblich ist state_type (< 80 offen, >= 80
 		// geschlossen; Zuordnung s. ibsStateNames/event_states.txt). Fehlt das

@@ -1741,10 +1741,10 @@ func main() {
 	// "CRM <wert> [copy]  Kundenv. ID <address_id> [copy]".
 	// CRM wird per Rufnummern-Webhook (s. webhook.go) mit dem Jira-Issue-Key des
 	// zur eingehenden Rufnummer passenden Tickets befuellt bzw. "-" (nicht
-	// gefunden). Default "CRM-10550". Reines Anzeige-Label (kein Textfeld mehr):
-	// einzige Schreibquelle ist setCustomerField (webhook.go), das auch den
-	// CRM-Status (currentCRM) pflegt und die Ticketliste leert.
-	customerField = widget.NewLabel("CRM-10550")
+	// gefunden). Default "-" (noch kein Anruf). Reines Anzeige-Label (kein
+	// Textfeld mehr): einzige Schreibquelle ist setCustomerField (webhook.go),
+	// das auch den CRM-Status (currentCRM) pflegt und die Ticketliste leert.
+	customerField = widget.NewLabel("-")
 	setCurrentCRM(validCRM(customerField.Text)) // Startwert setzen
 	crmCopyBtn := newTooltipButton(theme.ContentCopyIcon(), func() {
 		if v := strings.TrimSpace(customerField.Text); v != "" && v != "-" {

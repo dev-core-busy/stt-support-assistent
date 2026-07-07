@@ -14,10 +14,28 @@ import (
 const (
 	whisperModelURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
 
+	// Modell-Upgrade (TODO.md Punkt 1): large-v3-turbo quantisiert (q5_0,
+	// ~550 MB) - deutlich besseres Deutsch als whisper-base, nahezu Echtzeit
+	// auf moderner CPU. whisper-base bleibt als Rueckfall installiert (und
+	// aktiv, solange der turbo-Download noch fehlt/laeuft).
+	whisperTurboModelURL  = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
+	whisperTurboModelFile = "whisper-large-v3-turbo-q5_0.bin"
+
 	// Final, manuell verifizierte Direktlinks (Stand 15. April 2026)
 	whisperWinURL = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-bin-x64.zip"
 	llamaWinURL   = "https://github.com/ggml-org/llama.cpp/releases/download/b9145/llama-b9145-bin-win-cpu-x64.zip"
 )
+
+// localWhisperModelPath liefert das Modell fuer die lokale Erkennung:
+// bevorzugt large-v3-turbo (q5_0), Rueckfall whisper-base (z.B. solange der
+// turbo-Download noch nicht abgeschlossen ist).
+func localWhisperModelPath() string {
+	turbo := filepath.Join(exeDir, "models", whisperTurboModelFile)
+	if _, err := os.Stat(turbo); err == nil {
+		return turbo
+	}
+	return filepath.Join(exeDir, "models", "whisper-base.bin")
+}
 
 // localModel beschreibt ein lokal nutzbares Gemma-Modell samt Auto-Download-Quelle
 // und (optionalem) Multimodal-Projektor für die Gemma-Native-STT.
@@ -134,7 +152,8 @@ func EnsureDependencies(progress func(string, float64)) error {
 	os.MkdirAll(filepath.Join(exeDir, "models"), os.ModePerm)
 	os.MkdirAll(filepath.Join(exeDir, "libs"), os.ModePerm)
 
-	// 1. Whisper Modell
+	// 1. Whisper Modelle: base (kleiner Rueckfall) + large-v3-turbo q5_0
+	// (Standard fuer die lokale Erkennung, s. localWhisperModelPath).
 	whisperPath := filepath.Join(exeDir, "models", "whisper-base.bin")
 	if _, err := os.Stat(whisperPath); os.IsNotExist(err) {
 		if err := downloadFile(whisperModelURL, whisperPath, func(p float64) {
@@ -145,6 +164,19 @@ func EnsureDependencies(progress func(string, float64)) error {
 	} else {
 		progress("Whisper-Modell (Lokal)", 1.0)
 	}
+	turboPath := filepath.Join(exeDir, "models", whisperTurboModelFile)
+	if _, err := os.Stat(turboPath); os.IsNotExist(err) {
+		if err := downloadFile(whisperTurboModelURL, turboPath, func(p float64) {
+			progress(fmt.Sprintf("Lade Whisper large-v3-turbo … %.0f%%", p*100), p)
+		}); err != nil {
+			// Nicht fatal: whisper-base ist vorhanden, die Erkennung laeuft
+			// damit weiter; naechster App-Start versucht den Download erneut.
+			Log("Whisper-turbo-Download fehlgeschlagen: " + err.Error())
+			progress("Whisper turbo-Download fehlgeschlagen - nutze base", 1.0)
+		}
+	} else {
+		progress("Whisper-Modell turbo (Lokal)", 1.0)
+	}
 
 	// 2. Lokale Gemma-Modelle werden bewusst NICHT mehr beim Start geladen
 	//    (früher: pauschaler Download der in config gewählten Modelle). Statt
@@ -154,9 +186,15 @@ func EnsureDependencies(progress func(string, float64)) error {
 	//    Auswahl speichern, d.h. eine gespeicherte Auswahl impliziert ein lokal
 	//    vorhandenes Modell.
 
-	// 3. Binaries für Windows
+	// 3. Binaries für Windows. whisper-server.exe steckt im selben Zip wie
+	// whisper-cli.exe (extractFromZip entpackt ALLE .exe/.dll) - der eigene
+	// ensureBinary-Aufruf greift daher nur bei Alt-Installationen, denen die
+	// Datei noch fehlt.
 	if runtime.GOOS == "windows" {
 		if err := ensureBinary(whisperWinURL, "whisper-cli.exe", progress); err != nil {
+			return err
+		}
+		if err := ensureBinary(whisperWinURL, "whisper-server.exe", progress); err != nil {
 			return err
 		}
 		if err := ensureBinary(llamaWinURL, "llama-cli.exe", progress); err != nil {

@@ -33,7 +33,7 @@ import (
 
 // AppVersion — aktuelle Programmversion (ohne "v"-Praefix). Vor jedem Release
 // hochzaehlen (und in README.md spiegeln), danach release.sh ausfuehren.
-const AppVersion = "0.8.11"
+const AppVersion = "0.8.12"
 
 // githubRepo — "Besitzer/Repo" fuer die GitHub-Releases-API.
 const githubRepo = "dev-core-busy/stt-support-assistent"

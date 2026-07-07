@@ -16,23 +16,23 @@ Stand 2026-07-05, Ergebnis der Mitschrift-Analyse. Bereits umgesetzt
 - Soft-Limiter statt Hard-Clipping beim Digital-Gain; Pegelanzeige auf ~15
   UI-Updates/s gedrosselt; Pausenerkennung gain-unabhängig.
 
-## 1. Lokaler Whisper: whisper-server statt CLI-Spawn + größeres Modell
+Umgesetzt am 2026-07-06:
 
-**Ist:** Pro Segment wird eine WAV auf Platte geschrieben und `whisper-cli`
-NEU gestartet — das Modell (whisper-base) wird jedes Mal neu geladen (0,5–2 s
-Overhead pro Segment). `whisper-base` ist für Deutsch schwach.
-
-**Soll:**
-- `whisper-server` (whisper.cpp) einmal beim App-Start hochziehen — die
-  Server-Lifecycle-Infrastruktur existiert bereits (`server_manager.go`,
-  llama-server, mehrere Instanzen) und lässt sich spiegeln. Segmente per HTTP
-  (`/inference`, multipart-WAV direkt aus dem RAM via `createWavData`) — kein
-  Disk-I/O, kein Modell-Reload.
-- Modell-Upgrade: `large-v3-turbo` quantisiert (~1,6 GB, deutlich besseres
-  Deutsch, nahezu Echtzeit auf moderner CPU) oder `small` (~500 MB) als
-  Kompromiss. Download in `setup_manager.go` ergänzen; prüfen, ob das
-  Binary-Zip `whisper-server` schon enthält, sonst Download erweitern.
-- `prompt`-Feld des Servers nutzen, damit das Kontext-Priming erhalten bleibt.
+- **Lokaler whisper-server statt CLI-Spawn** (`server_manager.go`): einmal
+  beim Start hochgezogen (Port 8082), Segmente per HTTP `POST /inference`
+  (multipart-WAV direkt aus dem RAM via `createWavData`) — kein Disk-I/O,
+  kein Modell-Reload pro Segment. Kontext-Priming über das `prompt`-Feld.
+  `whisper-cli` bleibt als Rückfall (Warmup/Fehler). Das Binary-Zip enthielt
+  `whisper-server.exe` bereits.
+- **Modell-Upgrade**: `ggml-large-v3-turbo-q5_0` (~550 MB) wird beim Start
+  geladen und bevorzugt genutzt (`localWhisperModelPath`); `whisper-base`
+  bleibt Rückfall, solange der Download fehlt/läuft.
+- **Notschnitt-Verfeinerung**: `vadSegmenter` schneidet bei Dauersprechen an
+  der energieärmsten Stelle der letzten ~2 s (`quietestCutPoint`, 20-ms-
+  Frames); der Rest hinter dem Schnitt bleibt als Anfang des nächsten
+  Segments erhalten. Der `remoteStreamer` kann nicht rückwirkend schneiden
+  (Audio bereits gestreamt) und wartet stattdessen bis zu 2 s Nachfrist auf
+  den ersten leisen Chunk.
 
 ## 2. Live-Partials im Transkript  *(Protokoll kann es, UI noch nicht)*
 
@@ -58,9 +58,22 @@ Rohstrom je Kanal). Falls der Remote-Whisper künftig über WAN/VPN erreicht
 wird: Binary-Frames oder Opus @ ~24 kbit/s (Faktor ~10) — beides erfordert
 eine Protokoll-Erweiterung auf dem Server.
 
-## 5. Notschnitt-Verfeinerung (nice-to-have)
+## 5. Schlagwort-Ticketsuche, Schritt 2: echte Abfrage gegen Jarvis + Kundenverwaltung
 
-`vadSegmenter`/`remoteStreamer` schneiden nach 15 s Dauersprechen hart
-(`vadMaxSeg`). Selten, aber dort kann wieder ein Wort zerteilt werden.
-Verbesserung: den energieärmsten Punkt der letzten ~2 s suchen und dort
-trennen.
+**Ist (seit 2026-07-06):** "Suche passende Tickets" (STT-Tab) extrahiert
+zusätzlich 2–3 Schlagworte aus der Mitschrift (Analyse-LLM,
+`extractTicketKeywords` in `main.go`) und zeigt sie in einem Info-Popup —
+reine Vorschau, die Schlagworte werden noch NICHT für die Suche verwendet.
+
+**Soll:** Die extrahierten Schlagworte an die Jarvis-API und die
+Kundenverwaltungs-API übergeben, damit passende Tickets gesucht und in der
+gemeinsamen Ergebnisliste angezeigt werden. Voraussetzung: BEIDE APIs müssen
+dafür erst angepasst werden —
+- Jarvis (`/api/support/query`): Schlagwort-/Stichwortsuche serverseitig
+  unterstützen (heute geht nur Freitext/RAG-Score).
+- Kundenverwaltung: es gibt bislang GAR KEINEN Text-/Schlagwort-Suchendpunkt
+  (nur `getByNumber` → `getEvents` je Adresse).
+Danach in `searchMatchingTickets` die Schlagworte statt/zusätzlich zum
+Mitschrift-Volltext senden und die Treffer beider Quellen wie bei der
+Anruf-Ansicht mischen.
+

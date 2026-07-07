@@ -1150,6 +1150,16 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 	// die Liste wird geleert und der vorhandene Balken der Such-Karte laeuft,
 	// bis das erste Ergebnis eintrifft.
 	showCallWorking = func() {
+		if ibsLast != nil || crmLast != nil {
+			// Ergebnisse des AKTUELLEN Anrufs sind bereits sichtbar (z.B. die
+			// schnellere IBS-Quelle, waehrend die Jira-Seite noch laeuft):
+			// die Liste NICHT zerstoeren und die Ansicht NICHT zuklappen -
+			// genau das liess die Ticketliste "kurz aufblitzen" und dann
+			// wieder die Portal-Suche erscheinen. Nachfolgende Ergebnisse
+			// ersetzen die Ansicht ohnehin (renderResults).
+			progress.Show()
+			return
+		}
 		if setCRMListExpanded != nil {
 			setCRMListExpanded(false)
 		}
@@ -1634,9 +1644,21 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 
 	renderError := func(err error) {
 		progress.Hide()
-		resultsBox.RemoveAll()
 		errText := canvas.NewText(T("Fehler: ")+err.Error(), kiAccent)
 		errText.TextStyle = fyne.TextStyle{Bold: true}
+		errText.Alignment = fyne.TextAlignLeading
+		if ibsLast != nil {
+			// Die Jira-Seite ist gescheitert, aber Kundenverwaltungs-Tickets
+			// des aktuellen Anrufs liegen vor: Anruf-Ansicht mit der IBS-
+			// Quelle (neu) aufbauen und den Fehler OBEN einblenden, statt die
+			// komplette Liste durch die Fehlermeldung zu ersetzen.
+			skipCallReset = true
+			renderResults(ibsLast.label, nil, 0, map[string]bool{})
+			resultsBox.Objects = append([]fyne.CanvasObject{errText}, resultsBox.Objects...)
+			resultsBox.Refresh()
+			return
+		}
+		resultsBox.RemoveAll()
 		resultsBox.Add(errText)
 		resultsBox.Refresh()
 	}

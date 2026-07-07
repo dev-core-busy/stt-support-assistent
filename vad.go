@@ -38,10 +38,47 @@ const (
 	vadMinSpeech = vadBytesPerSecond * 3 / 10   // < 300 ms Sprache insgesamt: verwerfen
 	vadMaxSeg    = vadBytesPerSecond * 15       // Notschnitt nach 15 s Dauersprechen
 
+	// Notschnitt-Verfeinerung: statt hart am Puffer-Ende wird innerhalb der
+	// letzten vadCutSearchWin die energiearmste Stelle gesucht (20-ms-Frames)
+	// und dort geschnitten - so zerteilt auch der Notschnitt kein Wort mehr.
+	// Der Rest hinter der Schnittstelle bleibt als Anfang des naechsten
+	// Segments erhalten. Der Remote-Streamer (remote_stt.go) kann nicht
+	// rueckwirkend schneiden (Audio ist schon gesendet) und nutzt dasselbe
+	// Fenster als NACHFRIST bis zum ersten leisen Chunk.
+	vadCutSearchWin = vadBytesPerSecond * 2  // ~2 s Suchfenster am Puffer-Ende
+	vadCutFrame     = vadBytesPerSecond / 50 // 20-ms-Frames fuer die Energiesuche
+
 	// vadChunkSpeechThresh: Spitzenamplitude (roh, nach Gain-Division), ab der
 	// ein ~10-ms-Chunk als Sprache zaehlt (~1 % Vollausschlag).
 	vadChunkSpeechThresh = 300.0
 )
+
+// quietestCutPoint liefert die Byte-Position (gerade, PCM16) der
+// energiearmsten Stelle innerhalb der letzten vadCutSearchWin von buf:
+// Mitte des 20-ms-Frames mit der kleinsten Energie. Rueckfall: Puffer-Ende.
+func quietestCutPoint(buf []byte) int {
+	start := len(buf) - vadCutSearchWin
+	if start < 0 {
+		start = 0
+	}
+	start -= start % 2
+	bestPos, bestEnergy := len(buf), math.MaxFloat64
+	for p := start; p+vadCutFrame <= len(buf); p += vadCutFrame {
+		var sumSq float64
+		for i := p; i+1 < p+vadCutFrame; i += 2 {
+			v := float64(int16(binary.LittleEndian.Uint16(buf[i : i+2])))
+			sumSq += v * v
+		}
+		if sumSq < bestEnergy {
+			bestEnergy, bestPos = sumSq, p+vadCutFrame/2
+		}
+	}
+	bestPos -= bestPos % 2
+	if bestPos <= 0 || bestPos > len(buf) {
+		return len(buf)
+	}
+	return bestPos
+}
 
 // chunkPeak liefert die Spitzenamplitude eines PCM16-Blocks.
 func chunkPeak(chunk []byte) float64 {
@@ -97,8 +134,13 @@ func (s *vadSegmenter) feed(chunk []byte) {
 		}
 		return
 	}
-	if s.silentTail >= vadPauseCut || len(s.buf) >= vadMaxSeg {
+	if s.silentTail >= vadPauseCut {
 		s.cut()
+	} else if len(s.buf) >= vadMaxSeg {
+		// Notschnitt mitten im Redefluss: an der leisesten Stelle der
+		// letzten ~2 s trennen statt hart am Puffer-Ende (kein zerteiltes
+		// Wort); der Rest laeuft als naechstes Segment weiter.
+		s.cutAtQuietest()
 	}
 }
 
@@ -118,6 +160,25 @@ func (s *vadSegmenter) cut() {
 	s.speechLen = 0
 	s.silentTail = 0
 	s.sawSpeech = false
+}
+
+// cutAtQuietest: Notschnitt bei Dauersprechen - emittiert den Puffer bis zur
+// energiearmsten Stelle der letzten ~2 s (quietestCutPoint); der Rest dahinter
+// bleibt als Anfang des naechsten Segments im Puffer (wir stehen mitten in
+// der Sprache, daher sawSpeech=true; speechLen des Rests ist eine Naeherung).
+func (s *vadSegmenter) cutAtQuietest() {
+	pos := quietestCutPoint(s.buf)
+	if s.speechLen >= vadMinSpeech && pos > 0 {
+		seg := make([]byte, pos)
+		copy(seg, s.buf[:pos])
+		s.emit(seg, s.speaker)
+	}
+	rest := make([]byte, len(s.buf)-pos)
+	copy(rest, s.buf[pos:])
+	s.buf = rest
+	s.speechLen = len(rest)
+	s.silentTail = 0
+	s.sawSpeech = true
 }
 
 // flush erzwingt einen Schnitt (Aufnahme-Stopp): der Restpuffer wird noch

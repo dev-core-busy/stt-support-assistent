@@ -335,10 +335,13 @@ func handleIncomingCaller(number string, auto bool) {
 	// Im Debug-Modus die Anfrage als Popup zeigen (Senden/Abbrechen), sonst
 	// sofort ausführen. debugPreviewAndConfirm regelt beides selbst. Sobald
 	// die Abfrage TATSAECHLICH startet (nicht bei Abbruch im Debug-Popup),
-	// zeigt die Ergebnisliste den "Ich arbeite"-Indikator.
+	// zeigt die Ergebnisliste den "Ich arbeite"-Indikator - aber nur, wenn
+	// danach auch eine Jira-TICKETLISTE geladen wird (s. wantJiraCallTickets):
+	// die reine CRM-Ermittlung fuellt nur das CRM Feld, ohne Ticketliste
+	// bliebe der Balken sonst endlos stehen.
 	fyne.Do(func() {
 		debugPreviewAndConfirm(mainWin, "Rufnummern-Webhook: CRM-Abfrage", jarvisPhonePreview(number), func() {
-			if showCallWorking != nil {
+			if wantJiraCallTickets() && showCallWorking != nil {
 				showCallWorking()
 			}
 			go performCallerJiraLookup(number)
@@ -594,6 +597,15 @@ func askCRMSelection(number string, matches []jiraPhoneMatch) string {
 	return <-ch
 }
 
+// wantJiraCallTickets meldet, ob beim Anruf die Jira-TICKETLISTE geladen
+// werden soll: nur wenn in der Such-Karte auch eine Jira-Quelle angehakt ist
+// ("Jira Tickets" oder "offene Jira Tickets"). Ist dort z.B. nur "IBS
+// Tickets" aktiv, wird beim Anruf KEINE Jira-Ticketsuche ausgefuehrt - die
+// CRM zur Rufnummer wird aber weiterhin ermittelt und im CRM Feld angezeigt.
+func wantJiraCallTickets() bool {
+	return config.JarvisJira || config.JarvisOpenOnly
+}
+
 // applyCRM übernimmt die (ggf. ausgewählte) CRM: zeigt sie im CRM Feld
 // (setCustomerField pflegt dabei auch den CRM-Status) und stößt automatisch
 // die Ticketsuche an – mit erkanntem Text, oder (bei leerem Textfenster) alle
@@ -604,10 +616,14 @@ func askCRMSelection(number string, matches []jiraPhoneMatch) string {
 func applyCRM(number, crm string) {
 	Log(fmt.Sprintf("Rufnummern-Webhook: Rufnummer %q -> CRM %s", number, crm))
 	setCustomerField(crm)
+	if !wantJiraCallTickets() {
+		Log("Rufnummern-Webhook: Jira-Ticketsuche übersprungen (keine Jira-Quelle in der Suche angehakt)")
+		return
+	}
 	fyne.Do(func() {
-		// Nach der CRM-Auswahl kann die Ticketsuche dauern: Liste sofort
-		// durch den "Ich arbeite"-Indikator ersetzen (die Ergebnisse bzw.
-		// eine Fehlermeldung loesen ihn ab).
+		// Nach der CRM-Auswahl kann die Ticketsuche dauern: "Ich arbeite"
+		// zeigen. showCallWorking laesst bereits angezeigte Ergebnisse des
+		// AKTUELLEN Anrufs (z.B. die schnellere IBS-Quelle) stehen.
 		if showCallWorking != nil {
 			showCallWorking()
 		}

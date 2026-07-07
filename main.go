@@ -936,11 +936,27 @@ type BackendCfg struct {
 	Model  string `json:"model"`
 }
 
+// AnalysisPromptDef ist eine gespeicherte Analyse-Vorgabe: Name ist die
+// beschreibende Zeile (der Pulldown-Eintrag), Prompt der zugehoerige
+// LLM-Prompt. Gepflegt in "Einstellungen" (Abschnitt "Spracherkennung und
+// Analyse"); der STT-Tab zeigt nur noch die Beschreibungen als Pulldown.
+// Das Loeschen einer Beschreibung loescht immer auch ihren Prompt.
+type AnalysisPromptDef struct {
+	Name   string `json:"name"`
+	Prompt string `json:"prompt"`
+}
+
 type AppConfig struct {
 	AppMode         string   `json:"appMode"`
 	Theme           string   `json:"theme"`
-	AnalysisPrompt  string   `json:"analysisPrompt"`
-	AnalysisPrompts []string `json:"analysisPrompts"` // gespeicherte Analyse-Vorgaben (Dropdown)
+	AnalysisPrompt  string   `json:"analysisPrompt"`  // Alt-Feld (nur Migration, s. migrateAnalysisPromptDefs)
+	AnalysisPrompts []string `json:"analysisPrompts"` // Alt-Feld: Vorgaben nur als Text (nur Migration)
+
+	// Analyse-Vorgaben: Beschreibung + Prompt (ersetzt AnalysisPrompt/-s).
+	// AnalysisPromptName ist die im STT-Tab gewaehlte Beschreibung - ihr
+	// Prompt wird beim "Analysieren" verwendet.
+	AnalysisPromptDefs []AnalysisPromptDef `json:"analysisPromptDefs"`
+	AnalysisPromptName string              `json:"analysisPromptName"`
 
 	// Neue Pipeline-Struktur: Erkennung / Nachbearbeitung / Analyse.
 	WhisperLocal     bool   `json:"whisperLocal"`     // Erkennung: lokaler Whisper (true) vs. Remote Whisper (false)
@@ -1129,6 +1145,7 @@ func LoadConfig(a fyne.App) {
 		if len(config.AnalysisPrompts) == 0 && config.AnalysisPrompt != "" {
 			config.AnalysisPrompts = []string{config.AnalysisPrompt}
 		}
+		migrateAnalysisPromptDefs()
 		syncConfigToAtomics()
 		return
 	}
@@ -1187,6 +1204,61 @@ func LoadConfig(a fyne.App) {
 			p.SetString("appMode", "")
 		}
 	}
+	// Auch ohne config.json (Erststart/Preferences-Migration) die Vorgaben-
+	// Paare aus den Alt-Feldern bzw. Defaults aufbauen.
+	migrateAnalysisPromptDefs()
+}
+
+// migrateAnalysisPromptDefs baut die Analyse-Vorgaben (Beschreibung+Prompt)
+// aus den Alt-Feldern auf: die fruehere Liste enthielt nur Prompt-TEXTE, die
+// zugleich im Dropdown standen - der Text wird darum 1:1 als Beschreibung
+// uebernommen (umbenennen geht jederzeit in "Einstellungen"). Zusaetzlich
+// wird sichergestellt, dass die gewaehlte Beschreibung existiert.
+func migrateAnalysisPromptDefs() {
+	if len(config.AnalysisPromptDefs) == 0 {
+		for _, p := range config.AnalysisPrompts {
+			if strings.TrimSpace(p) == "" {
+				continue
+			}
+			config.AnalysisPromptDefs = append(config.AnalysisPromptDefs, AnalysisPromptDef{Name: p, Prompt: p})
+		}
+		// Der bisher aktive Prompt war nicht zwingend Teil der alten Liste
+		// (er wurde erst beim Analysieren uebernommen) - nicht verlieren.
+		if p := strings.TrimSpace(config.AnalysisPrompt); p != "" && analysisPromptByName(p) == nil {
+			config.AnalysisPromptDefs = append(config.AnalysisPromptDefs, AnalysisPromptDef{Name: p, Prompt: p})
+		}
+		// Der bisher aktive Prompt bleibt die aktive Vorgabe (Name = alter Text).
+		if config.AnalysisPromptName == "" {
+			config.AnalysisPromptName = strings.TrimSpace(config.AnalysisPrompt)
+		}
+	}
+	if analysisPromptByName(config.AnalysisPromptName) == nil {
+		config.AnalysisPromptName = ""
+		if len(config.AnalysisPromptDefs) > 0 {
+			config.AnalysisPromptName = config.AnalysisPromptDefs[0].Name
+		}
+	}
+}
+
+// analysisPromptByName liefert die gespeicherte Analyse-Vorgabe zur
+// Beschreibung (nil, wenn unbekannt).
+func analysisPromptByName(name string) *AnalysisPromptDef {
+	for i := range config.AnalysisPromptDefs {
+		if config.AnalysisPromptDefs[i].Name == name {
+			return &config.AnalysisPromptDefs[i]
+		}
+	}
+	return nil
+}
+
+// analysisPromptNames: alle Beschreibungen in Listen-Reihenfolge (Optionen
+// der beiden Pulldowns in STT-Tab und "Einstellungen").
+func analysisPromptNames() []string {
+	out := make([]string, 0, len(config.AnalysisPromptDefs))
+	for _, d := range config.AnalysisPromptDefs {
+		out = append(out, d.Name)
+	}
+	return out
 }
 
 // currentBackend liefert die Konfiguration des in der 'remote LLM'-Sektion
@@ -1385,16 +1457,6 @@ func showDebugResponse(title, payload string) {
 	scroll := container.NewScroll(body)
 	scroll.SetMinSize(fyne.NewSize(560, 320))
 	dialog.ShowCustom(title, T("OK"), scroll, mainWin)
-}
-
-// contains prüft, ob s in slice enthalten ist.
-func contains(slice []string, s string) bool {
-	for _, v := range slice {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }
 
 // loadF64 liest einen als atomic.Uint64 gespiegelten float64-Wert.
@@ -1617,65 +1679,52 @@ func main() {
 	modeIcon = widget.NewIcon(theme.SettingsIcon()) // Platzhalter
 	modeIcon.Hide()
 
-	// Analysis UI: editierbares Dropdown mit gespeicherten Analyse-Vorgaben.
-	analysisPrompt := widget.NewSelectEntry(config.AnalysisPrompts)
-	bindText(func(s string) { analysisPrompt.SetPlaceHolder(s) }, "KI-Analyse Prompt (z.B. Fasse zusammen)")
-	analysisPrompt.SetText(config.AnalysisPrompt)
-	analysisPrompt.OnChanged = func(s string) {
-		config.AnalysisPrompt = s
-		saveConfigDebounced()
-	}
-	// rememberPrompt nimmt den aktuellen Prompt dauerhaft in die Auswahlliste auf
-	// (sofern neu/nicht leer). Wird bei Enter und beim Start einer Analyse aufgerufen.
-	rememberPrompt := func() {
-		p := strings.TrimSpace(analysisPrompt.Text)
-		if p == "" || contains(config.AnalysisPrompts, p) {
-			return
+	// Analyse-Vorgabe (STT-Tab): reines Pulldown der BESCHREIBUNGEN. Die
+	// Vorgaben selbst (Beschreibung + Prompt) werden im Reiter "Einstellungen"
+	// unter "Spracherkennung und Analyse" gepflegt ("LLM Prompt zur Analyse").
+	// Die Auswahl bestimmt, mit welchem Prompt "Analysieren" den erkannten
+	// Text nachbearbeitet.
+	analysisPromptSelect := widget.NewSelect(analysisPromptNames(), func(s string) {
+		if config.AnalysisPromptName != s {
+			config.AnalysisPromptName = s
+			saveConfigDebounced()
 		}
-		config.AnalysisPrompts = append(config.AnalysisPrompts, p)
-		analysisPrompt.SetOptions(config.AnalysisPrompts)
-		SaveConfig()
-		Log("Analyse-Vorgabe gespeichert: " + p)
-	}
-	analysisPrompt.OnSubmitted = func(string) { rememberPrompt() }
-
-	// Löschen-Button: entfernt die aktuell im Feld stehende Vorgabe aus der Liste.
-	delPromptBtn := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
-		p := strings.TrimSpace(analysisPrompt.Text)
-		if p == "" || !contains(config.AnalysisPrompts, p) {
-			showInfo(T("Vorgabe löschen"), T("Diese Vorgabe ist nicht in der Liste gespeichert."), win)
-			return
-		}
-		showConfirm(T("Vorgabe löschen"), T("Analyse-Vorgabe wirklich löschen?")+"\n\n\""+p+"\"", func(ok bool) {
-			if !ok {
-				return
-			}
-			rest := config.AnalysisPrompts[:0:0]
-			for _, x := range config.AnalysisPrompts {
-				if x != p {
-					rest = append(rest, x)
-				}
-			}
-			config.AnalysisPrompts = rest
-			analysisPrompt.SetOptions(config.AnalysisPrompts)
-			analysisPrompt.SetText("")
-			SaveConfig()
-			Log("Analyse-Vorgabe gelöscht: " + p)
-		}, win)
 	})
+	bindText(func(s string) {
+		analysisPromptSelect.PlaceHolder = s
+		analysisPromptSelect.Refresh()
+	}, "(keine Vorgabe)")
+	analysisPromptSelect.SetSelected(config.AnalysisPromptName)
+	// refreshAnalysisPromptSelect zieht Optionen + Auswahl nach, wenn die
+	// Vorgaben in "Einstellungen" geaendert wurden (Speichern/Loeschen dort).
+	refreshAnalysisPromptSelect := func() {
+		analysisPromptSelect.Options = analysisPromptNames()
+		if analysisPromptByName(config.AnalysisPromptName) == nil {
+			config.AnalysisPromptName = ""
+			if len(config.AnalysisPromptDefs) > 0 {
+				config.AnalysisPromptName = config.AnalysisPromptDefs[0].Name
+			}
+		}
+		analysisPromptSelect.Selected = config.AnalysisPromptName
+		analysisPromptSelect.Refresh()
+	}
 
 	analysisBtn := trButton("Analysieren", func() {
 		if isRecording.Load() {
 			toggleRecording()
 		}
 		text := outputArea.Text
-		prompt := analysisPrompt.Text
+		// Prompt der im Pulldown gewaehlten Beschreibung (gepflegt in
+		// "Einstellungen"); ohne Auswahl laeuft die Analyse ohne Prompt.
+		prompt := ""
+		if def := analysisPromptByName(config.AnalysisPromptName); def != nil {
+			prompt = def.Prompt
+		}
 		if len(strings.TrimSpace(text)) < 10 {
 			Log("Analyse übersprungen: Zu wenig Text")
 			showErr(fmt.Errorf(T("Zu wenig Text für eine Analyse vorhanden.")), win)
 			return
 		}
-		rememberPrompt() // genutzten Prompt in die Auswahlliste übernehmen
 
 		backendDesc := modelLabelFromSymbol(config.AnalysisModel)
 		if config.AnalysisModel == "remote" {
@@ -1937,6 +1986,29 @@ func main() {
 		}
 	})
 
+	// "Zwischenablage" (nur Symbol): kopiert die KOMPLETTE Mitschrift als Text
+	// in die Zwischenablage. Als Bestaetigung erscheint fuer 2 Sekunden ein
+	// selbstschliessender Hinweis mittig im Fenster (PopUp statt Dialog:
+	// verschwindet ohne Klick; ein Klick irgendwohin schliesst frueher).
+	copyTranscriptBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func() {
+		text := outputArea.Text
+		if len(strings.TrimSpace(text)) == 0 {
+			showErr(fmt.Errorf(T("Kein Text zum Kopieren vorhanden.")), win)
+			return
+		}
+		win.Clipboard().SetContent(text)
+		Log(fmt.Sprintf("Mitschrift in Zwischenablage kopiert (%d Zeichen)", len(text)))
+		hint := widget.NewLabelWithStyle(T("Mitschrift wurde in die Zwischenablage kopiert."), fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+		popup := widget.NewPopUp(container.NewPadded(hint), win.Canvas())
+		cs := win.Canvas().Size()
+		ps := popup.MinSize()
+		popup.ShowAtPosition(fyne.NewPos((cs.Width-ps.Width)/2, (cs.Height-ps.Height)/2))
+		go func() {
+			time.Sleep(2 * time.Second)
+			fyne.Do(popup.Hide)
+		}()
+	})
+
 	clearBtn := trButton("Inhalt leeren", func() {
 		// Sowohl Anzeige als auch internen Puffer zurücksetzen, damit neuer Text
 		// nicht an den alten Inhalt angehängt wird (currentText speist appendToOutput).
@@ -1956,10 +2028,52 @@ func main() {
 	// mit Debug-Popup (falls aktiv).
 	var ticketSearchBtn *widget.Button
 	ticketSearchBtn = trButtonIcon("Suche passende Tickets", theme.SearchIcon(), func() {
-		if searchMatchingTickets != nil {
-			// crmFallback=true: bei leerem Textfenster alle Tickets zur CRM laden.
-			searchMatchingTickets(outputArea.Text, ticketSearchBtn, false, true)
+		text := outputArea.Text
+		// Jira-Ticketsuche nur, wenn eine Jira-Quelle angehakt ist (dasselbe
+		// Gate wie beim Anruf, s. wantJiraCallTickets in webhook.go) UND eine
+		// gueltige CRM vorliegt. Beides sonst nur im Log - KEIN Extra-Popup
+		// neben den Schlagworten (Nutzer-Vorgabe).
+		runSearch := func() {}
+		switch {
+		case !wantJiraCallTickets():
+			Log("Suche passende Tickets: Jira-Suche übersprungen (keine Jira-Quelle angehakt)")
+		case !hasCRM():
+			Log("Suche passende Tickets: Jira-Suche übersprungen (keine gültige CRM-Nummer)")
+		default:
+			runSearch = func() {
+				if searchMatchingTickets != nil {
+					// crmFallback=true: bei leerem Textfenster alle Tickets zur CRM laden.
+					searchMatchingTickets(text, ticketSearchBtn, false, true)
+				}
+			}
 		}
+		// (Fast) leeres Textfenster: Schlagwort-Extraktion nicht moeglich -
+		// passenden Hinweis zeigen und (falls sinnvoll) direkt suchen.
+		if len(strings.TrimSpace(text)) < 10 {
+			switch {
+			case wantJiraCallTickets() && !hasCRM():
+				showErr(fmt.Errorf(T("Im CRM Feld steht keine gültige CRM-Nummer. Die Ticketsuche ist erst mit einer CRM möglich.")), win)
+			case wantJiraCallTickets():
+				showInfo(T("Suche passende Tickets"),
+					T("Das Textfenster ist leer – es werden alle Tickets zur gefundenen CRM geladen.\nSchlagworte können erst extrahiert werden, wenn eine Mitschrift vorliegt."), win)
+				runSearch()
+			default: // nur IBS: keine Suche, keine Schlagworte
+				showInfo(T("Suche passende Tickets"),
+					T("Das Textfenster ist leer – es können keine Schlagworte extrahiert werden."), win)
+			}
+			return
+		}
+		// Nutzer-Vorgabe: ZUERST die Schlagworte extrahieren und ANZEIGEN,
+		// erst DANACH startet die eigentliche Ticketsuche (runSearch laeuft
+		// als Abschluss-Callback der Extraktion - auch im Fehlerfall, das
+		// Fehler-Popup kommt dann als Erstes). Button solange sperren.
+		// Schritt 2 (Abfrage der APIs MIT den Schlagworten) steht in TODO.md -
+		// Jarvis/Kundenverwaltung muessen dafuer erst angepasst werden.
+		ticketSearchBtn.Disable()
+		extractTicketKeywords(text, win, func() {
+			ticketSearchBtn.Enable()
+			runSearch()
+		})
 	})
 
 	diktatTab := container.NewBorder(
@@ -1968,15 +2082,19 @@ func main() {
 			// engineInfo lebt jetzt in der Statuszeile ganz unten (statusBar),
 			// nicht mehr mitten im STT-Tab.
 			analysisProgress,
-			container.NewBorder(
-				trLabelStyle("LLM Prompt zur Analyse:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-				nil, nil, nil,
-				container.NewBorder(nil, nil, nil, container.NewHBox(delPromptBtn, analysisBtn), analysisPrompt),
+			// Analyse-Zeile: links das Beschreibungs-Pulldown der Analyse-
+			// Vorgaben (Pflege der Vorgaben im Reiter "Einstellungen"),
+			// rechts der Analysieren-Button.
+			container.NewBorder(nil, nil,
+				trLabelStyle("Analyse-Vorgabe:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+				analysisBtn,
+				analysisPromptSelect,
 			),
 		),
 		nil, nil,
-		// Erkennungs-Textfenster, darunter direkt "Inhalt leeren" und "Speichern".
-		container.NewBorder(nil, container.NewHBox(clearBtn, ticketSearchBtn, saveTranscriptBtn), nil, nil, outputArea),
+		// Erkennungs-Textfenster, darunter direkt "Inhalt leeren",
+		// Ticketsuche, "Zwischenablage" (Symbol) und "Speichern" (Symbol).
+		container.NewBorder(nil, container.NewHBox(clearBtn, ticketSearchBtn, copyTranscriptBtn, saveTranscriptBtn), nil, nil, outputArea),
 	)
 	refreshDiktatTab = func() {
 		topControls.Refresh()
@@ -2467,6 +2585,9 @@ func main() {
 		} else {
 			remoteUrlEntry.Enable()
 		}
+		// whisper-server passend zur neuen Auswahl starten/stoppen
+		// (asynchron - der Start wartet auf den Warmup-Health-Check).
+		go ensureWhisperServer()
 		updatePills()
 	})
 	whisperRadio.Horizontal = true
@@ -2530,6 +2651,87 @@ func main() {
 	}, 170)
 	suppressModelChange = true
 	analysisSelect.SetSelected(modelLabelFromSymbol(config.AnalysisModel))
+
+	// --- LLM Prompt zur Analyse: Verwaltung der Analyse-Vorgaben ---
+	// (vom STT-Tab hierher gewandert.) Eine Vorgabe = beschreibende Zeile
+	// (editierbares Pulldown) + zugehoeriger Prompt (scrollbares Textfenster,
+	// 6 sichtbare Zeilen). Auswahl einer Beschreibung laedt ihren Prompt;
+	// Prompt-Aenderungen an einer BESTEHENDEN Vorgabe werden direkt
+	// mitgespeichert, eine NEUE Beschreibung legt der Speichern-Button an.
+	// Loeschen entfernt Beschreibung UND Prompt. Das Pulldown im STT-Tab
+	// (analysisPromptSelect) zeigt dieselben Beschreibungen.
+	promptNameEntry := widget.NewSelectEntry(analysisPromptNames())
+	bindText(func(s string) { promptNameEntry.SetPlaceHolder(s) }, "Beschreibung, z. B. \"Zusammenfassung\"")
+	promptTextEntry := widget.NewMultiLineEntry()
+	promptTextEntry.Wrapping = fyne.TextWrapWord
+	promptTextEntry.SetMinRowsVisible(6)
+	bindText(func(s string) { promptTextEntry.SetPlaceHolder(s) }, "KI-Analyse Prompt (z.B. Fasse zusammen)")
+	// Vorbelegung: die aktuell im STT-Tab gewaehlte Vorgabe.
+	if def := analysisPromptByName(config.AnalysisPromptName); def != nil {
+		promptNameEntry.SetText(def.Name)
+		promptTextEntry.SetText(def.Prompt)
+	}
+	promptNameEntry.OnChanged = func(s string) {
+		// Auswahl aus dem Pulldown (bzw. exakt getippter Name) laedt den
+		// gespeicherten Prompt ins Textfenster.
+		if def := analysisPromptByName(strings.TrimSpace(s)); def != nil {
+			promptTextEntry.SetText(def.Prompt)
+		}
+	}
+	promptTextEntry.OnChanged = func(s string) {
+		// Prompt einer bestehenden Vorgabe direkt mitschreiben ("Eintraege
+		// lassen sich bearbeiten und speichern") - neue Beschreibungen werden
+		// erst mit dem Speichern-Button angelegt.
+		if def := analysisPromptByName(strings.TrimSpace(promptNameEntry.Text)); def != nil && def.Prompt != s {
+			def.Prompt = s
+			saveConfigDebounced()
+		}
+	}
+	savePromptBtn := widget.NewButtonWithIcon("", theme.DocumentSaveIcon(), func() {
+		name := strings.TrimSpace(promptNameEntry.Text)
+		if name == "" {
+			showInfo(T("Vorgabe speichern"), T("Bitte zuerst eine Beschreibung eingeben."), win)
+			return
+		}
+		if def := analysisPromptByName(name); def != nil {
+			def.Prompt = promptTextEntry.Text
+		} else {
+			config.AnalysisPromptDefs = append(config.AnalysisPromptDefs, AnalysisPromptDef{Name: name, Prompt: promptTextEntry.Text})
+		}
+		if config.AnalysisPromptName == "" {
+			config.AnalysisPromptName = name
+		}
+		SaveConfig()
+		promptNameEntry.SetOptions(analysisPromptNames())
+		refreshAnalysisPromptSelect()
+		Log("Analyse-Vorgabe gespeichert: " + name)
+	})
+	delPromptBtn := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
+		name := strings.TrimSpace(promptNameEntry.Text)
+		if analysisPromptByName(name) == nil {
+			showInfo(T("Vorgabe löschen"), T("Diese Vorgabe ist nicht in der Liste gespeichert."), win)
+			return
+		}
+		showConfirm(T("Vorgabe löschen"), T("Analyse-Vorgabe wirklich löschen?")+"\n\n\""+name+"\"", func(ok bool) {
+			if !ok {
+				return
+			}
+			rest := config.AnalysisPromptDefs[:0:0]
+			for _, d := range config.AnalysisPromptDefs {
+				if d.Name != name {
+					rest = append(rest, d)
+				}
+			}
+			config.AnalysisPromptDefs = rest
+			promptNameEntry.SetText("")
+			promptTextEntry.SetText("")
+			promptNameEntry.SetOptions(analysisPromptNames())
+			refreshAnalysisPromptSelect() // waehlt im STT-Tab ggf. die erste verbliebene Vorgabe
+			SaveConfig()
+			Log("Analyse-Vorgabe gelöscht: " + name)
+		}, win)
+	})
+	promptNameRow := container.NewBorder(nil, nil, nil, container.NewHBox(savePromptBtn, delPromptBtn), promptNameEntry)
 	suppressModelChange = false
 
 	saveBtn := trButtonIcon("Einstellungen jetzt speichern", theme.DocumentSaveIcon(), func() {
@@ -2707,6 +2909,11 @@ func main() {
 		),
 		container.New(&alignedFormLayout{}, trLabel("Remote-Whisper-URL:"), remoteUrlEntry),
 		container.New(&alignedFormLayout{}, trLabel("Analyse (manuell, mit Prompt):"), framedSelect(analysisSelect)),
+		// Analyse-Vorgaben (Beschreibung + Prompt) - letzte Punkte des
+		// Abschnitts; das STT-Pulldown "Analyse-Vorgabe" zeigt die
+		// Beschreibungen (s. Kommentar bei promptNameEntry).
+		container.New(&alignedFormLayout{}, trLabel("LLM Prompt zur Analyse:"), promptNameRow),
+		container.New(&alignedFormLayout{}, trLabel("Prompt:"), promptTextEntry),
 
 		// Automatischer zyklischer Ticket-Scan - inhaltlich zur Erkennung/Analyse
 		// gehoerig, daher hier direkt hinter "Analyse (manuell, mit Prompt)".
@@ -3434,7 +3641,14 @@ func processSegment(audio []byte, speaker string) {
 		remoteTranscribe(audio, speaker)
 		return
 	}
-	// Whisper lokal (whisper-cli)
+	// Whisper lokal: bevorzugt der staendig laufende whisper-server (Modell
+	// bleibt im RAM, WAV geht direkt aus dem Speicher per HTTP - kein
+	// Prozess-Spawn/Modell-Reload/Disk-I/O pro Segment, s. server_manager.go).
+	if text, ok := whisperServerTranscribe(audio, getSTTTail()); ok {
+		deliverSTTText(text, speaker)
+		return
+	}
+	// Rueckfall: whisper-cli (Server fehlt noch/Warmup laeuft/Anfrage schlug fehl).
 	tmpFile := filepath.Join(exeDir, fmt.Sprintf("tmp_%s_%d.wav", speaker, time.Now().UnixNano()))
 	if err := writeWav(tmpFile, audio); err != nil {
 		return
@@ -3446,8 +3660,7 @@ func processSegment(audio []byte, speaker string) {
 		whisperBin = filepath.Join(exeDir, "libs", "whisper-cli.exe")
 	}
 
-	modelPath := filepath.Join(exeDir, "models", "whisper-base.bin")
-	args := []string{"-m", modelPath, "-f", tmpFile, "-l", "de", "-nt"}
+	args := []string{"-m", localWhisperModelPath(), "-f", tmpFile, "-l", "de", "-nt"}
 	// Kontext-Priming: die letzten ~200 Zeichen erkannten Textes als initial
 	// prompt mitgeben - konsistente Schreibweisen/Eigennamen ueber
 	// Segmentgrenzen hinweg, weniger Fehler am Segmentanfang (s. vad.go).
@@ -3487,19 +3700,120 @@ func processSegment(audio []byte, speaker string) {
 	}
 
 	if len(cleanLines) > 0 {
-		text := strings.Join(cleanLines, " ")
-		updateSTTTail(text) // Kontext fuer das initial prompt des naechsten Segments
-		if atHasPostProc.Load() {
-			// Rohtext live anzeigen; Korrektur erfolgt am Satzende (siehe detectSilence).
-			appendPendingRaw(speaker, text)
-		} else {
-			appendSpeakerSegment(speaker, "", text)
-		}
+		deliverSTTText(strings.Join(cleanLines, " "), speaker)
+	}
+}
+
+// deliverSTTText: gemeinsame Weiterverarbeitung eines lokal erkannten
+// Segment-Textes (whisper-server UND whisper-cli-Rueckfall): Kontext-Tail
+// fuer das Priming des naechsten Segments nachziehen, dann anzeigen (roh bei
+// aktiver Nachbearbeitung - Korrektur folgt am Satzende, s. detectSilence).
+func deliverSTTText(text, speaker string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	updateSTTTail(text)
+	if atHasPostProc.Load() {
+		appendPendingRaw(speaker, text)
+	} else {
+		appendSpeakerSegment(speaker, "", text)
 	}
 }
 
 func runAnalysisLogic(text, userPrompt string) string {
 	return runLLM(config.AnalysisModel, text, userPrompt)
+}
+
+// extractTicketKeywords - Schritt 1 der Schlagwort-Ticketsuche ("Suche
+// passende Tickets"): laesst das konfigurierte Analyse-LLM 2-3 Schlagworte
+// aus der Mitschrift extrahieren und zeigt sie SOFORT in einem Popup
+// (Erfolg ODER Fehler); die Schlagworte stehen FETT direkt hinter
+// "Extrahierte Schlagworte:". Danach - und erst dann - laeuft then() (die
+// eigentliche Ticketsuche; Nutzer-Vorgabe: Extraktion+Anzeige zuerst).
+// Die Suche MIT den Schlagworten (Schritt 2) ist noch NICHT moeglich:
+// Jarvis- und Kundenverwaltungs-API muessen dafuer erst angepasst werden -
+// s. TODO.md Punkt "Schlagwort-Ticketsuche". Laeuft asynchron (LLM-Aufruf);
+// UI-Zugriffe via fyne.Do; then() laeuft im Fyne-Main-Thread.
+func extractTicketKeywords(text string, win fyne.Window, then func()) {
+	if then == nil {
+		then = func() {}
+	}
+	if len(strings.TrimSpace(text)) < 10 {
+		then()
+		return // (fast) leere Mitschrift - nichts zu extrahieren
+	}
+	prompt := T("Extrahiere aus dem folgenden Support-Gespräch 2 bis 3 Schlagworte, die das Anliegen am besten beschreiben. Antworte NUR mit den Schlagworten, durch Kommas getrennt, ohne weitere Erklärung.")
+	Log(fmt.Sprintf("Schlagwort-Extraktion gestartet (Analyse-LLM %s, %d Zeichen Mitschrift)", config.AnalysisModel, len(text)))
+	// Sichtbares "Ich arbeite": derselbe Endlos-Balken wie beim Analysieren
+	// (Aufruf kommt aus dem Button-Handler, also Main-Thread).
+	if analysisProgress != nil {
+		analysisProgress.Show()
+	}
+	go func() {
+		res := strings.TrimSpace(runAnalysisLogic(text, prompt))
+		Log("Schlagwort-Extraktion (roh): " + res)
+		isErr := res == "" || llmErrorText(res)
+		if !isErr {
+			res = strings.Join(strings.Fields(res), " ") // einzeilig glaetten
+			// Ueblichen LLM-Vorspann abraeumen ("Schlagworte: A, B").
+			low := strings.ToLower(res)
+			for _, label := range []string{"schlagworte:", "schlagwörter:", "stichworte:", "keywords:"} {
+				if strings.HasPrefix(low, label) {
+					res = strings.TrimSpace(res[len(label):])
+					break
+				}
+			}
+			isErr = res == ""
+		}
+		fyne.Do(func() {
+			if analysisProgress != nil {
+				analysisProgress.Hide()
+			}
+			if isErr {
+				if res == "" {
+					res = T("(keine Antwort erhalten)")
+				}
+				showErr(fmt.Errorf(T("Schlagworte konnten nicht ermittelt werden: ")+"%s", res), win)
+			} else {
+				// Schlagworte FETT direkt hinter dem Label (RichText-Segmente;
+				// ein Label kann keine Teil-Fettung).
+				line := widget.NewRichText(
+					&widget.TextSegment{Text: T("Extrahierte Schlagworte:") + " ", Style: widget.RichTextStyleInline},
+					&widget.TextSegment{Text: res, Style: widget.RichTextStyle{
+						Inline:    true,
+						TextStyle: fyne.TextStyle{Bold: true},
+					}},
+				)
+				hint := widget.NewLabel(T("Hinweis: Die Jarvis- und die Kundenverwaltungs-API müssen noch angepasst werden, damit mit diesen Schlagworten passende Tickets gesucht und angezeigt werden können."))
+				hint.Alignment = fyne.TextAlignLeading
+				dialog.ShowCustom(T("Schlagworte zur Ticketsuche"), T("OK"),
+					container.NewVBox(line, hint), win)
+			}
+			// Erst NACH der Anzeige der Schlagworte (bzw. des Fehlers) die
+			// eigentliche Ticketsuche anstossen (Nutzer-Vorgabe).
+			then()
+		})
+	}()
+}
+
+// llmErrorText erkennt die Fehler-Texte, die runLLM & Co. als STRING
+// zurueckgeben (dort gibt es keinen error-Rueckgabewert). WICHTIG: nur klar
+// fehlerfoermige Praefixe pruefen - ein blosses HasPrefix("Fehler") stufte
+// echte Schlagwortlisten wie "Fehlermeldung, Webseite" faelschlich als
+// Fehler ein.
+func llmErrorText(s string) bool {
+	for _, p := range []string{
+		"Fehler:", "Fehler bei", // runLLM/Gemini/Ollama/vLLM ("Fehler bei"/"Fehler beim")
+		"Das lokale Modell",        // llama-Instanz nicht bereit / wird neu geladen
+		"Keine Analyse-Ergebnisse", // leere llama-Antwort
+		"Keine Antwort von",        // leere Gemini-/vLLM-Antwort
+	} {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // runLLM routet eine LLM-Anfrage nach Modell-Symbol: "e2b"/"12b" an den jeweiligen

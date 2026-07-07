@@ -226,9 +226,16 @@ func (r *remoteStreamer) feed(chunk []byte) {
 		r.endUtterance()
 		return
 	}
-	if r.utterLen+len(r.sendBuf) >= vadMaxSeg {
-		// Dauersprechen ohne Pause: Notschnitt, sonst puffert der Server
-		// unbegrenzt und der Text erschiene erst am Gesprächsende.
+	// Dauersprechen ohne Pause: Notschnitt, sonst puffert der Server
+	// unbegrenzt und der Text erschiene erst am Gesprächsende. Verfeinert:
+	// nicht mehr HART beim Erreichen von vadMaxSeg schneiden (zerteilte
+	// Woerter), sondern innerhalb einer Nachfrist (vadCutSearchWin, ~2 s)
+	// auf den ersten LEISEN Chunk warten und dort trennen. Rueckwirkend wie
+	// beim lokalen vadSegmenter (quietestCutPoint) geht hier nicht - das
+	// Audio ist bereits zum Server gestreamt. Erst nach Ablauf der Nachfrist
+	// wird notfalls doch mitten im Redefluss geschnitten.
+	if total := r.utterLen + len(r.sendBuf); total >= vadMaxSeg+vadCutSearchWin ||
+		(total >= vadMaxSeg && !speech) {
 		r.endUtterance()
 		return
 	}

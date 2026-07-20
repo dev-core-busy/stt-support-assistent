@@ -1864,7 +1864,9 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 					}
 					renderResults(text, res, duration, openKeys)
 					if ibsWanted {
-						go performIBSBuzzwordSearch(text)
+						// Manuelle Portal-Suche: GLOBAL ueber alle Kunden suchen
+						// (addrID leer), der Suchtext ist die Schlagwortliste.
+						go performIBSBuzzwordSearch("", text)
 					}
 				})
 			}()

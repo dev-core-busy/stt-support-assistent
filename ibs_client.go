@@ -564,33 +564,16 @@ func performIBSLookup(number string) {
 }
 
 // performIBSBuzzwordSearch ist Schritt 2 der Schlagwort-Ticketsuche fuer die
-// Kundenverwaltung: es sucht mit den vom Analyse-LLM extrahierten Schlagworten
-// (buzzwords, komma-getrennt) die passenden Tickets zur address_id des aktuellen
-// Anrufers (POST /api/kundenverwaltung/tickets-by-buzzwords) und zeigt sie in
-// der Anruf-Ticketliste. Voraussetzung: Checkbox "IBS Tickets" aktiv
-// (config.JarvisIBS) und ein Anruf hat eine address_id geliefert
-// (currentIBSAddrID). Fehlt die ID, wird still uebersprungen (Log).
-// Laeuft in einer Goroutine; UI-Zugriffe via fyne.Do.
-func performIBSBuzzwordSearch(buzzwords string) {
+// Kundenverwaltung: es sucht mit den Schlagworten (buzzwords) die passenden
+// Tickets via POST /api/kundenverwaltung/tickets-by-buzzwords und zeigt sie in
+// der Ticketliste. addrID grenzt die Suche auf einen Kunden ein; ist addrID
+// leer (z.B. manuelle Portal-Suche ohne aktiven Anruf), sucht der Endpunkt
+// GLOBAL ueber alle Kunden. Voraussetzung: Checkbox "IBS Tickets" aktiv
+// (config.JarvisIBS). Laeuft in einer Goroutine; UI-Zugriffe via fyne.Do.
+func performIBSBuzzwordSearch(addrID, buzzwords string) {
 	buzzwords = strings.TrimSpace(buzzwords)
-	addrID := strings.TrimSpace(currentIBSAddrID)
+	addrID = strings.TrimSpace(addrID)
 	if !config.JarvisIBS {
-		return
-	}
-
-	render := func(label string, tickets []ibsTicket, errMsg string) {
-		fyne.Do(func() {
-			if showIBSTickets != nil {
-				showIBSTickets(label, tickets, errMsg)
-			}
-		})
-	}
-
-	if addrID == "" {
-		// Ohne Kundennummer (kein Anruf mit Kundenverwaltungs-Treffer) kann der
-		// Endpunkt nicht kundenbezogen suchen - klar anzeigen statt still nichts.
-		Log("IBS Schlagwort-Suche: keine address_id (kein Anruf mit Kundenverwaltungs-Treffer)")
-		render(T("Kundenverwaltung"), nil, T("Kundenverwaltung: keine Kundennummer bekannt (erst nach einem Anruf mit Kundenverwaltungs-Treffer verfügbar)."))
 		return
 	}
 	if buzzwords == "" {
@@ -603,15 +586,33 @@ func performIBSBuzzwordSearch(buzzwords string) {
 		limit = 30
 	}
 
-	Log(fmt.Sprintf("IBS Schlagwort-Suche: Adresse %s, limit %d, Schlagworte %q", addrID, limit, buzzwords))
+	render := func(label string, tickets []ibsTicket, errMsg string) {
+		fyne.Do(func() {
+			if showIBSTickets != nil {
+				showIBSTickets(label, tickets, errMsg)
+			}
+		})
+	}
+
+	scope := addrID
+	if scope == "" {
+		scope = "(global)"
+	}
+	Log(fmt.Sprintf("IBS Schlagwort-Suche: Kunde %s, limit %d, Schlagworte %q", scope, limit, buzzwords))
 	events, raw, err := ibsFetchMatchingEvents(addrID, buzzwords, limit)
-	fyne.Do(func() { showDebugResponse("Kundenverwaltung: Antwort tickets-by-buzzwords", ibsDebugPayload(raw, err)) })
+	// Debug-Popup zeigt Request UND Rohantwort - so ist bei "keine Treffer"
+	// sofort sichtbar, was gesendet und was geantwortet wurde.
+	reqPreview := fmt.Sprintf("POST %s%s\n\n{\"request\":{\"address_id\":%q,\"limit\":%q,\"buzzwords\":%q}}",
+		kvBaseURL(), kvBuzzwordPath, addrID, strconv.Itoa(limit), buzzwords)
+	fyne.Do(func() {
+		showDebugResponse("Kundenverwaltung: tickets-by-buzzwords", reqPreview+"\n\n--- Antwort ---\n"+ibsDebugPayload(raw, err))
+	})
 	label := T("Treffer zu: ") + buzzwords
 	if err != nil {
 		render(label, nil, err.Error())
 		return
 	}
 	tickets := ibsEventTickets(events)
-	Log(fmt.Sprintf("IBS Schlagwort-Suche: %d passende(s) Ticket(s) zu Adresse %s", len(tickets), addrID))
+	Log(fmt.Sprintf("IBS Schlagwort-Suche: %d Treffer (Kunde %s)", len(tickets), scope))
 	render(label, tickets, "")
 }

@@ -2074,11 +2074,11 @@ func main() {
 		extractTicketKeywords(text, win, func(keywords string) {
 			ticketSearchBtn.Enable()
 			runSearch()
-			// Kundenverwaltung mit den Schlagworten abfragen (getMatchingEvents);
-			// die Funktion prueft selbst, ob IBS aktiv/konfiguriert ist und eine
-			// address_id vorliegt, und ueberspringt sonst still.
+			// Kundenverwaltung mit den Schlagworten abfragen (tickets-by-buzzwords),
+			// eingegrenzt auf den aktuellen Anrufer (currentIBSAddrID). Die
+			// Funktion prueft selbst, ob IBS aktiv ist, und ueberspringt sonst.
 			if strings.TrimSpace(keywords) != "" {
-				go performIBSBuzzwordSearch(keywords)
+				go performIBSBuzzwordSearch(currentIBSAddrID, keywords)
 			}
 		})
 	})

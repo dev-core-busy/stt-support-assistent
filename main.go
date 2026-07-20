@@ -2066,7 +2066,7 @@ func main() {
 		extractTicketKeywords(text, win, func(keywords string) {
 			ticketSearchBtn.Enable()
 			runSearch()
-			// Kundenverwaltung mit den Schlagworten abfragen (tickets-by-buzzwords),
+			// Kundenverwaltung mit den Schlagworten abfragen (getMatchingEvents),
 			// eingegrenzt auf den aktuellen Anrufer (currentIBSAddrID). Die
 			// Funktion prueft selbst, ob IBS aktiv ist, und ueberspringt sonst.
 			if strings.TrimSpace(keywords) != "" {
@@ -3819,7 +3819,7 @@ func extractTicketKeywords(text string, win fyne.Window, then func(keywords stri
 						TextStyle: fyne.TextStyle{Bold: true},
 					}},
 				)
-				hint := widget.NewLabel(T("Hinweis: Die Jarvis-API muss noch angepasst werden, damit mit diesen Schlagworten auch dort passende Tickets gesucht werden können. Die Kundenverwaltung (tickets-by-buzzwords) wird bereits abgefragt, sofern ein Anruf eine Kundenv.-ID geliefert hat."))
+				hint := widget.NewLabel(T("Hinweis: Die Jarvis-API muss noch angepasst werden, damit mit diesen Schlagworten auch dort passende Tickets gesucht werden können. Die Kundenverwaltung (getMatchingEvents) wird bereits abgefragt, sofern ein Anruf eine Kundenv.-ID geliefert hat."))
 				hint.Alignment = fyne.TextAlignLeading
 				// Wortumbruch + feste Dialogbreite: ohne Umbruch macht Fyne den
 				// Dialog so breit wie der (lange) Hinweis in EINER Zeile und kappt

@@ -1837,8 +1837,8 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 		}
 
 		// "IBS Tickets" angehakt: zusaetzlich die Kundenverwaltung mit dem
-		// Suchtext als Schlagworte abfragen (POST /api/kundenverwaltung/
-		// tickets-by-buzzwords). openKeys != nil schaltet renderResults in die
+		// Suchtext als Schlagworte abfragen (POST {IBS.Url}/va/ev/getMatchingEvents).
+		// openKeys != nil schaltet renderResults in die
 		// Ansicht MIT Kundenverwaltungs-Bereich, sonst bliebe das IBS-Ergebnis
 		// unsichtbar. Die eigentliche IBS-Abfrage laeuft nach dem Jarvis-Render
 		// und blendet sich via showIBSTickets ein.

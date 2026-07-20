@@ -517,7 +517,7 @@ func performIBSLookup(number string) {
 
 // performIBSBuzzwordSearch ist Schritt 2 der Schlagwort-Ticketsuche fuer die
 // Kundenverwaltung: es sucht mit den Schlagworten (buzzwords) die passenden
-// Tickets via POST /api/kundenverwaltung/tickets-by-buzzwords und zeigt sie in
+// Tickets via POST {IBS.Url}/va/ev/getMatchingEvents und zeigt sie in
 // der Ticketliste. addrID grenzt die Suche auf einen Kunden ein; ist addrID
 // leer (z.B. manuelle Portal-Suche ohne aktiven Anruf), sucht der Endpunkt
 // GLOBAL ueber alle Kunden. Voraussetzung: Checkbox "IBS Tickets" aktiv
@@ -557,7 +557,7 @@ func performIBSBuzzwordSearch(addrID, buzzwords string) {
 	reqPreview := fmt.Sprintf("POST %s/va/ev/getMatchingEvents\n\n{\"event\":\"getMatchingEvents\",\"request\":{\"address_id\":%q,\"limit\":%q,\"buzzwords\":%q}}",
 		ibsBaseURL(), addrID, strconv.Itoa(limit), buzzwords)
 	fyne.Do(func() {
-		showDebugResponse("Kundenverwaltung: tickets-by-buzzwords", reqPreview+"\n\n--- Antwort ---\n"+ibsDebugPayload(raw, err))
+		showDebugResponse("Kundenverwaltung: getMatchingEvents", reqPreview+"\n\n--- Antwort ---\n"+ibsDebugPayload(raw, err))
 	})
 	label := T("Treffer zu: ") + buzzwords
 	if err != nil {

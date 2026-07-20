@@ -307,12 +307,10 @@ func kvBuzzwordURL(addrID, buzzwords string, limit int) string {
 // Endpunkt sucht global). buzzwords ist die (komma-/leerzeichengetrennte)
 // Schlagwortliste.
 //
-// Authentifizierung: HTTP Basic mit dem Windows-Domaenen-Login
-// (config.KvUser im Format "domaene\benutzer", config.KvPassword) - dieser
-// Endpunkt verlangt Basic-Auth statt des Jarvis-API-Keys. Zugangsdaten stehen
-// ausschliesslich in config.json (gitignored), nie im Quellcode (Repo public).
-// Die Antwort wird tolerant geparst (Treffer-Array unter diversen Schluesseln),
-// Rohtext geht ins Log und ins Debug-Popup.
+// Authentifizierung: derselbe Jarvis-API-Key wie bei den uebrigen /api/-
+// Endpunkten (Header X-API-Key, config.Jarvis.ApiKey) - KEIN Passwort/Domaenen-
+// Login. Die Antwort wird tolerant geparst (Treffer-Array unter diversen
+// Schluesseln), Rohtext geht ins Log und ins Debug-Popup.
 func ibsFetchMatchingEvents(addrID, buzzwords string, limit int) ([]interface{}, string, error) {
 	base := kvBaseURL()
 	if base == "" {
@@ -323,10 +321,11 @@ func ibsFetchMatchingEvents(addrID, buzzwords string, limit int) ([]interface{},
 		return nil, "", err
 	}
 	req.Header.Set("Accept", "application/json")
-	if u := strings.TrimSpace(config.KvUser); u != "" {
-		req.SetBasicAuth(u, config.KvPassword)
+	// Auth wie bei /api/support/query: X-API-Key (Jarvis-API-Key). Kein Passwort.
+	if k := strings.TrimSpace(config.Jarvis.ApiKey); k != "" {
+		req.Header.Set("X-API-Key", k)
 	} else {
-		Log("Kundenverwaltung-Suche: kein Basic-Auth-Benutzer gesetzt (config.KvUser) - Server lehnt die Anfrage vermutlich mit 401 ab")
+		Log("Kundenverwaltung-Suche: kein Jarvis-API-Key gesetzt (config.Jarvis.ApiKey) - Server lehnt die Anfrage vermutlich mit 401 ab")
 	}
 
 	resp, err := jarvisHTTPClient().Do(req)

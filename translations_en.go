@@ -151,8 +151,6 @@ var enOverrides = map[string]string{
 	"IBS-Server meldet HTTP %d":                    "IBS server returned HTTP %d",
 	"URL Kundenverwaltung API:":                    "Customer management API URL:",
 	"API-Key Kundenverwaltung:":                    "Customer management API key:",
-	"Kundenverwaltung Login (Buzzword-Suche):":     "Customer management login (keyword search):",
-	"Kundenverwaltung Passwort:":                   "Customer management password:",
 	"KI-Gesamtzusammenfassung":                     "AI overall summary",
 	"KI-GESAMTZUSAMMENFASSUNG":                     "AI OVERALL SUMMARY",
 	"KI-Zusammenfassung":                           "AI summary",

@@ -978,14 +978,6 @@ type AppConfig struct {
 	// API-Key gesetzt sind. Model bleibt ungenutzt.
 	IBS BackendCfg `json:"ibs"`
 
-	// Basic-Auth-Zugang (Windows-Domaenen-Login) fuer den Kundenverwaltungs-
-	// Schlagwort-Endpunkt POST {Jarvis.Url}/api/kundenverwaltung/tickets-by-buzzwords.
-	// Dieser Endpunkt liegt im Jarvis-/api/-Namespace, verlangt aber Basic-Auth
-	// statt des Jarvis-API-Keys. Benutzer im Format "domaene\benutzer".
-	// BEWUSST nur in config.json (gitignored), NIE im Quellcode - Repo ist public.
-	KvUser     string `json:"kvUser"`
-	KvPassword string `json:"kvPassword"`
-
 	// Zuletzt genutzte Filter/Optionen im KI-Support-Panel (STT-Tab).
 	JarvisRAG            bool `json:"jarvisRAG"`
 	JarvisIBS            bool `json:"jarvisIBS"`
@@ -2369,24 +2361,6 @@ func main() {
 		}
 	}
 
-	// Basic-Auth-Zugang (Windows-Domaenen-Login) fuer den Kundenverwaltungs-
-	// Schlagwort-Endpunkt POST {Jarvis.Url}/api/kundenverwaltung/tickets-by-buzzwords.
-	// Nur hier/in config.json hinterlegt, NIE im Quellcode (Repo public).
-	kvUserEntry := NewMinSizeEntry(200)
-	kvUserEntry.Entry.SetPlaceHolder("domaene\\benutzer")
-	kvUserEntry.Entry.SetText(config.KvUser)
-	kvUserEntry.Entry.OnChanged = func(s string) {
-		config.KvUser = s
-		saveConfigDebounced()
-	}
-	kvPassEntry := widget.NewPasswordEntry()
-	trPlaceholder(kvPassEntry, "Passwort")
-	kvPassEntry.SetText(config.KvPassword)
-	kvPassEntry.OnChanged = func(s string) {
-		config.KvPassword = s
-		saveConfigDebounced()
-	}
-
 	// DE/EN-Umschalter (Segment-Pill, siehe design.png "de_en.png"). Klick
 	// wechselt live die App-Sprache (currentLang / config.JarvisLang) über
 	// setLanguage; alle übersetzbaren Widgets folgen via onLangChange. Die Pille
@@ -2974,8 +2948,6 @@ func main() {
 			trLabel("API-Key:"), jarvisApiKeyEntry,
 			trLabel("URL Kundenverwaltung API:"), ibsUrlEntry,
 			trLabel("API-Key Kundenverwaltung:"), ibsApiKeyEntry,
-			trLabel("Kundenverwaltung Login (Buzzword-Suche):"), kvUserEntry,
-			trLabel("Kundenverwaltung Passwort:"), kvPassEntry,
 			trLabel("Prompt für KI-Zusammenfassung:"), jarvisSearchPromptEntry,
 		),
 

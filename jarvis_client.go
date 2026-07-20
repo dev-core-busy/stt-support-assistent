@@ -1836,6 +1836,13 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			Prompt: strings.TrimSpace(config.JarvisSearchQuery),
 		}
 
+		// "IBS Tickets" angehakt: zusaetzlich die Kundenverwaltung mit dem
+		// Suchtext als Schlagworte abfragen (POST /api/kundenverwaltung/
+		// tickets-by-buzzwords). openKeys != nil schaltet renderResults in die
+		// Ansicht MIT Kundenverwaltungs-Bereich, sonst bliebe das IBS-Ergebnis
+		// unsichtbar. Die eigentliche IBS-Abfrage laeuft nach dem Jarvis-Render
+		// und blendet sich via showIBSTickets ein.
+		ibsWanted := ibsCheck.Checked
 		debugPreviewAndConfirm(win, "Anfrage: Suchen (/api/support/query)", jarvisRequestPreview(req), func() {
 			searchBtn.Disable()
 			progress.Show()
@@ -1851,7 +1858,14 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 						renderError(err)
 						return
 					}
-					renderResults(text, res, duration, nil)
+					var openKeys map[string]bool
+					if ibsWanted {
+						openKeys = map[string]bool{} // nicht-nil -> Kundenverwaltungs-Bereich sichtbar
+					}
+					renderResults(text, res, duration, openKeys)
+					if ibsWanted {
+						go performIBSBuzzwordSearch(text)
+					}
 				})
 			}()
 		})

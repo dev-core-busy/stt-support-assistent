@@ -272,35 +272,85 @@ func ibsFetchEvents(addrID string) ([]interface{}, string, error) {
 	return events, raw, nil
 }
 
-// ibsFetchMatchingEvents holt die zu Schlagworten passenden Events zur Adresse
-// via POST /va/ev/getMatchingEvents. Der Server liest die Anfrage-Felder per
+// kvBuzzwordPath ist der Kundenverwaltungs-Schlagwort-Endpunkt. Er liegt im
+// Jarvis-/api/-Namespace (wie /api/support/query) - also auf dem JARVIS-Host
+// (config.Jarvis.Url), NICHT auf der kundenverwaltung.jar (die /va/... nutzt).
+const kvBuzzwordPath = "/api/kundenverwaltung/tickets-by-buzzwords"
+
+// kvBaseURL liefert die Basis-URL des Buzzword-Endpunkts (Jarvis-Host).
+func kvBaseURL() string {
+	return strings.TrimRight(strings.TrimSpace(config.Jarvis.Url), "/")
+}
+
+// ibsFetchMatchingEvents sucht die zu Schlagworten passenden Kundenverwaltungs-
+// Tickets via POST {Jarvis.Url}/api/kundenverwaltung/tickets-by-buzzwords.
+// Der Server liest die Anfrage-Felder per
 //
 //	jsonPayloadObject.getStringByPath("request.address_id")
 //	jsonPayloadObject.getStringByPath("request.limit")
 //	jsonPayloadObject.getStringByPath("request.buzzwords")
 //
 // - daher liegen address_id, limit UND buzzwords als Strings unter "request"
-// (limit als String, nicht als JSON-Zahl). buzzwords ist die vom Analyse-LLM
-// extrahierte, komma-getrennte Schlagwortliste. Das Ergebnis hat dasselbe
-// event[]-Schema wie getEvents und laeuft durch denselben Parser.
+// (limit als String). buzzwords ist die komma-getrennte Schlagwortliste.
+//
+// Authentifizierung: HTTP Basic mit dem Windows-Domaenen-Login
+// (config.KvUser im Format "domaene\benutzer", config.KvPassword) - dieser
+// Endpunkt verlangt Basic-Auth statt des Jarvis-API-Keys. Zugangsdaten stehen
+// ausschliesslich in config.json (gitignored), nie im Quellcode (Repo public).
+// Die Antwort wird tolerant geparst (Treffer-Array unter diversen Schluesseln),
+// Rohtext geht ins Log und ins Debug-Popup.
 func ibsFetchMatchingEvents(addrID, buzzwords string, limit int) ([]interface{}, string, error) {
+	base := kvBaseURL()
+	if base == "" {
+		return nil, "", fmt.Errorf(T("Kundenverwaltung-Suche: Jarvis-Server-URL ist nicht konfiguriert (siehe Einstellungen)."))
+	}
 	body := map[string]interface{}{
-		"event": "getMatchingEvents",
 		"request": map[string]string{
 			"address_id": addrID,
 			"limit":      strconv.Itoa(limit),
 			"buzzwords":  buzzwords,
 		},
 	}
-	v, raw, err := ibsPostJSON("/va/ev/getMatchingEvents", body)
+	payload, err := json.Marshal(body)
 	if err != nil {
-		return nil, raw, err
+		return nil, "", err
 	}
-	events, _ := ibsFindValue(v, "event", "events", "tickets", "items", "data", "result").([]interface{})
+	req, err := http.NewRequest("POST", base+kvBuzzwordPath, bytes.NewReader(payload))
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if u := strings.TrimSpace(config.KvUser); u != "" {
+		req.SetBasicAuth(u, config.KvPassword)
+	} else {
+		Log("Kundenverwaltung-Suche: kein Basic-Auth-Benutzer gesetzt (config.KvUser) - Server lehnt die Anfrage vermutlich mit 401 ab")
+	}
+
+	resp, err := jarvisHTTPClient().Do(req)
+	if err != nil {
+		e := fmt.Errorf(T("Kundenverwaltung nicht erreichbar (%s): %v"), base, err)
+		Log("Kundenverwaltung " + kvBuzzwordPath + ": " + e.Error())
+		return nil, "", e
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	rawS := string(raw)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		e := fmt.Errorf(T("Kundenverwaltung meldet HTTP %d"), resp.StatusCode)
+		Log("Kundenverwaltung " + kvBuzzwordPath + ": " + e.Error() + " | Rohantwort: " + rawS)
+		return nil, rawS, e
+	}
+	var v interface{}
+	if uerr := json.Unmarshal(raw, &v); uerr != nil {
+		e := fmt.Errorf(T("Kundenverwaltung: Antwort ist kein gültiges JSON: %v"), uerr)
+		Log("Kundenverwaltung " + kvBuzzwordPath + ": " + e.Error() + " | Rohantwort: " + rawS)
+		return nil, rawS, e
+	}
+	events, _ := ibsFindValue(v, "event", "events", "tickets", "items", "data", "result", "matches").([]interface{})
 	if events == nil {
-		Log("IBS getMatchingEvents: kein event[]-Array in der Antwort | Rohantwort: " + raw)
+		Log("Kundenverwaltung tickets-by-buzzwords: kein Treffer-Array in der Antwort | Rohantwort: " + rawS)
 	}
-	return events, raw, nil
+	return events, rawS, nil
 }
 
 // ibsEventTickets mappt die rohen Events auf die Anzeigeform (Feldnamen laut
@@ -515,19 +565,32 @@ func performIBSLookup(number string) {
 
 // performIBSBuzzwordSearch ist Schritt 2 der Schlagwort-Ticketsuche fuer die
 // Kundenverwaltung: es sucht mit den vom Analyse-LLM extrahierten Schlagworten
-// (buzzwords, komma-getrennt) die passenden Events zur address_id des aktuellen
-// Anrufers (getMatchingEvents) und zeigt sie in der Anruf-Ticketliste. Voraus-
-// setzung: IBS ist konfiguriert+aktiv und ein Anruf hat eine address_id
-// geliefert (currentIBSAddrID). Fehlt die ID, wird still uebersprungen (Log).
+// (buzzwords, komma-getrennt) die passenden Tickets zur address_id des aktuellen
+// Anrufers (POST /api/kundenverwaltung/tickets-by-buzzwords) und zeigt sie in
+// der Anruf-Ticketliste. Voraussetzung: Checkbox "IBS Tickets" aktiv
+// (config.JarvisIBS) und ein Anruf hat eine address_id geliefert
+// (currentIBSAddrID). Fehlt die ID, wird still uebersprungen (Log).
 // Laeuft in einer Goroutine; UI-Zugriffe via fyne.Do.
 func performIBSBuzzwordSearch(buzzwords string) {
 	buzzwords = strings.TrimSpace(buzzwords)
 	addrID := strings.TrimSpace(currentIBSAddrID)
-	if !ibsConfigured() || !config.JarvisIBS {
+	if !config.JarvisIBS {
 		return
 	}
+
+	render := func(label string, tickets []ibsTicket, errMsg string) {
+		fyne.Do(func() {
+			if showIBSTickets != nil {
+				showIBSTickets(label, tickets, errMsg)
+			}
+		})
+	}
+
 	if addrID == "" {
-		Log("IBS Schlagwort-Suche übersprungen: keine address_id (kein Anruf mit Kundenverwaltungs-Treffer)")
+		// Ohne Kundennummer (kein Anruf mit Kundenverwaltungs-Treffer) kann der
+		// Endpunkt nicht kundenbezogen suchen - klar anzeigen statt still nichts.
+		Log("IBS Schlagwort-Suche: keine address_id (kein Anruf mit Kundenverwaltungs-Treffer)")
+		render(T("Kundenverwaltung"), nil, T("Kundenverwaltung: keine Kundennummer bekannt (erst nach einem Anruf mit Kundenverwaltungs-Treffer verfügbar)."))
 		return
 	}
 	if buzzwords == "" {
@@ -540,17 +603,9 @@ func performIBSBuzzwordSearch(buzzwords string) {
 		limit = 30
 	}
 
-	render := func(label string, tickets []ibsTicket, errMsg string) {
-		fyne.Do(func() {
-			if showIBSTickets != nil {
-				showIBSTickets(label, tickets, errMsg)
-			}
-		})
-	}
-
 	Log(fmt.Sprintf("IBS Schlagwort-Suche: Adresse %s, limit %d, Schlagworte %q", addrID, limit, buzzwords))
 	events, raw, err := ibsFetchMatchingEvents(addrID, buzzwords, limit)
-	fyne.Do(func() { showDebugResponse("IBS: Antwort getMatchingEvents", ibsDebugPayload(raw, err)) })
+	fyne.Do(func() { showDebugResponse("Kundenverwaltung: Antwort tickets-by-buzzwords", ibsDebugPayload(raw, err)) })
 	label := T("Treffer zu: ") + buzzwords
 	if err != nil {
 		render(label, nil, err.Error())

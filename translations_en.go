@@ -98,6 +98,7 @@ var enOverrides = map[string]string{
 	"Extrahierte Schlagworte:":    "Extracted keywords:",
 	"Hinweis: Die Jarvis-API muss noch angepasst werden, damit mit diesen Schlagworten auch dort passende Tickets gesucht werden können. Die Kundenverwaltung (getMatchingEvents) wird bereits abgefragt, sofern ein Anruf eine Kundenv.-ID geliefert hat.": "Note: The Jarvis API still needs to be adapted so that matching tickets can also be searched there using these keywords. Customer management (getMatchingEvents) is already queried, provided a call supplied a customer-mgmt ID.",
 	"Treffer zu: ": "Matches for: ",
+	"Bitte mindestens eine Quelle auswählen (Jira/Confluence/Wissen oder IBS Tickets).":       "Please select at least one source (Jira/Confluence/Knowledge or IBS tickets).",
 	"Kundenverwaltung-Suche: Jarvis-Server-URL ist nicht konfiguriert (siehe Einstellungen).": "Customer management search: Jarvis server URL is not configured (see settings).",
 	"Kundenverwaltung nicht erreichbar (%s): %v":                                              "Customer management not reachable (%s): %v",
 	"Kundenverwaltung meldet HTTP %d":                                                         "Customer management returned HTTP %d",

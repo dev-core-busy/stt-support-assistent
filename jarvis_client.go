@@ -1809,6 +1809,35 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			showErr(fmt.Errorf(T("Bitte einen Suchtext eingeben.")), win)
 			return
 		}
+		// Welche Quellen sind ueberhaupt angehakt? Jarvis (/api/support/query)
+		// und Kundenverwaltung (getMatchingEvents) sind GETRENNTE Server. Ist
+		// KEINE Jarvis-Quelle gewaehlt, darf auch KEINE Jarvis-Anfrage rausgehen.
+		jarvisWanted := ragCheck.Checked || jiraCheck.Checked || openOnlyCheck.Checked || confluenceCheck.Checked || aiCheck.Checked
+		ibsWanted := ibsCheck.Checked
+		if !jarvisWanted && !ibsWanted {
+			showErr(fmt.Errorf(T("Bitte mindestens eine Quelle auswählen (Jira/Confluence/Wissen oder IBS Tickets).")), win)
+			return
+		}
+
+		// Nur "IBS Tickets" (keine Jarvis-Quelle): KEINE Jarvis-Anfrage senden -
+		// ausschliesslich die Kundenverwaltung abfragen (getMatchingEvents,
+		// config.IBS.Url). renderResults mit leerem (nicht-nil) openKeys raeumt
+		// eine evtl. stehende Jira-Seite ab und oeffnet die reine IBS-Ansicht;
+		// performIBSBuzzwordSearch blendet die Treffer via showIBSTickets ein.
+		if !jarvisWanted {
+			searchBtn.Disable()
+			progress.Show()
+			renderResults(text, nil, 0, map[string]bool{})
+			go func() {
+				performIBSBuzzwordSearch("", text) // addrID leer => globale Suche
+				fyne.Do(func() {
+					progress.Hide()
+					searchBtn.Enable()
+				})
+			}()
+			return
+		}
+
 		jiraLimit, _ := strconv.Atoi(strings.TrimSpace(jiraLimitEntry.Text))
 		if jiraLimit <= 0 {
 			jiraLimit = 10
@@ -1836,13 +1865,9 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			Prompt: strings.TrimSpace(config.JarvisSearchQuery),
 		}
 
-		// "IBS Tickets" angehakt: zusaetzlich die Kundenverwaltung mit dem
-		// Suchtext als Schlagworte abfragen (POST {IBS.Url}/va/ev/getMatchingEvents).
-		// openKeys != nil schaltet renderResults in die
-		// Ansicht MIT Kundenverwaltungs-Bereich, sonst bliebe das IBS-Ergebnis
-		// unsichtbar. Die eigentliche IBS-Abfrage laeuft nach dem Jarvis-Render
-		// und blendet sich via showIBSTickets ein.
-		ibsWanted := ibsCheck.Checked
+		// Zusaetzlich "IBS Tickets" angehakt: nach dem Jarvis-Render die
+		// Kundenverwaltung abfragen (openKeys != nil => IBS-Bereich sichtbar),
+		// eingeblendet via showIBSTickets.
 		debugPreviewAndConfirm(win, "Anfrage: Suchen (/api/support/query)", jarvisRequestPreview(req), func() {
 			searchBtn.Disable()
 			progress.Show()

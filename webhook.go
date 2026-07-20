@@ -324,7 +324,9 @@ func handleIncomingCaller(number string, auto bool) {
 		}
 	})
 	// Kundenv.-ID des vorherigen Anrufers zuruecksetzen (performIBSLookup
-	// setzt gleich die neue, sofern die IBS-Abfrage unten laeuft).
+	// setzt gleich die neue, sofern die IBS-Abfrage unten laeuft). Auch den
+	// Merker fuer die Schlagwort-Suche (getMatchingEvents) leeren.
+	currentIBSAddrID = ""
 	setIBSAddressField("-")
 
 	if auto && !config.AutoSearchCaller {

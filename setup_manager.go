@@ -4,11 +4,13 @@ import (
 	"archive/zip"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const (
@@ -164,8 +166,18 @@ func EnsureDependencies(progress func(string, float64)) error {
 	} else {
 		progress("Whisper-Modell (Lokal)", 1.0)
 	}
+	// turbo NUR laden, wenn die LOKALE Erkennung aktiv ist - bei Remote-
+	// Whisper wird das Modell nicht gebraucht, und ein haengender/langsamer
+	// 550-MB-Download wuerde den Start (und damit den Mitschrift-Button)
+	// blockieren. Wechselt der Nutzer spaeter auf lokal, laeuft die
+	// Erkennung zunaechst mit whisper-base; der turbo-Download folgt beim
+	// naechsten App-Start mit lokaler Einstellung.
 	turboPath := filepath.Join(exeDir, "models", whisperTurboModelFile)
-	if _, err := os.Stat(turboPath); os.IsNotExist(err) {
+	if _, err := os.Stat(turboPath); err == nil {
+		progress("Whisper-Modell turbo (Lokal)", 1.0)
+	} else if !config.WhisperLocal {
+		Log("Whisper-turbo-Download übersprungen (Erkennung: Remote)")
+	} else {
 		if err := downloadFile(whisperTurboModelURL, turboPath, func(p float64) {
 			progress(fmt.Sprintf("Lade Whisper large-v3-turbo … %.0f%%", p*100), p)
 		}); err != nil {
@@ -174,8 +186,6 @@ func EnsureDependencies(progress func(string, float64)) error {
 			Log("Whisper-turbo-Download fehlgeschlagen: " + err.Error())
 			progress("Whisper turbo-Download fehlgeschlagen - nutze base", 1.0)
 		}
-	} else {
-		progress("Whisper-Modell turbo (Lokal)", 1.0)
 	}
 
 	// 2. Lokale Gemma-Modelle werden bewusst NICHT mehr beim Start geladen
@@ -195,7 +205,9 @@ func EnsureDependencies(progress func(string, float64)) error {
 			return err
 		}
 		if err := ensureBinary(whisperWinURL, "whisper-server.exe", progress); err != nil {
-			return err
+			// Nicht fatal: whisper-cli bleibt der Rueckfall der lokalen
+			// Erkennung, Remote-Whisper ist gar nicht betroffen.
+			Log("whisper-server.exe konnte nicht geladen werden: " + err.Error())
 		}
 		if err := ensureBinary(llamaWinURL, "llama-cli.exe", progress); err != nil {
 			return err
@@ -225,7 +237,18 @@ func ensureBinary(url, fileName string, progress func(string, float64)) error {
 }
 
 func downloadFile(url, dest string, progress func(float64)) error {
-	client := &http.Client{}
+	// Bewusst KEIN Gesamt-Timeout (grosse Modell-Downloads dauern), aber
+	// Timeouts fuer Verbindungsaufbau/TLS/Antwortbeginn: ein blackholender
+	// Proxy liess den Download sonst ENDLOS haengen - und damit den ganzen
+	// App-Start (EnsureDependencies blockiert den Mitschrift-Button).
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: 15 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+		},
+	}
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Antigravity-STT-App/1.0")
 

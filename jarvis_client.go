@@ -1764,8 +1764,20 @@ func buildKISupportPanel(win fyne.Window) (fyne.CanvasObject, func(recognizedTex
 			}
 		}
 	}
+	// Such-Limit der Schlagwortsuche (request.limit fuer getMatchingEvents):
+	// wie viele passende Kundenverwaltungs-Tickets der Server zurueckliefern
+	// soll. Getrennt vom reinen Anzeige-Limit oben (JarvisIBSLimit).
+	ibsSearchLimitEntry := widget.NewEntry()
+	ibsSearchLimitEntry.SetText(strconv.Itoa(config.JarvisIBSSearchLimit))
+	ibsSearchLimitEntry.OnChanged = func(s string) {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+			config.JarvisIBSSearchLimit = n
+			saveConfigDebounced()
+		}
+	}
 	ibsLimitRow := container.New(&compactFormLayout{},
 		trLabel("Kundenverwaltung-Tickets:"), ibsLimitEntry,
+		trLabel("Kundenverwaltung-Schlagwortsuche:"), ibsSearchLimitEntry,
 	)
 
 	advanced := container.NewVBox(

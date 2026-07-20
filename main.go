@@ -29,10 +29,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/gen2brain/malgo"
-	"image"
 	"image/color"
-	"image/draw"
-	"image/png"
 )
 
 // ========= UI Elements with Tooltips =========
@@ -982,14 +979,15 @@ type AppConfig struct {
 	IBS BackendCfg `json:"ibs"`
 
 	// Zuletzt genutzte Filter/Optionen im KI-Support-Panel (STT-Tab).
-	JarvisRAG        bool `json:"jarvisRAG"`
-	JarvisIBS        bool `json:"jarvisIBS"`
-	JarvisJira       bool `json:"jarvisJira"`
-	JarvisOpenOnly   bool `json:"jarvisOpenOnly"`
-	JarvisConfluence bool `json:"jarvisConfluence"`
-	JarvisAISummary  bool `json:"jarvisAISummary"`
-	JarvisJiraLimit  int  `json:"jarvisJiraLimit"`
-	JarvisIBSLimit   int  `json:"jarvisIBSLimit"` // max. angezeigte Kundenverwaltungs-Tickets
+	JarvisRAG            bool `json:"jarvisRAG"`
+	JarvisIBS            bool `json:"jarvisIBS"`
+	JarvisJira           bool `json:"jarvisJira"`
+	JarvisOpenOnly       bool `json:"jarvisOpenOnly"`
+	JarvisConfluence     bool `json:"jarvisConfluence"`
+	JarvisAISummary      bool `json:"jarvisAISummary"`
+	JarvisJiraLimit      int  `json:"jarvisJiraLimit"`
+	JarvisIBSLimit       int  `json:"jarvisIBSLimit"`       // max. angezeigte Kundenverwaltungs-Tickets
+	JarvisIBSSearchLimit int  `json:"jarvisIBSSearchLimit"` // request.limit der Schlagwortsuche (getMatchingEvents)
 
 	// Zustand der Kopfzeile der Anruf-Ticketliste (Quellen-Haekchen "Jira"/
 	// "Kundenv.", Radio "offen"/"alle") - bleibt wie die Such-Checkboxen ueber
@@ -1121,6 +1119,7 @@ func LoadConfig(a fyne.App) {
 		JarvisAISummary:          true,
 		JarvisJiraLimit:          10,
 		JarvisIBSLimit:           10,
+		JarvisIBSSearchLimit:     30,
 		JarvisCallShowJira:       true,
 		JarvisCallShowIBS:        true,
 		JarvisCallOpenOnly:       true,
@@ -1498,27 +1497,6 @@ func saveConfigDebounced() {
 	saveTimer = time.AfterFunc(600*time.Millisecond, writeConfigFile)
 }
 
-// opaqueWindowIcon rendert das (transparente) App-Icon auf einen deckend
-// weißen Hintergrund. Windows stellt das Titelleisten-Icon (oben links im
-// Fenster) bei einem Icon mit Alphakanal teils fehlerhaft dar; das Taskleisten-
-// symbol (myApp.SetIcon) ist davon nicht betroffen und bleibt transparent.
-func opaqueWindowIcon(src fyne.Resource) fyne.Resource {
-	img, _, err := image.Decode(bytes.NewReader(src.Content()))
-	if err != nil {
-		return src
-	}
-	bounds := img.Bounds()
-	flat := image.NewRGBA(bounds)
-	draw.Draw(flat, bounds, &image.Uniform{color.White}, image.Point{}, draw.Src)
-	draw.Draw(flat, bounds, img, bounds.Min, draw.Over)
-
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, flat); err != nil {
-		return src
-	}
-	return fyne.NewStaticResource("app_icon_window.png", buf.Bytes())
-}
-
 func main() {
 	// EXE-Pfad global bestimmen
 	p, _ := os.Executable()
@@ -1547,7 +1525,12 @@ func main() {
 	win := myApp.NewWindow("")
 	mainWin = win // paketweiter Zugriff (z.B. Debug-Popup des Rufnummern-Webhooks)
 	win.SetMaster()
-	win.SetIcon(opaqueWindowIcon(appIcon)) // Fenster-Icon (oben links) deckend statt transparent
+	// Fenster-Icon transparent setzen; das (frueher unscharfe, weiss
+	// hinterlegte) Titelleisten-Symbol wird unter Windows zusaetzlich NATIV
+	// aus dem mehrstufigen .exe-Icon gesetzt (applyCrispWindowIcon, s.u.) -
+	// Windows bekommt so exakt passende 16/32-px-Bilder statt dieses grosse
+	// PNG selbst herunterzuskalieren.
+	win.SetIcon(appIcon)
 	updateWindowTitle(win)
 
 	// Fenstergröße & Position wiederherstellen
@@ -1934,7 +1917,17 @@ func main() {
 		for range t.C {
 			refreshServerHealth()
 			if !atWhisperLocal.Load() {
-				atRemoteWhisperOK.Store(remoteWhisperHealth())
+				ok, detail := remoteWhisperHealth()
+				// Debug: Zustandswechsel der Remote-Whisper-Erreichbarkeit
+				// loggen (nur Wechsel, nicht alle 2 s).
+				if atRemoteWhisperOK.Load() != ok {
+					if ok {
+						Log("Remote-Whisper erreichbar: " + remoteWhisperURL())
+					} else {
+						Log("Remote-Whisper NICHT erreichbar (/health): " + detail)
+					}
+				}
+				atRemoteWhisperOK.Store(ok)
 			}
 			fyne.Do(updatePills)
 		}
@@ -2070,9 +2063,15 @@ func main() {
 		// Schritt 2 (Abfrage der APIs MIT den Schlagworten) steht in TODO.md -
 		// Jarvis/Kundenverwaltung muessen dafuer erst angepasst werden.
 		ticketSearchBtn.Disable()
-		extractTicketKeywords(text, win, func() {
+		extractTicketKeywords(text, win, func(keywords string) {
 			ticketSearchBtn.Enable()
 			runSearch()
+			// Kundenverwaltung mit den Schlagworten abfragen (getMatchingEvents);
+			// die Funktion prueft selbst, ob IBS aktiv/konfiguriert ist und eine
+			// address_id vorliegt, und ueberspringt sonst still.
+			if strings.TrimSpace(keywords) != "" {
+				go performIBSBuzzwordSearch(keywords)
+			}
 		})
 	})
 
@@ -3086,6 +3085,7 @@ func main() {
 	win.SetContent(container.NewBorder(nil, statusBar, nil, nil, container.NewStack(tabs, logoOverlay)))
 	restoreWindowPosition(win)
 	setWindowSquare(win, isClassic(config.Theme)) // eckiger Fensterrahmen im klassischen Design
+	applyCrispWindowIcon(win)                     // scharfes, transparentes Titelleisten-Symbol (nativ, s. main_windows.go)
 
 	// Auto-Update: still im Hintergrund gegen die neueste GitHub-Release-Version
 	// pruefen und bei Bedarf (nach Rueckfrage) herunterladen + neu starten.
@@ -3326,7 +3326,39 @@ func prepareAudio() {
 	// den Restpuffer: der Callback liefert dann keine Chunks mehr, ohne Flush
 	// fehlten die letzten Worte des Gespraechs im Transkript.
 	runVADLoop := func(ctx context.Context, ch <-chan []byte, speaker string, gain func() float64) {
-		seg := &vadSegmenter{speaker: speaker, gain: gain, emit: processSegment}
+		// Transkriptions-Warteschlange: processSegment (lokale whisper-
+		// Inferenz, bei large-v3-turbo mehrere Sekunden je Segment) darf die
+		// VAD-Schleife NICHT blockieren - sonst laeuft der 6-s-Audiopuffer
+		// des Capture-Callbacks ueber ("Audiopuffer voll", verlorene
+		// Segmente). Ein Worker je Sprecher arbeitet die Segmente sequenziell
+		// ab (Reihenfolge im Transkript bleibt erhalten). Ist auch die
+		// Warteschlange voll (Inferenz dauerhaft langsamer als Echtzeit),
+		// wird das AELTESTE Segment verworfen - mit klarer Log-Meldung.
+		queue := make(chan []byte, 16)
+		defer close(queue) // beendet den Worker beim Stopp der Schleife
+		go func() {
+			for segAudio := range queue {
+				processSegment(segAudio, speaker)
+			}
+		}()
+		enqueue := func(segAudio []byte, sp string) {
+			select {
+			case queue <- segAudio:
+				return
+			default:
+			}
+			select {
+			case old := <-queue:
+				Log(fmt.Sprintf("WARN: %s-Transkription kommt nicht hinterher - ältestes Segment (%.1f s) verworfen",
+					sp, float64(len(old))/float64(vadBytesPerSecond)))
+			default:
+			}
+			select {
+			case queue <- segAudio:
+			default:
+			}
+		}
+		seg := &vadSegmenter{speaker: speaker, gain: gain, emit: enqueue}
 		stream := &remoteStreamer{speaker: speaker, gain: gain}
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
@@ -3735,12 +3767,12 @@ func runAnalysisLogic(text, userPrompt string) string {
 // Jarvis- und Kundenverwaltungs-API muessen dafuer erst angepasst werden -
 // s. TODO.md Punkt "Schlagwort-Ticketsuche". Laeuft asynchron (LLM-Aufruf);
 // UI-Zugriffe via fyne.Do; then() laeuft im Fyne-Main-Thread.
-func extractTicketKeywords(text string, win fyne.Window, then func()) {
+func extractTicketKeywords(text string, win fyne.Window, then func(keywords string)) {
 	if then == nil {
-		then = func() {}
+		then = func(string) {}
 	}
 	if len(strings.TrimSpace(text)) < 10 {
-		then()
+		then("")
 		return // (fast) leere Mitschrift - nichts zu extrahieren
 	}
 	prompt := T("Extrahiere aus dem folgenden Support-Gespräch 2 bis 3 Schlagworte, die das Anliegen am besten beschreiben. Antworte NUR mit den Schlagworten, durch Kommas getrennt, ohne weitere Erklärung.")
@@ -3770,12 +3802,14 @@ func extractTicketKeywords(text string, win fyne.Window, then func()) {
 			if analysisProgress != nil {
 				analysisProgress.Hide()
 			}
+			keywords := ""
 			if isErr {
 				if res == "" {
 					res = T("(keine Antwort erhalten)")
 				}
 				showErr(fmt.Errorf(T("Schlagworte konnten nicht ermittelt werden: ")+"%s", res), win)
 			} else {
+				keywords = res
 				// Schlagworte FETT direkt hinter dem Label (RichText-Segmente;
 				// ein Label kann keine Teil-Fettung).
 				line := widget.NewRichText(
@@ -3785,14 +3819,15 @@ func extractTicketKeywords(text string, win fyne.Window, then func()) {
 						TextStyle: fyne.TextStyle{Bold: true},
 					}},
 				)
-				hint := widget.NewLabel(T("Hinweis: Die Jarvis- und die Kundenverwaltungs-API müssen noch angepasst werden, damit mit diesen Schlagworten passende Tickets gesucht und angezeigt werden können."))
+				hint := widget.NewLabel(T("Hinweis: Die Jarvis-API muss noch angepasst werden, damit mit diesen Schlagworten auch dort passende Tickets gesucht werden können. Die Kundenverwaltung (getMatchingEvents) wird bereits abgefragt, sofern ein Anruf eine Kundenv.-ID geliefert hat."))
 				hint.Alignment = fyne.TextAlignLeading
 				dialog.ShowCustom(T("Schlagworte zur Ticketsuche"), T("OK"),
 					container.NewVBox(line, hint), win)
 			}
 			// Erst NACH der Anzeige der Schlagworte (bzw. des Fehlers) die
-			// eigentliche Ticketsuche anstossen (Nutzer-Vorgabe).
-			then()
+			// eigentliche Ticketsuche anstossen (Nutzer-Vorgabe). Die extrahierten
+			// Schlagworte gehen an then() (fuer die getMatchingEvents-Suche).
+			then(keywords)
 		})
 	}()
 }

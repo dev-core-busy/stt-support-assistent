@@ -66,6 +66,13 @@ func ibsConfigured() bool {
 	return strings.TrimSpace(config.IBS.Url) != "" && strings.TrimSpace(config.IBS.ApiKey) != ""
 }
 
+// currentIBSAddrID haelt die address_id des zuletzt per Rufnummern-Webhook
+// gefundenen Anrufers fest (von performIBSLookup gesetzt, beim naechsten Anruf
+// zurueckgesetzt, s. webhook.go). Die Schlagwort-Suche (getMatchingEvents)
+// braucht diese ID - sie steht nur im Anzeige-Label ("Kundenv. ID"), das aber
+// "-" statt der Roh-ID zeigt.
+var currentIBSAddrID string
+
 func ibsBaseURL() string {
 	return strings.TrimRight(strings.TrimSpace(config.IBS.Url), "/")
 }
@@ -265,6 +272,37 @@ func ibsFetchEvents(addrID string) ([]interface{}, string, error) {
 	return events, raw, nil
 }
 
+// ibsFetchMatchingEvents holt die zu Schlagworten passenden Events zur Adresse
+// via POST /va/ev/getMatchingEvents. Der Server liest die Anfrage-Felder per
+//
+//	jsonPayloadObject.getStringByPath("request.address_id")
+//	jsonPayloadObject.getStringByPath("request.limit")
+//	jsonPayloadObject.getStringByPath("request.buzzwords")
+//
+// - daher liegen address_id, limit UND buzzwords als Strings unter "request"
+// (limit als String, nicht als JSON-Zahl). buzzwords ist die vom Analyse-LLM
+// extrahierte, komma-getrennte Schlagwortliste. Das Ergebnis hat dasselbe
+// event[]-Schema wie getEvents und laeuft durch denselben Parser.
+func ibsFetchMatchingEvents(addrID, buzzwords string, limit int) ([]interface{}, string, error) {
+	body := map[string]interface{}{
+		"event": "getMatchingEvents",
+		"request": map[string]string{
+			"address_id": addrID,
+			"limit":      strconv.Itoa(limit),
+			"buzzwords":  buzzwords,
+		},
+	}
+	v, raw, err := ibsPostJSON("/va/ev/getMatchingEvents", body)
+	if err != nil {
+		return nil, raw, err
+	}
+	events, _ := ibsFindValue(v, "event", "events", "tickets", "items", "data", "result").([]interface{})
+	if events == nil {
+		Log("IBS getMatchingEvents: kein event[]-Array in der Antwort | Rohantwort: " + raw)
+	}
+	return events, raw, nil
+}
+
 // ibsEventTickets mappt die rohen Events auf die Anzeigeform (Feldnamen laut
 // Doku, tolerante Varianten als Rueckfall). Offen = state != ENDED (so
 // filtert auch der Server bei getOpenEvents). Ohne erkennbaren Inhalt landet
@@ -441,6 +479,7 @@ func performIBSLookup(number string) {
 
 	addrID, addrLabel, raw, err := ibsAddressLookup(number)
 	fyne.Do(func() { showDebugResponse("IBS: Antwort getByNumber", ibsDebugPayload(raw, err)) })
+	currentIBSAddrID = addrID  // fuer die spaetere Schlagwort-Suche (getMatchingEvents)
 	setIBSAddressField(addrID) // "Kundenv. ID" im STT-Tab ("-" wenn leer)
 	if err != nil {
 		render(number, nil, err.Error())
@@ -472,4 +511,52 @@ func performIBSLookup(number string) {
 	}
 	Log(fmt.Sprintf("IBS: %d Ticket(s) zu Adresse %s, davon %d offen", len(tickets), addrID, open))
 	render(who, tickets, "")
+}
+
+// performIBSBuzzwordSearch ist Schritt 2 der Schlagwort-Ticketsuche fuer die
+// Kundenverwaltung: es sucht mit den vom Analyse-LLM extrahierten Schlagworten
+// (buzzwords, komma-getrennt) die passenden Events zur address_id des aktuellen
+// Anrufers (getMatchingEvents) und zeigt sie in der Anruf-Ticketliste. Voraus-
+// setzung: IBS ist konfiguriert+aktiv und ein Anruf hat eine address_id
+// geliefert (currentIBSAddrID). Fehlt die ID, wird still uebersprungen (Log).
+// Laeuft in einer Goroutine; UI-Zugriffe via fyne.Do.
+func performIBSBuzzwordSearch(buzzwords string) {
+	buzzwords = strings.TrimSpace(buzzwords)
+	addrID := strings.TrimSpace(currentIBSAddrID)
+	if !ibsConfigured() || !config.JarvisIBS {
+		return
+	}
+	if addrID == "" {
+		Log("IBS Schlagwort-Suche übersprungen: keine address_id (kein Anruf mit Kundenverwaltungs-Treffer)")
+		return
+	}
+	if buzzwords == "" {
+		Log("IBS Schlagwort-Suche übersprungen: keine Schlagworte")
+		return
+	}
+
+	limit := config.JarvisIBSSearchLimit
+	if limit <= 0 {
+		limit = 30
+	}
+
+	render := func(label string, tickets []ibsTicket, errMsg string) {
+		fyne.Do(func() {
+			if showIBSTickets != nil {
+				showIBSTickets(label, tickets, errMsg)
+			}
+		})
+	}
+
+	Log(fmt.Sprintf("IBS Schlagwort-Suche: Adresse %s, limit %d, Schlagworte %q", addrID, limit, buzzwords))
+	events, raw, err := ibsFetchMatchingEvents(addrID, buzzwords, limit)
+	fyne.Do(func() { showDebugResponse("IBS: Antwort getMatchingEvents", ibsDebugPayload(raw, err)) })
+	label := T("Treffer zu: ") + buzzwords
+	if err != nil {
+		render(label, nil, err.Error())
+		return
+	}
+	tickets := ibsEventTickets(events)
+	Log(fmt.Sprintf("IBS Schlagwort-Suche: %d passende(s) Ticket(s) zu Adresse %s", len(tickets), addrID))
+	render(label, tickets, "")
 }

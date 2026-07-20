@@ -254,9 +254,13 @@ func ensureWhisperServer() {
 		return
 	}
 
-	threads := runtime.NumCPU() / 2
-	if threads < 1 {
-		threads = 1
+	// Threads: fast alle Kerne (statt der Haelfte wie bei llama) - die
+	// Transkription muss SCHNELLER als Echtzeit laufen, sonst staut sich
+	// die Segment-Warteschlange (s. runVADLoop) und Segmente gehen verloren.
+	// Sie laeuft zudem nur in kurzen Schueben je Segment.
+	threads := runtime.NumCPU() - 2
+	if threads < 2 {
+		threads = 2
 	}
 	args := []string{
 		"-m", modelPath,
@@ -276,9 +280,13 @@ func ensureWhisperServer() {
 	}
 	whisperSrv.cmd = cmd
 	whisperSrv.model = modelPath
-	Log(fmt.Sprintf("whisper-server gestartet (Port %s, Modell %s)", whisperSrv.port, filepath.Base(modelPath)))
+	Log(fmt.Sprintf("whisper-server gestartet (Port %s, Modell %s, %d Threads)", whisperSrv.port, filepath.Base(modelPath), threads))
+	// whisper-server schreibt ALLE Diagnose-Ausgaben (Init, system_info,
+	// "processing ...") auf stderr - das sind KEINE Fehler, daher derselbe
+	// neutrale Log-Tag wie fuer stdout (das fruehere "-ERR" las sich wie
+	// eine Warnungsflut).
 	go pipeToLog(stdoutPipe, "WHISPER-SRV")
-	go pipeToLog(stderrPipe, "WHISPER-SRV-ERR")
+	go pipeToLog(stderrPipe, "WHISPER-SRV")
 
 	// Warmup: GET /health (in whisper.cpp v1.8.4 vorhanden) antwortet 200,
 	// sobald der Server laeuft und das Modell geladen ist.

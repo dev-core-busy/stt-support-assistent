@@ -4,8 +4,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -36,7 +38,28 @@ type remoteSession struct {
 	speaker   string
 	seq       int
 	mu        sync.Mutex
+	// pendingSince: Unix-Nanos der aeltesten UNBEANTWORTETEN eou-Sendung
+	// (0 = nichts offen). Watchdog: antwortet der Server ueber laengere Zeit
+	// GAR NICHT (haengender Transkriptions-Worker; beobachtet 2026-07-07 -
+	// ready kam, finals blieben komplett aus), gilt die Session als tot und
+	// wird beim naechsten Senden neu aufgebaut (s. getRemoteSession).
+	pendingSince atomic.Int64
 }
+
+// remoteStallTimeout: ab so viel Wartezeit ohne JEDE Server-Antwort auf eine
+// gesendete Äußerung wird die Session als haengend verworfen und neu aufgebaut.
+const remoteStallTimeout = 30 * time.Second
+
+// remoteInstanceID macht die Session-IDs dieser App-Instanz eindeutig
+// (Rechnername + PID): bisher hiess JEDE Installation "stt-app-Agent" -
+// im Server-Log nicht auseinanderzuhalten.
+var remoteInstanceID = func() string {
+	h, err := os.Hostname()
+	if err != nil || strings.TrimSpace(h) == "" {
+		h = "host"
+	}
+	return fmt.Sprintf("%s-%d", h, os.Getpid())
+}()
 
 var (
 	remoteSessions   = map[string]*remoteSession{}
@@ -52,18 +75,28 @@ func remoteWhisperURL() string {
 }
 
 // getRemoteSession liefert die (ggf. neu aufgebaute) Session eines Sprechers.
+// Eine Session, deren letzte Äußerung seit remoteStallTimeout unbeantwortet
+// ist, wird verworfen und neu aufgebaut (Watchdog gegen haengende Server).
 func getRemoteSession(speaker string) (*remoteSession, error) {
 	remoteSessionsMu.Lock()
 	defer remoteSessionsMu.Unlock()
 	if s, ok := remoteSessions[speaker]; ok && s.conn != nil {
-		return s, nil
+		if p := s.pendingSince.Load(); p > 0 && time.Since(time.Unix(0, p)) > remoteStallTimeout {
+			Log(fmt.Sprintf("Remote-STT[%s]: seit %.0f s KEINE Antwort auf gesendete Äußerungen - Session wird neu aufgebaut",
+				s.sessionId, time.Since(time.Unix(0, p)).Seconds()))
+			websocket.JSON.Send(s.conn, wsMsg{Type: "stop", SessionId: s.sessionId})
+			s.conn.Close()
+			delete(remoteSessions, speaker)
+		} else {
+			return s, nil
+		}
 	}
 	url := remoteWhisperURL()
 	conn, err := websocket.Dial(url, "", "http://localhost/")
 	if err != nil {
 		return nil, fmt.Errorf("Verbindung zu %s fehlgeschlagen: %v", url, err)
 	}
-	sid := "stt-app-" + speaker
+	sid := "stt-app-" + remoteInstanceID + "-" + speaker
 	s := &remoteSession{conn: conn, sessionId: sid, speaker: speaker}
 	if err := websocket.JSON.Send(conn, wsMsg{
 		Type: "start", SessionId: sid, Language: "de",
@@ -74,20 +107,26 @@ func getRemoteSession(speaker string) (*remoteSession, error) {
 	}
 	go s.readLoop()
 	remoteSessions[speaker] = s
-	Log("Remote-STT-Session gestartet: " + sid)
+	Log("Remote-STT-Session gestartet: " + sid + " -> " + url)
 	return s, nil
 }
 
-// readLoop liest Server-Nachrichten und zeigt final-Texte an.
+// readLoop liest Server-Nachrichten und zeigt final-Texte an. Jede
+// eintreffende Nachricht wird geloggt (Debug: nachvollziehen, ob und was der
+// Server ueberhaupt antwortet).
 func (s *remoteSession) readLoop() {
 	for {
 		var m wsMsg
 		if err := websocket.JSON.Receive(s.conn, &m); err != nil {
+			Log(fmt.Sprintf("Remote-STT[%s]: Verbindung beendet: %v", s.sessionId, err))
 			return // Verbindung geschlossen
 		}
 		switch m.Type {
 		case "final":
-			if text := strings.TrimSpace(m.Text); text != "" {
+			s.pendingSince.Store(0) // Antwort da -> Watchdog zuruecksetzen
+			text := strings.TrimSpace(m.Text)
+			Log(fmt.Sprintf("Remote-STT[%s]: final erhalten (%d Zeichen)", s.sessionId, len(text)))
+			if text != "" {
 				updateSTTTail(text) // Kontext-Puffer (nutzt derzeit nur der lokale Whisper)
 				if atHasPostProc.Load() {
 					appendPendingRaw(s.speaker, text)
@@ -101,7 +140,10 @@ func (s *remoteSession) readLoop() {
 			// bräuchte Replace-Semantik im Transkript (das pendingRaw-Modell
 			// kann nur anhängen) - bewusst ignoriert, s. TODO.md.
 		case "error":
-			Log("Remote-STT-Fehler: " + m.Message)
+			s.pendingSince.Store(0) // auch ein Fehler ist eine Antwort
+			Log(fmt.Sprintf("Remote-STT[%s]: Server-Fehler: %s", s.sessionId, m.Message))
+		default:
+			Log(fmt.Sprintf("Remote-STT[%s]: Nachricht Typ %q erhalten", s.sessionId, m.Type))
 		}
 	}
 }
@@ -113,13 +155,19 @@ func (s *remoteSession) send(audio []byte, eou bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.seq++
-	return websocket.JSON.Send(s.conn, wsMsg{
+	err := websocket.JSON.Send(s.conn, wsMsg{
 		Type:           "audio",
 		SessionId:      s.sessionId,
 		Sequence:       s.seq,
 		PcmBase64:      base64.StdEncoding.EncodeToString(audio),
 		EndOfUtterance: eou,
 	})
+	if err == nil && eou {
+		// Watchdog scharf stellen (nur falls nicht schon eine aeltere
+		// Äußerung unbeantwortet ist).
+		s.pendingSince.CompareAndSwap(0, time.Now().UnixNano())
+	}
+	return err
 }
 
 // remoteSendChunk sendet Audio (ggf. mit Äußerungsende-Markierung) an den
@@ -249,8 +297,24 @@ func (r *remoteStreamer) push(eou bool) {
 	if len(r.sendBuf) == 0 && !eou {
 		return
 	}
+	if eou && len(r.sendBuf) == 0 {
+		// NIEMALS ein leeres eou-Paket senden: ohne Audio fehlt pcmBase64
+		// (omitempty) komplett und der Server VERWIRFT die Nachricht - das
+		// endOfUtterance geht verloren, die Äußerung wird nie transkribiert
+		// (live verifiziert 2026-07-07: exakt so verschwanden ALLE finals,
+		// denn der Pausen-Trim in feed() leert den Restpuffer praktisch
+		// immer - drop=8 KB, der Puffer haelt aber nie >=8 KB, sonst waere
+		// er vorher gepusht worden). 20 ms Stille als Traeger mitschicken.
+		r.sendBuf = make([]byte, vadBytesPerSecond/50)
+	}
 	remoteSendChunk(r.sendBuf, r.speaker, eou)
 	r.utterLen += len(r.sendBuf)
+	if eou {
+		// Debug: eine Zeile je abgeschlossener Äußerung - so ist im Log
+		// nachvollziehbar, dass ueberhaupt Audio zum Server geht.
+		Log(fmt.Sprintf("Remote-STT[%s]: Äußerung gesendet (endOfUtterance, %d Bytes ≈ %.1f s)",
+			r.speaker, r.utterLen, float64(r.utterLen)/float64(vadBytesPerSecond)))
+	}
 	r.sendBuf = nil
 }
 
@@ -279,6 +343,7 @@ func closeRemoteSession(speaker string) {
 			s.conn.Close()
 		}
 		delete(remoteSessions, speaker)
+		Log("Remote-STT-Session geschlossen: " + s.sessionId)
 	}
 }
 
@@ -295,8 +360,9 @@ func closeAllRemoteSessions() {
 }
 
 // remoteWhisperHealth prüft, ob der Remote-Whisper-Server erreichbar ist
-// (HTTP /health, abgeleitet aus der WebSocket-URL). Blockierend bis 2s.
-func remoteWhisperHealth() bool {
+// (HTTP /health, abgeleitet aus der WebSocket-URL). detail nennt bei
+// ok=false den Grund (fuer das Transitions-Log im Pill-Ticker, main.go).
+func remoteWhisperHealth() (ok bool, detail string) {
 	h := remoteWhisperURL()
 	h = strings.Replace(h, "wss://", "https://", 1)
 	h = strings.Replace(h, "ws://", "http://", 1)
@@ -304,11 +370,22 @@ func remoteWhisperHealth() bool {
 		h = h[:i]
 	}
 	h = strings.TrimRight(h, "/") + "/health"
-	client := &http.Client{Timeout: 2 * time.Second}
+	// OHNE System-Proxy (Transport.Proxy nil): der STT-Server ist ein
+	// interner Host, den ein Firmen-Proxy nicht kennt - mit Proxy meldete
+	// der Check dauerhaft "nicht erreichbar", obwohl der (proxylose)
+	// WebSocket funktionierte. Timeout 3 s (der Check laeuft alle 2 s im
+	// Pill-Ticker, eine verspaetete Antwort zaehlt als nicht erreichbar).
+	client := &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
 	resp, err := client.Get(h)
 	if err != nil {
-		return false
+		return false, err.Error()
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	if resp.StatusCode != http.StatusOK {
+		return false, "HTTP " + resp.Status
+	}
+	return true, ""
 }

@@ -4,12 +4,14 @@ package main
 
 import (
 	"fmt"
-	"fyne.io/fyne/v2"
+	"os"
 	"regexp"
 	"strings"
 	"syscall"
 	"time"
 	"unsafe"
+
+	"fyne.io/fyne/v2"
 )
 
 var (
@@ -17,10 +19,52 @@ var (
 	procSetWindowPlacement = user32.NewProc("SetWindowPlacement")
 	procGetWindowPlacement = user32.NewProc("GetWindowPlacement")
 	procFindWindowW        = user32.NewProc("FindWindowW")
+	procSendMessageW       = user32.NewProc("SendMessageW")
 
 	dwmapi                    = syscall.NewLazyDLL("dwmapi.dll")
 	procDwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute")
+
+	shell32            = syscall.NewLazyDLL("shell32.dll")
+	procExtractIconExW = shell32.NewProc("ExtractIconExW")
 )
+
+// applyCrispWindowIcon setzt Titelleisten- (16 px) und Alt-Tab-/Taskleisten-
+// Symbol (32 px) NATIV aus dem Icon der laufenden .exe (das mehrstufige,
+// transparente .ico aus rsrc_windows_amd64.syso). Fyne/GLFW uebergibt nur
+// EIN grosses PNG, das Windows selbst herunterskaliert - das Ergebnis war
+// unscharf; zudem wurde das Icon frueher deckend weiss hinterlegt. Mit
+// ExtractIconExW liefert Windows exakt passende, transparente Groessen.
+// Kleine Verzoegerung wie bei restoreWindowPosition, damit das HWND existiert.
+func applyCrispWindowIcon(w fyne.Window) {
+	time.AfterFunc(300*time.Millisecond, func() {
+		hwnd := getHWND(w.Title())
+		if hwnd == 0 {
+			return
+		}
+		exe, err := os.Executable()
+		if err != nil {
+			return
+		}
+		exePtr, err := syscall.UTF16PtrFromString(exe)
+		if err != nil {
+			return
+		}
+		var hLarge, hSmall uintptr
+		procExtractIconExW.Call(uintptr(unsafe.Pointer(exePtr)), 0,
+			uintptr(unsafe.Pointer(&hLarge)), uintptr(unsafe.Pointer(&hSmall)), 1)
+		const (
+			wmSetIcon = 0x0080
+			iconSmall = 0 // Titelleiste
+			iconBig   = 1 // Alt-Tab / Taskleiste
+		)
+		if hSmall != 0 {
+			procSendMessageW.Call(hwnd, wmSetIcon, iconSmall, hSmall)
+		}
+		if hLarge != 0 {
+			procSendMessageW.Call(hwnd, wmSetIcon, iconBig, hLarge)
+		}
+	})
+}
 
 // setWindowSquare schaltet die Fensterrahmen-Ecken zwischen eckig (square=true)
 // und abgerundet um. Wirkt nur unter Windows 11 (DWM); ältere Windows ignorieren

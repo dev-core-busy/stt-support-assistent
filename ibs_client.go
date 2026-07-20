@@ -39,7 +39,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -273,86 +272,37 @@ func ibsFetchEvents(addrID string) ([]interface{}, string, error) {
 	return events, raw, nil
 }
 
-// kvBuzzwordPath ist der Kundenverwaltungs-Schlagwort-Endpunkt. Er liegt im
-// Jarvis-/api/-Namespace (wie /api/support/query) - also auf dem JARVIS-Host
-// (config.Jarvis.Url), NICHT auf der kundenverwaltung.jar (die /va/... nutzt).
-const kvBuzzwordPath = "/api/kundenverwaltung/tickets-by-buzzwords"
-
-// kvBaseURL liefert die Basis-URL des Buzzword-Endpunkts (Jarvis-Host).
-func kvBaseURL() string {
-	return strings.TrimRight(strings.TrimSpace(config.Jarvis.Url), "/")
-}
-
-// kvBuzzwordURL baut die GET-URL inkl. Query-Parameter (buzzwords, limit und -
-// nur bei nicht-leerer Kundennummer - address_id). Ein Ort fuer Aufruf und
-// Debug-Vorschau, damit beide garantiert identisch sind.
-func kvBuzzwordURL(addrID, buzzwords string, limit int) string {
-	q := url.Values{}
-	q.Set("buzzwords", buzzwords)
-	q.Set("limit", strconv.Itoa(limit))
-	if strings.TrimSpace(addrID) != "" {
-		q.Set("address_id", addrID)
-	}
-	return kvBaseURL() + kvBuzzwordPath + "?" + q.Encode()
-}
-
 // ibsFetchMatchingEvents sucht die zu Schlagworten passenden Kundenverwaltungs-
-// Tickets via GET {Jarvis.Url}/api/kundenverwaltung/tickets-by-buzzwords
-// ?buzzwords=...&limit=...&address_id=... . Der Endpunkt ist ein FastAPI-
-// Gateway (Antwort-Stil {"detail": ...}); es akzeptiert KEIN POST (HTTP 405),
-// die Suche laeuft als GET mit Query-Parametern. Das Gateway reicht die Werte
-// intern an die Java-kundenverwaltung.jar weiter (dort per
-// getStringByPath("request.address_id"/"request.limit"/"request.buzzwords")).
-// address_id wird nur bei nicht-leerer Kundennummer mitgeschickt (leer => der
-// Endpunkt sucht global). buzzwords ist die (komma-/leerzeichengetrennte)
-// Schlagwortliste.
+// Tickets via POST {IBS.Url}/va/ev/getMatchingEvents - dieselbe Server-/Auth-
+// Basis wie getEvents (kundenverwaltung.jar, X-API-Key + Bearer via ibsDo).
+// Der Server liest die Anfrage-Felder per
 //
-// Authentifizierung: derselbe Jarvis-API-Key wie bei den uebrigen /api/-
-// Endpunkten (Header X-API-Key, config.Jarvis.ApiKey) - KEIN Passwort/Domaenen-
-// Login. Die Antwort wird tolerant geparst (Treffer-Array unter diversen
-// Schluesseln), Rohtext geht ins Log und ins Debug-Popup.
+//	jsonPayloadObject.getStringByPath("request.address_id")
+//	jsonPayloadObject.getStringByPath("request.limit")
+//	jsonPayloadObject.getStringByPath("request.buzzwords")
+//
+// - daher address_id, limit UND buzzwords als Strings unter "request" (limit
+// als String). Leere address_id => globale Suche ueber alle Kunden. buzzwords
+// ist die (komma-/leerzeichengetrennte) Schlagwortliste. Die Antwort wird
+// tolerant geparst; Rohtext geht ins Log und ins Debug-Popup.
 func ibsFetchMatchingEvents(addrID, buzzwords string, limit int) ([]interface{}, string, error) {
-	base := kvBaseURL()
-	if base == "" {
-		return nil, "", fmt.Errorf(T("Kundenverwaltung-Suche: Jarvis-Server-URL ist nicht konfiguriert (siehe Einstellungen)."))
+	body := map[string]interface{}{
+		"event": "getMatchingEvents",
+		"request": map[string]string{
+			"address_id": addrID,
+			"limit":      strconv.Itoa(limit),
+			"buzzwords":  buzzwords,
+		},
 	}
-	req, err := http.NewRequest("GET", kvBuzzwordURL(addrID, buzzwords, limit), nil)
+	v, raw, err := ibsPostJSON("/va/ev/getMatchingEvents", body)
 	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("Accept", "application/json")
-	// Auth wie bei /api/support/query: X-API-Key (Jarvis-API-Key). Kein Passwort.
-	if k := strings.TrimSpace(config.Jarvis.ApiKey); k != "" {
-		req.Header.Set("X-API-Key", k)
-	} else {
-		Log("Kundenverwaltung-Suche: kein Jarvis-API-Key gesetzt (config.Jarvis.ApiKey) - Server lehnt die Anfrage vermutlich mit 401 ab")
-	}
-
-	resp, err := jarvisHTTPClient().Do(req)
-	if err != nil {
-		e := fmt.Errorf(T("Kundenverwaltung nicht erreichbar (%s): %v"), base, err)
-		Log("Kundenverwaltung " + kvBuzzwordPath + ": " + e.Error())
-		return nil, "", e
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	rawS := string(raw)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		e := fmt.Errorf(T("Kundenverwaltung meldet HTTP %d"), resp.StatusCode)
-		Log("Kundenverwaltung " + kvBuzzwordPath + ": " + e.Error() + " | Rohantwort: " + rawS)
-		return nil, rawS, e
-	}
-	var v interface{}
-	if uerr := json.Unmarshal(raw, &v); uerr != nil {
-		e := fmt.Errorf(T("Kundenverwaltung: Antwort ist kein gültiges JSON: %v"), uerr)
-		Log("Kundenverwaltung " + kvBuzzwordPath + ": " + e.Error() + " | Rohantwort: " + rawS)
-		return nil, rawS, e
+		return nil, raw, err
 	}
 	events, _ := ibsFindValue(v, "event", "events", "tickets", "items", "data", "result", "matches").([]interface{})
 	if events == nil {
-		Log("Kundenverwaltung tickets-by-buzzwords: kein Treffer-Array in der Antwort | Rohantwort: " + rawS)
+		Log("IBS getMatchingEvents: kein Treffer-Array in der Antwort | Rohantwort: " + raw)
 	}
-	return events, rawS, nil
+	return events, raw, nil
 }
 
 // ibsEventTickets mappt die rohen Events auf die Anzeigeform (Feldnamen laut
@@ -604,7 +554,8 @@ func performIBSBuzzwordSearch(addrID, buzzwords string) {
 	events, raw, err := ibsFetchMatchingEvents(addrID, buzzwords, limit)
 	// Debug-Popup zeigt Request UND Rohantwort - so ist bei "keine Treffer"
 	// sofort sichtbar, was gesendet und was geantwortet wurde.
-	reqPreview := "GET " + kvBuzzwordURL(addrID, buzzwords, limit)
+	reqPreview := fmt.Sprintf("POST %s/va/ev/getMatchingEvents\n\n{\"event\":\"getMatchingEvents\",\"request\":{\"address_id\":%q,\"limit\":%q,\"buzzwords\":%q}}",
+		ibsBaseURL(), addrID, strconv.Itoa(limit), buzzwords)
 	fyne.Do(func() {
 		showDebugResponse("Kundenverwaltung: tickets-by-buzzwords", reqPreview+"\n\n--- Antwort ---\n"+ibsDebugPayload(raw, err))
 	})

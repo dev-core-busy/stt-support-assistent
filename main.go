@@ -3821,8 +3821,16 @@ func extractTicketKeywords(text string, win fyne.Window, then func(keywords stri
 				)
 				hint := widget.NewLabel(T("Hinweis: Die Jarvis-API muss noch angepasst werden, damit mit diesen Schlagworten auch dort passende Tickets gesucht werden können. Die Kundenverwaltung (getMatchingEvents) wird bereits abgefragt, sofern ein Anruf eine Kundenv.-ID geliefert hat."))
 				hint.Alignment = fyne.TextAlignLeading
-				dialog.ShowCustom(T("Schlagworte zur Ticketsuche"), T("OK"),
+				// Wortumbruch + feste Dialogbreite: ohne Umbruch macht Fyne den
+				// Dialog so breit wie der (lange) Hinweis in EINER Zeile und kappt
+				// ihn am Fensterrand. NewCustom+Resize erzwingt eine feste Breite,
+				// innerhalb derer der Hinweis sauber umbricht.
+				line.Wrapping = fyne.TextWrapWord
+				hint.Wrapping = fyne.TextWrapWord
+				d := dialog.NewCustom(T("Schlagworte zur Ticketsuche"), T("OK"),
 					container.NewVBox(line, hint), win)
+				d.Resize(fyne.NewSize(480, 260))
+				d.Show()
 			}
 			// Erst NACH der Anzeige der Schlagworte (bzw. des Fehlers) die
 			// eigentliche Ticketsuche anstossen (Nutzer-Vorgabe). Die extrahierten
